@@ -1,11 +1,22 @@
-# Alert router
+# Criers
 
-Working name. An event-driven Rust service that receives Alertmanager webhooks,
+An event-driven Rust service that receives Alertmanager webhooks,
 persists occurrence history, and proposes notifications using explicit policy.
 
 **Current state: runnable shadow-only foundation, not production notification routing.**
 It cannot send a Discord message or contact a model. No cloud credentials are
-required. The product name and public repository are not finalized yet.
+required. Licensed under [MIT](LICENSE).
+
+## Workspace
+
+- `crates/core` (`criers-core`): Alertmanager wire types, bounded validation,
+  occurrence keys, and deterministic policy. No async runtime, HTTP, or database.
+- `crates/server` (`criers`, binary `criers`): Axum admission and authentication,
+  transactional SQLite lifecycle handling, status, and shadow outbox records.
+
+Dependencies, package metadata, and lints are shared in the root `Cargo.toml`.
+The runtime depends on the core, never the reverse. See the
+[architecture decision](docs/adr/001-workspace.md) and [glossary](GLOSSARY.md).
 
 ## Implemented
 
@@ -36,12 +47,12 @@ tools with `mise install --locked rust aqua:nextest-rs/nextest/cargo-nextest`.
 Create `data/` and a credential file outside the repository. Use at least 32
 random printable ASCII characters and restrict the file to its owner. Set:
 
-- `ALERT_ROUTER_SOURCE=example`: trusted producer identity, not taken from labels.
-- `ALERT_ROUTER_TOKEN_FILE=/path/to/private-token`: required credential file.
-- `ALERT_ROUTER_DATABASE=data/alerts.sqlite`: optional database path. Its parent
+- `CRIERS_SOURCE=example`: trusted producer identity, not taken from labels.
+- `CRIERS_TOKEN_FILE=/path/to/private-token`: required credential file.
+- `CRIERS_DATABASE=data/alerts.sqlite`: optional database path. Its parent
   directory must exist; use a private directory for real alert data.
-- `ALERT_ROUTER_BIND=127.0.0.1:8080`: optional listen address.
-- `RUST_LOG=alert_router=info,tower_http=info`: optional tracing filter.
+- `CRIERS_BIND=127.0.0.1:8080`: optional listen address.
+- `RUST_LOG=criers=info,tower_http=info`: optional tracing filter.
 
 Start with `mise run dev`. Send the synthetic [critical webhook](examples/critical.json)
 to `POST /v1/alertmanager` with `Content-Type: application/json` and a matching
@@ -56,7 +67,9 @@ Quiet incoming traffic always leaves source coverage unknown until an independen
 heartbeat contract is implemented.
 
 `mise run ci` checks formatting, strict Clippy, nextest, separate doctests, and a
-development build using the dated compiler pin in `mise.toml`.
+development build using the dated compiler pin in `mise.toml`. GitHub Actions
+runs the same task; only successful trusted main-branch pushes write the
+compilation cache.
 
 ## Admission and failure behavior
 

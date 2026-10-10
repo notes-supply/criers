@@ -8,15 +8,13 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use criers_core::Webhook;
 use serde_json::json;
 use subtle::ConstantTimeEq;
 use tokio::sync::Semaphore;
 use tower_http::{timeout::TimeoutLayer, trace::TraceLayer};
 
-use crate::{
-    model::Webhook,
-    store::{Receipt, Snapshot, Store, StoreError},
-};
+use crate::store::{Receipt, Snapshot, Store, StoreError};
 
 const MAX_BODY_BYTES: usize = 1_048_576;
 
@@ -116,18 +114,6 @@ async fn snapshot(State(state): State<AppState>) -> Result<Json<Snapshot>, AppEr
 
 async fn ready(State(state): State<AppState>) -> Result<StatusCode, AppError> {
     let _permit = state.admission.try_acquire().map_err(|_| AppError::Busy)?;
-    state
-        .store
-        .with_connection(|connection| {
-            // A rollback-only write proves writability without altering alert history.
-            let transaction = connection.transaction()?;
-            transaction.execute(
-                "INSERT INTO events(source, received_at, payload) VALUES ('readiness', '', '')",
-                [],
-            )?;
-            transaction.rollback()?;
-            Ok(())
-        })
-        .await?;
+    state.store.ready().await?;
     Ok(StatusCode::NO_CONTENT)
 }

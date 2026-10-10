@@ -5,12 +5,11 @@ use std::{
 };
 
 use chrono::Utc;
+use criers_core::{Action, Alert, Status, Webhook};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::Serialize;
 use thiserror::Error;
 use tokio::sync::Semaphore;
-
-use crate::model::{Action, Alert, Status, Webhook};
 
 #[derive(Debug, Error)]
 pub(crate) enum StoreError {
@@ -75,7 +74,7 @@ impl Store {
         })
     }
 
-    pub async fn with_connection<T, F>(&self, operation: F) -> Result<T, StoreError>
+    async fn with_connection<T, F>(&self, operation: F) -> Result<T, StoreError>
     where
         T: Send + 'static,
         F: FnOnce(&mut Connection) -> Result<T, StoreError> + Send + 'static,
@@ -91,6 +90,20 @@ impl Store {
             operation(&mut connection)
         })
         .await?
+    }
+
+    pub async fn ready(&self) -> Result<(), StoreError> {
+        self.with_connection(|connection| {
+            // A rollback-only write proves writability without altering alert history.
+            let transaction = connection.transaction()?;
+            transaction.execute(
+                "INSERT INTO events(source, received_at, payload) VALUES ('readiness', '', '')",
+                [],
+            )?;
+            transaction.rollback()?;
+            Ok(())
+        })
+        .await
     }
 
     pub async fn ingest(&self, source: String, webhook: Webhook) -> Result<Receipt, StoreError> {
@@ -221,3 +234,6 @@ fn process_alert(
         intent_created,
     })
 }
+
+#[cfg(test)]
+mod tests;

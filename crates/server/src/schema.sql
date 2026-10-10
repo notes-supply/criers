@@ -46,5 +46,3 @@ CREATE TABLE IF NOT EXISTS source_status (
     last_event_at TEXT NOT NULL,
     truncated_alerts INTEGER NOT NULL
 ) STRICT;
-
-CREATE INDEX IF NOT EXISTS occurrences_identity ON occurrences(source, fingerprint, starts_at);

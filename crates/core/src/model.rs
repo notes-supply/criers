@@ -97,8 +97,8 @@ impl Alert {
     /// This requires a source explicitly trusted to supply severity labels.
     ///
     /// ```
-    /// use alert_router::model::{Action, Webhook};
-    /// let webhook: Webhook = serde_json::from_str(include_str!("../examples/critical.json"))?;
+    /// use criers_core::{Action, Webhook};
+    /// let webhook: Webhook = serde_json::from_str(include_str!("../../../examples/critical.json"))?;
     /// webhook.validate()?;
     /// assert_eq!(webhook.alerts[0].policy().0, Action::Ping);
     /// # Ok::<(), Box<dyn std::error::Error>>(())

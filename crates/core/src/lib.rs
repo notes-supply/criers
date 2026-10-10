@@ -5,4 +5,6 @@
 
 #![deny(missing_docs)]
 
-pub mod model;
+mod model;
+
+pub use model::{Action, Alert, Status, Webhook};

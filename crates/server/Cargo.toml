@@ -1,0 +1,31 @@
+[package]
+name = "criers"
+description = "Durable, event-driven alert routing with explicit notification policy"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+criers-core.workspace = true
+anyhow.workspace = true
+axum.workspace = true
+chrono = { workspace = true, features = ["now"] }
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+subtle.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tower.workspace = true
+
+[lints]
+workspace = true

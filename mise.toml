@@ -8,19 +8,19 @@ run = "cargo fmt --all -- --check"
 
 [tasks.lint]
 description = "Lint every target"
-run = "cargo clippy --all-targets --all-features --locked -- -D warnings"
+run = "cargo clippy --workspace --all-targets --all-features --locked -- -D warnings"
 
 [tasks.test]
 description = "Run regression tests and separate doctests"
-run = ["cargo nextest run --all-targets --locked", "cargo test --doc --locked"]
+run = ["cargo nextest run --workspace --all-targets --locked", "cargo test --workspace --doc --locked"]
 
 [tasks.build]
 description = "Build the runnable service"
-run = "cargo build --locked"
+run = "cargo build --workspace --locked"
 
 [tasks.dev]
 description = "Start the receiver in shadow-only mode"
-run = "cargo run --locked"
+run = "cargo run --package criers --locked"
 
 [tasks.ci]
 description = "Run the required source and behavior checks"

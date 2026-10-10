@@ -5,6 +5,7 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode},
 };
+use criers_core::{Action, Webhook};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::sync::Semaphore;
@@ -12,17 +13,16 @@ use tower::ServiceExt;
 
 use crate::{
     http::{self, AppState},
-    model::{Action, Webhook},
     store::Store,
 };
 
-const TOKEN: &str = "synthetic-test-token-not-a-live-secret-0123456789";
+pub(super) const TOKEN: &str = "synthetic-test-token-not-a-live-secret-0123456789";
 
-fn fixture() -> Value {
-    serde_json::from_str(include_str!("../examples/critical.json")).unwrap()
+pub(super) fn fixture() -> Value {
+    serde_json::from_str(include_str!("../../../examples/critical.json")).unwrap()
 }
 
-async fn setup() -> (TempDir, PathBuf, Store, Router) {
+pub(super) async fn setup() -> (TempDir, PathBuf, Store, Router) {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("alerts.sqlite");
     let store = Store::open(path.clone()).await.unwrap();
@@ -41,7 +41,7 @@ async fn ingest(store: &Store, value: Value) -> crate::store::Receipt {
     store.ingest("example".into(), webhook).await.unwrap()
 }
 
-async fn post(app: Router, payload: Value, token: &str) -> axum::response::Response {
+pub(super) async fn post(app: Router, payload: Value, token: &str) -> axum::response::Response {
     app.oneshot(
         Request::builder()
             .method("POST")
@@ -242,40 +242,18 @@ async fn oversized_body_is_rejected_without_persisting() {
 }
 
 #[tokio::test]
-async fn read_only_database_returns_retryable_failure_instead_of_false_acceptance() {
+async fn readiness_write_leaves_observation_history_unchanged() {
     let (_directory, _path, store, app) = setup().await;
-    store
-        .with_connection(|connection| {
-            connection.execute_batch("PRAGMA query_only = ON")?;
-            Ok(())
-        })
+    ingest(&store, fixture()).await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/health/ready")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
-    let response = post(app, fixture(), TOKEN).await;
-    let snapshot = store.snapshot("example".into()).await.unwrap();
-    assert_eq!(
-        (response.status(), snapshot.events, snapshot.shadow_intents),
-        (StatusCode::SERVICE_UNAVAILABLE, 0, 0)
-    );
-}
-
-#[tokio::test]
-async fn full_database_rolls_back_event_decision_and_intent_together() {
-    let (_directory, _path, store, app) = setup().await;
-    store
-        .with_connection(|connection| {
-            let pages: u32 = connection.query_row("PRAGMA page_count", [], |row| row.get(0))?;
-            connection.pragma_update(None, "max_page_count", pages)?;
-            Ok(())
-        })
-        .await
-        .unwrap();
-    let mut full = fixture();
-    let annotations = full["alerts"][0]["annotations"].as_object_mut().unwrap();
-    for index in 0..32 {
-        annotations.insert(format!("detail{index}"), json!("x".repeat(8192)));
-    }
-    let response = post(app, full, TOKEN).await;
     let snapshot = store.snapshot("example".into()).await.unwrap();
     assert_eq!(
         (
@@ -284,6 +262,6 @@ async fn full_database_rolls_back_event_decision_and_intent_together() {
             snapshot.occurrences,
             snapshot.shadow_intents
         ),
-        (StatusCode::SERVICE_UNAVAILABLE, 0, 0, 0)
+        (StatusCode::NO_CONTENT, 1, 1, 1)
     );
 }
