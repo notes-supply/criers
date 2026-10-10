@@ -1,0 +1,68 @@
+# Criers example configuration. Relative paths resolve from this file's directory.
+# Unknown keys are rejected; `criers check --config <file>` validates without side effects.
+
+# "shadow" records decisions and intents without sending anything (default).
+# "live" delivers new intents. Intents recorded in shadow mode are never sent later.
+mode = "shadow"
+
+[server]
+listen = "127.0.0.1:8080"      # authenticated Alertmanager ingestion
+ops_listen = "127.0.0.1:9090"  # /health/live, /health/ready, /metrics
+max_body_bytes = 1048576
+ingest_concurrency = 8
+shutdown_grace = "10s"
+credential_reload_interval = "15s"
+
+[storage]
+path = "../data/criers.sqlite"  # the directory must exist
+max_size_mib = 1024
+retention = "30d"
+
+[delivery]
+timeout = "10s"
+max_attempts = 12
+backoff_base = "1s"
+backoff_max = "5m"
+max_rate_limit_wait = "15m"
+batch_max = 10
+
+[policy]
+unknown_severity = "ping"
+critical_floor = ["critical"]
+
+[policy.severity]
+critical = "ping"
+warning = "quiet_post"
+info = "record"
+
+# POST /v1/sources/local/alertmanager with "Authorization: Bearer <token>".
+[sources.local]
+# List a second file while rotating; both tokens are accepted until one is removed.
+credential_files = ["../secrets/alertmanager-token"]
+default_destination = "ops"
+trust_severity = true
+# Alertmanager receiver name -> destination. Labels never choose destinations.
+receivers = {}
+
+[sources.local.heartbeat]
+alertname = "Watchdog"
+stale_after = "10m"
+
+[destinations.ops]
+kind = "discord"
+# Read only in live mode. The file holds https://discord.com/api/webhooks/<id>/<token>.
+webhook_url_file = "../secrets/discord-ops-url"
+mention_users = []
+mention_roles = []
+mention_cooldown = "1m"
+
+# Optional shadow assessment with Cloudflare Clef. It never changes notifications.
+# [assessment]
+# account_id = "0123456789abcdef0123456789abcdef"
+# api_token_file = "../secrets/cloudflare-ai-token"
+# model = "clef-flash"
+# timeout = "5s"
+# concurrency = 2
+# max_pending = 1000
+# labels = ["alertname", "job", "namespace", "service", "severity"]
+# annotations = ["summary"]

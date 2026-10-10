@@ -135,3 +135,44 @@ fn ops_and_ingestion_listeners_must_differ() {
     ));
     assert!(message.contains("must differ"), "{message}");
 }
+
+#[test]
+fn shipped_example_configuration_is_valid() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    for path in ["examples", "data", "secrets"] {
+        std::fs::create_dir(root.join(path)).unwrap();
+    }
+    std::fs::write(root.join("secrets/alertmanager-token"), TOKEN).unwrap();
+    let config = root.join("examples/criers.toml");
+    std::fs::write(&config, include_str!("../../../../examples/criers.toml")).unwrap();
+    let loaded = Config::load(&config);
+    assert!(loaded.is_ok(), "{:#}", loaded.unwrap_err());
+}
+
+#[test]
+fn kubernetes_configuration_is_valid_with_mounted_paths() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    std::fs::create_dir(root.join("data")).unwrap();
+    std::fs::create_dir(root.join("secrets")).unwrap();
+    std::fs::write(root.join("secrets/alertmanager-token"), TOKEN).unwrap();
+    let text = include_str!("../../../../deploy/kubernetes/criers.toml")
+        .replace(
+            "/run/secrets/criers/",
+            &format!("{}/secrets/", root.display()),
+        )
+        .replace("/var/lib/criers/", &format!("{}/data/", root.display()));
+    let config = root.join("criers.toml");
+    std::fs::write(&config, text).unwrap();
+    let loaded = Config::load(&config);
+    assert!(loaded.is_ok(), "{:#}", loaded.unwrap_err());
+}
+
+#[test]
+fn kubernetes_placeholder_secret_is_rejected() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("token");
+    std::fs::write(&path, "replace with 32 to 256 random printable characters").unwrap();
+    assert!(crate::credentials::read_token(&path).is_err());
+}

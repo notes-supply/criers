@@ -155,7 +155,10 @@ mention_users = ["123456789012345678"]
 
     async fn post(&self, client: &reqwest::Client, token: &str, payload: &Value) -> (u16, Value) {
         let response = client
-            .post(format!("http://{}/v1/sources/prod/alertmanager", self.ingest))
+            .post(format!(
+                "http://{}/v1/sources/prod/alertmanager",
+                self.ingest
+            ))
             .bearer_auth(token)
             .json(payload)
             .send()
@@ -238,7 +241,9 @@ async fn live_process_delivers_survives_restart_and_stops_gracefully() {
     let client = reqwest::Client::new();
     let mut child = deployment.spawn();
     deployment.wait_ready(&client).await;
-    let (status, receipt) = deployment.post(&client, TOKEN, &critical("0123456789abcdef")).await;
+    let (status, receipt) = deployment
+        .post(&client, TOKEN, &critical("0123456789abcdef"))
+        .await;
     let deadline = Instant::now() + Duration::from_secs(10);
     while discord.count() < 1 && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -255,17 +260,22 @@ async fn live_process_delivers_survives_restart_and_stops_gracefully() {
 
     let mut restarted = deployment.spawn();
     deployment.wait_ready(&client).await;
-    let (duplicate_status, duplicate) =
-        deployment.post(&client, TOKEN, &critical("0123456789abcdef")).await;
+    let (duplicate_status, duplicate) = deployment
+        .post(&client, TOKEN, &critical("0123456789abcdef"))
+        .await;
     tokio::time::sleep(Duration::from_millis(500)).await;
     let second_exit = terminate(&mut restarted);
-    let sent = count(&deployment.database(), "SELECT count(*) FROM outbox WHERE state = 'sent'");
+    let sent = count(
+        &deployment.database(),
+        "SELECT count(*) FROM outbox WHERE state = 'sent'",
+    );
     let body = discord.bodies.lock().unwrap()[0].clone();
     assert!(
         status == 202
             && receipt["decisions"][0]["intent_created"] == json!(true)
             && body["allowed_mentions"]["users"] == json!(["123456789012345678"])
-            && metrics.contains(r#"criers_delivery_attempts_total{destination="ops",outcome="sent"} 1"#)
+            && metrics
+                .contains(r#"criers_delivery_attempts_total{destination="ops",outcome="sent"} 1"#)
             && exit.success()
             && duplicate_status == 202
             && duplicate["decisions"][0]["intent_created"] == json!(false)
@@ -336,7 +346,10 @@ async fn readiness_stays_green_while_ingestion_admission_is_saturated() {
             && stored == accepted
             && exit.success(),
         "ready={:?} accepted={accepted} busy={busy} stored={stored}",
-        statuses.iter().filter(|&&status| status != 204).collect::<Vec<_>>()
+        statuses
+            .iter()
+            .filter(|&&status| status != 204)
+            .collect::<Vec<_>>()
     );
 }
 
@@ -373,7 +386,9 @@ async fn sigterm_under_load_loses_no_acknowledged_webhook() {
         })
         .collect();
     tokio::time::sleep(Duration::from_millis(400)).await;
-    let exit = tokio::task::spawn_blocking(move || terminate(&mut child)).await.unwrap();
+    let exit = tokio::task::spawn_blocking(move || terminate(&mut child))
+        .await
+        .unwrap();
     let mut acknowledged = Vec::new();
     for stream in streams {
         acknowledged.extend(stream.await.unwrap());
@@ -416,17 +431,33 @@ async fn credential_rotation_applies_and_invalid_updates_keep_the_last_good_toke
     let client = reqwest::Client::new();
     let mut child = deployment.spawn();
     deployment.wait_ready(&client).await;
-    let (overlap_old, _) = deployment.post(&client, TOKEN, &critical("0000000000000001")).await;
-    let (overlap_new, _) = deployment.post(&client, ROTATED, &critical("0000000000000002")).await;
+    let (overlap_old, _) = deployment
+        .post(&client, TOKEN, &critical("0000000000000001"))
+        .await;
+    let (overlap_new, _) = deployment
+        .post(&client, ROTATED, &critical("0000000000000002"))
+        .await;
     // Retire the old token by replacing the first file, as a Secret update would.
     let replacement = "synthetic-third-token-not-a-live-secret-0003";
-    std::fs::write(deployment.directory.path().join("secrets/token"), replacement).unwrap();
+    std::fs::write(
+        deployment.directory.path().join("secrets/token"),
+        replacement,
+    )
+    .unwrap();
     tokio::time::sleep(Duration::from_millis(2500)).await;
-    let (retired, _) = deployment.post(&client, TOKEN, &critical("0000000000000003")).await;
+    let (retired, _) = deployment
+        .post(&client, TOKEN, &critical("0000000000000003"))
+        .await;
     // A transient invalid update keeps the last good token and is exposed in metrics.
-    std::fs::write(deployment.directory.path().join("secrets/token.next"), "bad").unwrap();
+    std::fs::write(
+        deployment.directory.path().join("secrets/token.next"),
+        "bad",
+    )
+    .unwrap();
     tokio::time::sleep(Duration::from_millis(2500)).await;
-    let (kept, _) = deployment.post(&client, ROTATED, &critical("0000000000000004")).await;
+    let (kept, _) = deployment
+        .post(&client, ROTATED, &critical("0000000000000004"))
+        .await;
     let metrics = client
         .get(format!("http://{}/metrics", deployment.ops))
         .send()

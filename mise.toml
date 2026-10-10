@@ -1,6 +1,8 @@
 [tools]
 rust = { version = "nightly-2026-10-10", profile = "minimal", components = "rustfmt,clippy,rust-src" }
 "aqua:nextest-rs/nextest/cargo-nextest" = "0.9.148"
+"aqua:kubernetes-sigs/kustomize" = "5.8.3"
+"aqua:yannh/kubeconform" = "0.8.0"
 
 [tasks.fmt]
 description = "Check Rust formatting"
@@ -19,8 +21,19 @@ description = "Build the runnable service"
 run = "cargo build --workspace --locked"
 
 [tasks.dev]
-description = "Start the receiver in shadow-only mode"
-run = "cargo run --package criers --locked"
+description = "Start Criers with the example configuration"
+run = "cargo run --package criers --locked -- serve --config examples/criers.toml"
+
+[tasks.manifests]
+description = "Render and validate the Kubernetes manifests"
+run = [
+  "kustomize build deploy/kubernetes -o target/kubernetes.yaml",
+  "kubeconform -strict -summary -kubernetes-version 1.34.0 target/kubernetes.yaml",
+]
+
+[tasks.image]
+description = "Build the release OCI image"
+run = "docker build -t criers:dev ."
 
 [tasks.ci]
 description = "Run the required source and behavior checks"
