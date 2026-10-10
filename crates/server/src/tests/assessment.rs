@@ -1,0 +1,203 @@
+//! Shadow assessment against a labelled mock Clef fixture.
+
+use std::{sync::Arc, time::Duration};
+
+use serde_json::{Value, json};
+use tokio_util::sync::CancellationToken;
+
+use super::{
+    Harness, fixture,
+    fixtures::{MockProvider, Scripted},
+    with,
+};
+use crate::assessment::{self, Clef};
+
+const ACCOUNT: &str = "0123456789abcdef0123456789abcdef";
+
+fn answer(impact: f64) -> Scripted {
+    Scripted::json(
+        200,
+        json!({
+            "result": {
+                "model": "clef-flash",
+                "answers": {
+                    "impact": {"type": "noul", "noul": impact},
+                    "urgency": {"type": "score", "score": 1.2, "legend": {"0": "a", "1": "b", "2": "c", "3": "d"},
+                        "probabilities": {"0": 0.2, "1": 0.5, "2": 0.2, "3": 0.1}, "confidence": 0.4}
+                },
+                "usage": {"input_tokens": 120, "output_tokens": 0}
+            },
+            "success": true, "errors": [], "messages": []
+        }),
+    )
+}
+
+async fn harness(clef: &MockProvider, extra: &str) -> Harness {
+    Harness::shadow(&format!(
+        "[assessment]\naccount_id = \"{ACCOUNT}\"\napi_token_file = \"clef.token\"\n\
+         base_url = \"http://{}/client/v4\"\ntimeout = \"1s\"\nmax_attempts = 1\n{extra}",
+        clef.address
+    ))
+    .await
+}
+
+fn spawn(harness: &Harness) -> CancellationToken {
+    let cancel = CancellationToken::new();
+    let clef = Clef::new(Arc::clone(harness.config.assessment.as_ref().unwrap())).unwrap();
+    tokio::spawn(assessment::run(
+        harness.store.clone(),
+        clef,
+        Arc::clone(&harness.state.metrics),
+        Arc::clone(&harness.state.wake),
+        cancel.clone(),
+    ));
+    cancel
+}
+
+async fn wait_for_outcome(harness: &Harness) -> Option<String> {
+    for _ in 0..200 {
+        let outcome: Option<String> = harness
+            .query("SELECT (SELECT outcome FROM assessments WHERE state = 'done' LIMIT 1)")
+            .await;
+        if outcome.is_some() {
+            return outcome;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    None
+}
+
+fn warning() -> Value {
+    let value = with(fixture(), "/alerts/0/labels/severity", json!("warning"));
+    let mut value = with(value, "/alerts/0/labels/service", json!("checkout"));
+    value["alerts"][0]["labels"]["private_label"] = json!("must-not-leave");
+    value
+}
+
+#[tokio::test]
+async fn warning_is_assessed_with_redacted_context_and_provenance() {
+    let clef = MockProvider::start(Vec::new(), answer(0.8)).await;
+    let harness = harness(&clef, "").await;
+    harness.ingest(warning()).await;
+    let cancel = spawn(&harness);
+    let outcome = wait_for_outcome(&harness).await;
+    cancel.cancel();
+    let request = &clef.requests()[0];
+    let impact: f64 = harness
+        .query("SELECT impact_probability FROM assessments")
+        .await;
+    let provenance: String = harness
+        .query("SELECT requested_model || ' ' || model || ' ' || policy_version FROM assessments")
+        .await;
+    assert!(
+        outcome.as_deref() == Some("assessed")
+            && impact == 0.8
+            && request.path
+                == format!("/client/v4/accounts/{ACCOUNT}/ai/run/@cf/cloudflare/clef-flash")
+            && request.authorization.as_deref() == Some("Bearer synthetic-clef-token-not-live")
+            && request.body["state"]["labels"]["service"] == "checkout"
+            && request.body["state"]["labels"]
+                .get("private_label")
+                .is_none()
+            && provenance.starts_with("clef-flash clef-flash clef-impact-urgency-v1;policy-"),
+        "outcome={outcome:?} impact={impact} provenance={provenance} request={request:?}"
+    );
+}
+
+#[tokio::test]
+async fn critical_floor_bypasses_assessment_entirely() {
+    let clef = MockProvider::start(Vec::new(), answer(0.1)).await;
+    let harness = harness(&clef, "").await;
+    let receipt = harness.ingest(fixture()).await;
+    let cancel = spawn(&harness);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    cancel.cancel();
+    let assessments: i64 = harness.query("SELECT count(*) FROM assessments").await;
+    assert_eq!(
+        (
+            receipt.decisions[0].reason,
+            receipt.decisions[0].intent_created,
+            assessments,
+            clef.requests().len()
+        ),
+        ("trusted_critical_floor", true, 0, 0)
+    );
+}
+
+#[tokio::test]
+async fn provider_timeout_is_recorded_without_touching_notifications() {
+    let clef = MockProvider::start(Vec::new(), answer(0.9).delayed(Duration::from_secs(3))).await;
+    let harness = harness(&clef, "").await;
+    let receipt = harness.ingest(warning()).await;
+    let cancel = spawn(&harness);
+    let outcome = wait_for_outcome(&harness).await;
+    cancel.cancel();
+    let intents: i64 = harness.query("SELECT count(*) FROM outbox").await;
+    assert_eq!(
+        (
+            receipt.decisions[0].intent_created,
+            outcome.as_deref(),
+            intents
+        ),
+        (true, Some("timeout"), 1)
+    );
+}
+
+#[tokio::test]
+async fn malformed_provider_response_is_recorded_as_malformed() {
+    let broken = Scripted::json(
+        200,
+        json!({"result": {"model": "clef-flash", "answers": {}}, "success": true}),
+    );
+    let clef = MockProvider::start(Vec::new(), broken).await;
+    let harness = harness(&clef, "").await;
+    harness.ingest(warning()).await;
+    let cancel = spawn(&harness);
+    let outcome = wait_for_outcome(&harness).await;
+    cancel.cancel();
+    assert_eq!(outcome.as_deref(), Some("malformed"));
+}
+
+#[tokio::test]
+async fn assessment_finishing_after_resolution_is_stale_and_announces_nothing() {
+    let clef =
+        MockProvider::start(Vec::new(), answer(0.99).delayed(Duration::from_millis(500))).await;
+    let harness = harness(&clef, "").await;
+    harness.ingest(warning()).await;
+    let cancel = spawn(&harness);
+    clef.wait_for(1).await;
+    harness
+        .ingest(with(warning(), "/alerts/0/status", json!("resolved")))
+        .await;
+    let outcome = wait_for_outcome(&harness).await;
+    cancel.cancel();
+    let intents: i64 = harness.query("SELECT count(*) FROM outbox").await;
+    assert_eq!((outcome.as_deref(), intents), (Some("stale"), 1));
+}
+
+#[tokio::test]
+async fn full_assessment_queue_skips_instead_of_growing() {
+    let clef = MockProvider::start(Vec::new(), answer(0.5)).await;
+    let harness = harness(&clef, "max_pending = 1\n").await;
+    let mut batch = warning();
+    let template = batch["alerts"][0].clone();
+    batch["alerts"] = Value::Array(
+        (0..3)
+            .map(|index| {
+                with(
+                    template.clone(),
+                    "/fingerprint",
+                    json!(format!("{index:016x}")),
+                )
+            })
+            .collect(),
+    );
+    harness.ingest(batch).await;
+    let skipped: i64 = harness
+        .query("SELECT count(*) FROM assessments WHERE outcome = 'skipped_queue_full'")
+        .await;
+    let pending: i64 = harness
+        .query("SELECT count(*) FROM assessments WHERE state = 'pending'")
+        .await;
+    assert_eq!((skipped, pending), (2, 1));
+}
