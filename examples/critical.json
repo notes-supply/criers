@@ -1,0 +1,21 @@
+{
+  "version": "4",
+  "groupKey": "{}:{alertname=\"ExampleStorageFailure\"}",
+  "receiver": "router",
+  "status": "firing",
+  "truncatedAlerts": 0,
+  "alerts": [
+    {
+      "status": "firing",
+      "fingerprint": "0123456789abcdef",
+      "labels": {
+        "alertname": "ExampleStorageFailure",
+        "severity": "critical",
+        "service": "example-service"
+      },
+      "annotations": { "summary": "Synthetic critical storage alert, not a real incident" },
+      "startsAt": "2026-10-10T10:00:00Z",
+      "endsAt": "2026-10-10T10:10:00Z"
+    }
+  ]
+}

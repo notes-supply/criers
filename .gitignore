@@ -1,0 +1,6 @@
+/target/
+/data/
+*.sqlite*
+.env*
+mise.local.toml
+secrets/
