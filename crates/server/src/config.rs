@@ -82,6 +82,7 @@ struct RawServer {
     ops_listen: SocketAddr,
     max_body_bytes: usize,
     ingest_concurrency: usize,
+    admission_wait: HumanDuration,
     request_timeout: HumanDuration,
     shutdown_grace: HumanDuration,
     credential_reload_interval: HumanDuration,
@@ -94,6 +95,7 @@ impl Default for RawServer {
             ops_listen: SocketAddr::from(([127, 0, 0, 1], 9090)),
             max_body_bytes: 1_048_576,
             ingest_concurrency: 8,
+            admission_wait: HumanDuration(Duration::from_secs(1)),
             request_timeout: HumanDuration(Duration::from_secs(30)),
             shutdown_grace: HumanDuration(Duration::from_secs(10)),
             credential_reload_interval: HumanDuration(Duration::from_secs(15)),
@@ -308,6 +310,7 @@ pub(crate) struct Server {
     pub ops_listen: SocketAddr,
     pub max_body_bytes: usize,
     pub ingest_concurrency: usize,
+    pub admission_wait: Duration,
     pub request_timeout: Duration,
     pub shutdown_grace: Duration,
     pub credential_reload_interval: Duration,
@@ -532,6 +535,11 @@ fn validate_server(raw: RawServer) -> Result<Server> {
         "server.ingest_concurrency must be between 1 and 64"
     );
     within("server.request_timeout", raw.request_timeout, 1, 300)?;
+    within("server.admission_wait", raw.admission_wait, 0, 30)?;
+    ensure!(
+        raw.admission_wait.0 < raw.request_timeout.0,
+        "server.admission_wait must be shorter than server.request_timeout"
+    );
     within("server.shutdown_grace", raw.shutdown_grace, 1, 300)?;
     within(
         "server.credential_reload_interval",
@@ -544,6 +552,7 @@ fn validate_server(raw: RawServer) -> Result<Server> {
         ops_listen: raw.ops_listen,
         max_body_bytes: raw.max_body_bytes,
         ingest_concurrency: raw.ingest_concurrency,
+        admission_wait: raw.admission_wait.0,
         request_timeout: raw.request_timeout.0,
         shutdown_grace: raw.shutdown_grace.0,
         credential_reload_interval: raw.credential_reload_interval.0,

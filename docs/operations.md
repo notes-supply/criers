@@ -54,6 +54,10 @@ Ingestion listens on `server.listen`; probes and metrics listen on
 | `422` | Unsupported version, more than 512 alerts, malformed identity or fields over limits | not retried |
 | `503` + `Retry-After` | Admission full, shutting down, or storage unavailable | retried |
 
+Admission allows `server.ingest_concurrency` concurrent webhooks plus a waiting
+line four times that size. A request waits up to `server.admission_wait` for a
+slot; beyond the line or the wait it gets a 503.
+
 Alertmanager retries 5xx responses within a notification. It does not retry a
 4xx, but a failed notification is not recorded in its notification log, so the
 next `group_interval` flush sends the group again. A transient 4xx therefore

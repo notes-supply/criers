@@ -119,7 +119,10 @@ webhook_url_file = "ops.url"
             config: Arc::clone(&config),
             credentials: Arc::new(credentials),
             store: store.clone(),
-            admission: Arc::new(Semaphore::new(8)),
+            admission: Arc::new(http::Admission::new(
+                8,
+                std::time::Duration::from_millis(100),
+            )),
             metrics: Arc::new(Metrics::new()),
             wake: Arc::new(Notify::new()),
             draining: Arc::new(AtomicBool::new(false)),
@@ -517,7 +520,10 @@ async fn oversized_body_is_a_permanent_413_without_persisting() {
 async fn occupied_admission_returns_retryable_503() {
     let harness = Harness::shadow("").await;
     let mut state = harness.state.clone();
-    state.admission = Arc::new(Semaphore::new(0));
+    state.admission = Arc::new(http::Admission::new(
+        0,
+        std::time::Duration::from_millis(50),
+    ));
     let (status, _) = post_to(http::ingest_router(state), "example", &fixture(), TOKEN).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 }
@@ -526,7 +532,10 @@ async fn occupied_admission_returns_retryable_503() {
 async fn readiness_ignores_occupied_ingestion_admission() {
     let harness = Harness::shadow("").await;
     let mut state = harness.state.clone();
-    state.admission = Arc::new(Semaphore::new(0));
+    state.admission = Arc::new(http::Admission::new(
+        0,
+        std::time::Duration::from_millis(50),
+    ));
     let status = get(http::ops_router(state), "/health/ready").await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 }
@@ -577,7 +586,10 @@ async fn metrics_use_bounded_labels_without_fingerprints() {
 async fn status_reads_share_ingestion_admission() {
     let harness = Harness::shadow("").await;
     let mut state = harness.state.clone();
-    state.admission = Arc::new(Semaphore::new(0));
+    state.admission = Arc::new(http::Admission::new(
+        0,
+        std::time::Duration::from_millis(50),
+    ));
     let response = http::ingest_router(state)
         .oneshot(
             Request::builder()
@@ -612,5 +624,34 @@ async fn large_batches_are_decoded_off_the_reactor_and_accepted() {
     assert_eq!(
         (status, body["decisions"].as_array().map(Vec::len)),
         (StatusCode::ACCEPTED, Some(400))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_burst_within_the_waiting_line_is_admitted_instead_of_rejected() {
+    let harness = Harness::shadow("").await;
+    let mut state = harness.state.clone();
+    state.admission = Arc::new(http::Admission::new(2, std::time::Duration::from_secs(10)));
+    let app = http::ingest_router(state);
+    let posts: Vec<_> = (0..10)
+        .map(|index| {
+            let app = app.clone();
+            let payload = with(
+                fixture(),
+                "/alerts/0/fingerprint",
+                json!(format!("{index:016x}")),
+            );
+            tokio::spawn(async move { post_to(app, "example", &payload, TOKEN).await.0 })
+        })
+        .collect();
+    let mut statuses = Vec::new();
+    for post in posts {
+        statuses.push(post.await.unwrap());
+    }
+    assert!(
+        statuses
+            .iter()
+            .all(|&status| status == StatusCode::ACCEPTED),
+        "{statuses:?}"
     );
 }

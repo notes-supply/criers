@@ -10,6 +10,7 @@ listen = "127.0.0.1:8080"      # authenticated Alertmanager ingestion
 ops_listen = "127.0.0.1:9090"  # /health/live, /health/ready, /metrics
 max_body_bytes = 1048576
 ingest_concurrency = 8
+admission_wait = "1s"       # short queue before a retryable 503
 shutdown_grace = "10s"
 credential_reload_interval = "15s"
 

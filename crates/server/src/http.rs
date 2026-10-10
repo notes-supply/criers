@@ -20,7 +20,7 @@ use axum::{
 use criers_core::{Status, Webhook};
 use http_body_util::LengthLimitError;
 use serde_json::json;
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tower_http::{timeout::TimeoutLayer, trace::TraceLayer};
 
 use crate::{
@@ -36,7 +36,7 @@ pub(crate) struct AppState {
     pub config: Arc<Config>,
     pub credentials: Arc<BTreeMap<String, CredentialSet>>,
     pub store: Store,
-    pub admission: Arc<Semaphore>,
+    pub admission: Arc<Admission>,
     pub metrics: Arc<Metrics>,
     pub wake: Arc<Notify>,
     pub draining: Arc<AtomicBool>,
@@ -96,6 +96,37 @@ impl IntoResponse for AppError {
                 .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
         }
         response
+    }
+}
+
+/// Bounded ingestion admission: a few slots plus a short, capped waiting line.
+///
+/// A burst of group flushes queues briefly instead of failing at once; beyond
+/// the waiting line or the wait limit, callers get a retryable 503.
+pub(crate) struct Admission {
+    slots: Arc<Semaphore>,
+    waiting: Semaphore,
+    wait: Duration,
+}
+
+impl Admission {
+    pub(crate) fn new(slots: usize, wait: Duration) -> Self {
+        Self {
+            slots: Arc::new(Semaphore::new(slots)),
+            waiting: Semaphore::new(slots.saturating_mul(4)),
+            wait,
+        }
+    }
+
+    async fn enter(&self) -> Result<OwnedSemaphorePermit, AppError> {
+        if let Ok(permit) = Arc::clone(&self.slots).try_acquire_owned() {
+            return Ok(permit);
+        }
+        let _queued = self.waiting.try_acquire().map_err(|_| AppError::Busy)?;
+        match tokio::time::timeout(self.wait, Arc::clone(&self.slots).acquire_owned()).await {
+            Ok(Ok(permit)) => Ok(permit),
+            Ok(Err(_)) | Err(_) => Err(AppError::Busy),
+        }
     }
 }
 
@@ -219,9 +250,7 @@ async fn admit(state: &AppState, source: &str, request: Request) -> Result<Admit
     if state.draining.load(Ordering::Relaxed) {
         return Err(AppError::Draining);
     }
-    let permit = Arc::clone(&state.admission)
-        .try_acquire_owned()
-        .map_err(|_| AppError::Busy)?;
+    let permit = state.admission.enter().await?;
     let limit = state.config.server.max_body_bytes;
     let body = axum::body::to_bytes(request.into_body(), limit)
         .await
@@ -307,9 +336,7 @@ async fn snapshot(
     State(state): State<AppState>,
     Path(source): Path<String>,
 ) -> Result<Json<Snapshot>, AppError> {
-    let _permit = Arc::clone(&state.admission)
-        .try_acquire_owned()
-        .map_err(|_| AppError::Busy)?;
+    let _permit = state.admission.enter().await?;
     Ok(Json(state.store.snapshot(source).await?))
 }
 

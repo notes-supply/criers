@@ -9,10 +9,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use tokio::{
-    sync::{Notify, Semaphore},
-    task::JoinSet,
-};
+use tokio::{sync::Notify, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
@@ -164,7 +161,10 @@ async fn serve(path: &Path) -> Result<()> {
         config: Arc::clone(&config),
         credentials: Arc::clone(&credentials),
         store: store.clone(),
-        admission: Arc::new(Semaphore::new(config.server.ingest_concurrency)),
+        admission: Arc::new(http::Admission::new(
+            config.server.ingest_concurrency,
+            config.server.admission_wait,
+        )),
         metrics: Arc::clone(&metrics),
         wake: Arc::clone(&wake),
         draining: Arc::clone(&draining),
