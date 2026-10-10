@@ -174,7 +174,7 @@ async fn retention_deletes_in_bounded_batches() {
         .await
         .unwrap();
     let events: i64 = harness.query("SELECT count(*) FROM events").await;
-    assert_eq!((first.events, events), (2, 3));
+    assert_eq!((first.decisions, first.events, events), (2, 2, 3));
 }
 
 #[tokio::test]
@@ -203,7 +203,8 @@ async fn scaffold_database_migrates_and_keeps_shadow_intents_shadow() {
                 "INSERT INTO events(id, source, received_at, payload)
                  VALUES (1, 'example', '2026-10-10T10:00:01.5+00:00', '{payload}');
                  INSERT INTO occurrences(id, source, fingerprint, starts_at, status, highest_action)
-                 VALUES (1, 'example', '0123456789abcdef', '2026-10-10T10:00:00.000000000Z', 'firing', 2);
+                 VALUES (1, 'example', '0123456789abcdef', '2026-10-10T10:00:00.000000000Z', 'firing', 2),
+                        (2, 'example', '0123456789abcdef', '2026-10-09T10:00:00.000000000Z', 'firing', 2);
                  INSERT INTO decisions(event_id, occurrence_id, action, reason, policy_version, intent_created)
                  VALUES (1, 1, 'ping', 'trusted_critical_floor', 'deterministic-v1', 1);
                  INSERT INTO outbox(occurrence_id, kind, action, mode, created_at)
@@ -244,6 +245,16 @@ async fn scaffold_database_migrates_and_keeps_shadow_intents_shadow() {
         })
         .await
         .unwrap();
+    let older: String = store
+        .with_connection(|connection| {
+            Ok(
+                connection.query_row("SELECT status FROM occurrences WHERE id = 2", [], |row| {
+                    row.get(0)
+                })?,
+            )
+        })
+        .await
+        .unwrap();
     let claim = store
         .claim_deliveries(
             "ops".into(),
@@ -261,8 +272,9 @@ async fn scaffold_database_migrates_and_keeps_shadow_intents_shadow() {
             && state == "shadow"
             && alertname == "ExampleStorageFailure"
             && received == 1_791_626_401_500
+            && older == "superseded"
             && matches!(claim, Claim::Wait(None)),
-        "state={state} alertname={alertname} received={received} claim={claim:?}"
+        "state={state} alertname={alertname} received={received} older={older} claim={claim:?}"
     );
 }
 
@@ -319,4 +331,125 @@ async fn coverage_moves_from_never_seen_to_recovered_to_stale() {
         (states, notifications),
         (vec!["never_seen", "healthy", "stale"], 3)
     );
+}
+
+const DEAD_DISCORD: &str = "http://127.0.0.1:9/api/webhooks/123456789012345678/x";
+const LIMITS: ClaimLimits = ClaimLimits {
+    max_rows: 10,
+    budget_chars: 1900,
+    mention_cooldown_ms: 0,
+};
+
+async fn claim_and_complete(harness: &Harness, completion: super::Completion) {
+    let Claim::Batch(batch) = harness
+        .store
+        .claim_deliveries("ops".into(), crate::now_ms(), LIMITS)
+        .await
+        .unwrap()
+    else {
+        panic!("expected a batch");
+    };
+    harness
+        .store
+        .complete_deliveries("ops".into(), batch.ids, completion, 3)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn rows_blocked_behind_an_earlier_send_do_not_cause_an_immediate_reclaim() {
+    let harness = Harness::live(DEAD_DISCORD, "").await;
+    harness
+        .ingest(with(
+            fixture(),
+            "/alerts/0/labels/severity",
+            json!("warning"),
+        ))
+        .await;
+    let retry_at = crate::now_ms() + HOUR;
+    claim_and_complete(
+        &harness,
+        super::Completion::Retry {
+            retry_at,
+            status: Some(502),
+            error: "HTTP 502".into(),
+            ambiguous: true,
+        },
+    )
+    .await;
+    harness.ingest(fixture()).await;
+    let claim = harness
+        .store
+        .claim_deliveries("ops".into(), crate::now_ms(), LIMITS)
+        .await
+        .unwrap();
+    assert!(
+        matches!(claim, Claim::Wait(Some(at)) if at >= retry_at),
+        "{claim:?}"
+    );
+}
+
+#[tokio::test]
+async fn no_op_writes_do_not_mask_a_full_database_in_readiness() {
+    let harness = Harness::live(DEAD_DISCORD, "").await;
+    cap_at_current_size(&harness.store).await;
+    let (status, _) = post_to(harness.app(), "example", &bulky(), TOKEN).await;
+    let claim = harness
+        .store
+        .claim_deliveries("ops".into(), crate::now_ms(), LIMITS)
+        .await;
+    let ready = get(harness.ops(), "/health/ready").await;
+    assert_eq!(
+        (status, claim.is_ok(), ready),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            true,
+            StatusCode::SERVICE_UNAVAILABLE
+        )
+    );
+}
+
+#[tokio::test]
+async fn retention_keeps_the_delivery_record_of_a_still_firing_alert() {
+    let harness = Harness::live(DEAD_DISCORD, "").await;
+    harness.ingest(fixture()).await;
+    claim_and_complete(
+        &harness,
+        super::Completion::Sent {
+            remote_id: Some("1".into()),
+            status: 200,
+            mentioned: true,
+        },
+    )
+    .await;
+    harness
+        .store
+        .retention_step(crate::now_ms() + HOUR, 1000)
+        .await
+        .unwrap();
+    let receipt = harness
+        .ingest(with(fixture(), "/alerts/0/status", json!("resolved")))
+        .await;
+    assert_eq!(
+        (
+            receipt.decisions[0].reason,
+            receipt.decisions[0].intent_created
+        ),
+        ("recovery", true)
+    );
+}
+
+#[tokio::test]
+async fn open_deliveries_for_removed_destinations_are_ended() {
+    let harness = Harness::live(DEAD_DISCORD, "").await;
+    harness
+        .ingest(with(fixture(), "/receiver", json!("quiet")))
+        .await;
+    let abandoned = harness
+        .store
+        .abandon_unconfigured(vec!["ops".into()])
+        .await
+        .unwrap();
+    let state: String = harness.query("SELECT state FROM outbox").await;
+    assert_eq!((abandoned, state.as_str()), (1, "failed"));
 }

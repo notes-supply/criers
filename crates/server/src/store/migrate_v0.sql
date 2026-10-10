@@ -42,6 +42,12 @@ LEFT JOIN json_each(le.payload, '$.alerts') alert
     ON lower(json_extract(alert.value, '$.fingerprint')) = o.fingerprint
 GROUP BY o.id;
 
+-- The scaffold never marked older starts of a fingerprint as superseded.
+UPDATE occurrences SET status = 'superseded', closed_at = last_seen_at
+WHERE status = 'firing' AND EXISTS (SELECT 1 FROM occurrences newer
+    WHERE newer.source = occurrences.source AND newer.fingerprint = occurrences.fingerprint
+    AND newer.starts_at > occurrences.starts_at);
+
 INSERT INTO decisions(id, event_id, occurrence_id, action, reason, policy_version)
 SELECT id, event_id, occurrence_id, action, reason, policy_version
 FROM temp.legacy_decisions;

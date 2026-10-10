@@ -6,7 +6,7 @@
 
 use std::{sync::Arc, time::Duration};
 
-use reqwest::{Client, StatusCode, Url, header::HeaderMap};
+use reqwest::{Client, StatusCode, Url};
 use secrecy::ExposeSecret;
 use serde::Serialize;
 use tokio::sync::Notify;
@@ -21,6 +21,8 @@ use crate::{
 };
 
 const MAX_RESPONSE_BYTES: usize = 65_536;
+const IDLE_POLL: Duration = Duration::from_secs(5);
+const MIN_WAIT: Duration = Duration::from_millis(50);
 const MENTION_COALESCED: &str = "(mention coalesced; recently pinged)\n";
 
 /// What a Discord request achieved.
@@ -167,38 +169,37 @@ impl Discord {
             .await
         {
             Ok(response) => response,
-            Err(error) => return transport_outcome(&error),
+            Err(error) => return transport_outcome(error),
         };
         let status = response.status();
-        let headers = response.headers().clone();
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .and_then(seconds);
         let body = read_bounded(response, MAX_RESPONSE_BYTES).await;
-        classify(status, &headers, body)
+        classify(status, retry_after, body)
     }
 }
 
-fn transport_outcome(error: &reqwest::Error) -> Outcome {
-    let text = error.to_string();
+fn transport_outcome(error: reqwest::Error) -> Outcome {
+    let builder = error.is_builder();
     // Without a connection nothing reached Discord; afterwards the message may exist.
-    let ambiguous = !error.is_connect() && !error.is_builder();
-    if error.is_builder() {
+    let ambiguous = !error.is_connect() && !builder;
+    // The request URL contains the webhook token and must never be stored or logged.
+    let error = error.without_url().to_string();
+    if builder {
         Outcome::Permanent {
             status: None,
-            error: text,
+            error,
         }
     } else {
         Outcome::Retry {
             status: None,
-            error: redact_url(&text),
+            error,
             ambiguous,
         }
-    }
-}
-
-/// reqwest errors can include the request URL, which contains the webhook token.
-fn redact_url(text: &str) -> String {
-    match text.find("http") {
-        Some(start) => format!("{}[url redacted]", &text[..start]),
-        None => text.to_owned(),
     }
 }
 
@@ -216,9 +217,10 @@ fn seconds(value: f64) -> Option<Duration> {
     (value.is_finite() && value >= 0.0).then(|| Duration::from_secs_f64(value.min(86_400.0)))
 }
 
+/// Classifies a response; `retry_after` is the parsed `Retry-After` header.
 pub(crate) fn classify(
     status: StatusCode,
-    headers: &HeaderMap,
+    retry_after: Option<Duration>,
     body: Result<Vec<u8>, BodyError>,
 ) -> Outcome {
     let code = status.as_u16();
@@ -241,14 +243,9 @@ pub(crate) fn classify(
             .ok()
             .and_then(|bytes| serde_json::from_slice::<RateLimit>(&bytes).ok())
             .and_then(|limit| seconds(limit.retry_after));
-        let from_header = headers
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.trim().parse::<f64>().ok())
-            .and_then(seconds);
         let retry_after = from_body
             .into_iter()
-            .chain(from_header)
+            .chain(retry_after)
             .max()
             .unwrap_or(Duration::from_secs(1));
         return Outcome::RateLimited {
@@ -308,6 +305,10 @@ impl Worker {
         };
         let mut failures = 0u32;
         while !cancel.is_cancelled() {
+            // Registering before the claim means a commit during the claim still wakes us.
+            let woken = self.wake.notified();
+            tokio::pin!(woken);
+            woken.as_mut().enable();
             let now = crate::now_ms();
             let wait = match self
                 .store
@@ -316,14 +317,14 @@ impl Worker {
             {
                 Ok(Claim::Batch(batch)) => {
                     failures = 0;
-                    self.deliver(batch).await;
+                    self.deliver(batch, &cancel).await;
                     continue;
                 }
                 Ok(Claim::Wait(until)) => {
                     failures = 0;
-                    until.map_or(Duration::from_secs(5), |until| {
+                    until.map_or(IDLE_POLL, |until| {
                         Duration::from_millis(u64::try_from(until - now).unwrap_or(0))
-                            .min(Duration::from_secs(5))
+                            .clamp(MIN_WAIT, IDLE_POLL)
                     })
                 }
                 Err(error) => {
@@ -338,13 +339,13 @@ impl Worker {
             };
             tokio::select! {
                 () = cancel.cancelled() => break,
-                () = self.wake.notified() => {}
+                () = woken => {}
                 () = tokio::time::sleep(wait) => {}
             }
         }
     }
 
-    async fn deliver(&self, batch: Batch) {
+    async fn deliver(&self, batch: Batch, cancel: &CancellationToken) {
         let (content, mention) = self.discord.message(&batch);
         let outcome = self.discord.send(&content, mention).await;
         self.metrics
@@ -400,27 +401,28 @@ impl Worker {
         if batch.possibly_duplicate {
             tracing::info!(destination = %self.destination, rows = batch.ids.len(), "retried rows may duplicate an earlier ambiguous send");
         }
-        let ids = batch.ids;
-        // Completion must persist even during shutdown; retry briefly on storage errors.
-        for attempt in 1..=3u32 {
-            match self
+        // Keep trying to record the outcome: rows left in flight would block later
+        // intents of their occurrences. Only shutdown abandons the attempt, and
+        // restart then retries those rows as possible duplicates.
+        let mut attempt = 0u32;
+        loop {
+            let result = self
                 .store
                 .complete_deliveries(
                     self.destination.clone(),
-                    ids.clone(),
+                    batch.ids.clone(),
                     completion.clone(),
                     settings.max_attempts,
                 )
-                .await
-            {
-                Ok(()) => return,
-                Err(error) => {
-                    tracing::error!(destination = %self.destination, %error, attempt, "cannot record delivery outcome");
-                    tokio::time::sleep(Duration::from_millis(200 * u64::from(attempt))).await;
-                }
+                .await;
+            let Err(error) = result else { return };
+            attempt = attempt.saturating_add(1);
+            tracing::error!(destination = %self.destination, %error, attempt, "cannot record delivery outcome");
+            tokio::select! {
+                () = cancel.cancelled() => return,
+                () = tokio::time::sleep(backoff(attempt, Duration::from_millis(200), Duration::from_secs(10))) => {}
             }
         }
-        // The rows stay in flight and become possible duplicates on restart.
     }
 }
 
@@ -428,19 +430,11 @@ impl Worker {
 mod tests {
     use super::*;
 
-    fn headers(retry_after: Option<&str>) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        if let Some(value) = retry_after {
-            headers.insert(reqwest::header::RETRY_AFTER, value.parse().unwrap());
-        }
-        headers
-    }
-
     #[test]
     fn rate_limit_uses_the_longer_of_body_and_header() {
         let outcome = classify(
             StatusCode::TOO_MANY_REQUESTS,
-            &headers(Some("3")),
+            Some(Duration::from_secs(3)),
             Ok(br#"{"message":"limited","retry_after":1.5,"global":false}"#.to_vec()),
         );
         assert_eq!(
@@ -454,7 +448,7 @@ mod tests {
 
     #[test]
     fn missing_webhook_is_permanent() {
-        let outcome = classify(StatusCode::NOT_FOUND, &headers(None), Ok(Vec::new()));
+        let outcome = classify(StatusCode::NOT_FOUND, None, Ok(Vec::new()));
         assert!(matches!(
             outcome,
             Outcome::Permanent {
@@ -466,7 +460,7 @@ mod tests {
 
     #[test]
     fn gateway_timeout_is_an_ambiguous_retry() {
-        let outcome = classify(StatusCode::GATEWAY_TIMEOUT, &headers(None), Ok(Vec::new()));
+        let outcome = classify(StatusCode::GATEWAY_TIMEOUT, None, Ok(Vec::new()));
         assert!(matches!(
             outcome,
             Outcome::Retry {
@@ -478,7 +472,7 @@ mod tests {
 
     #[test]
     fn success_without_a_readable_body_is_still_sent() {
-        let outcome = classify(StatusCode::OK, &headers(None), Err(BodyError::TooLarge));
+        let outcome = classify(StatusCode::OK, None, Err(BodyError::TooLarge));
         assert_eq!(
             outcome,
             Outcome::Sent {

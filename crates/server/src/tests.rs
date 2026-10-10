@@ -572,3 +572,45 @@ async fn metrics_use_bounded_labels_without_fingerprints() {
         "{text}"
     );
 }
+
+#[tokio::test]
+async fn status_reads_share_ingestion_admission() {
+    let harness = Harness::shadow("").await;
+    let mut state = harness.state.clone();
+    state.admission = Arc::new(Semaphore::new(0));
+    let response = http::ingest_router(state)
+        .oneshot(
+            Request::builder()
+                .uri("/v1/sources/example/status")
+                .header("Authorization", format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn large_batches_are_decoded_off_the_reactor_and_accepted() {
+    let harness = Harness::shadow("").await;
+    let mut batch = fixture();
+    let template = batch["alerts"][0].clone();
+    batch["alerts"] = Value::Array(
+        (0..400)
+            .map(|index| {
+                with(
+                    template.clone(),
+                    "/fingerprint",
+                    json!(format!("{index:016x}")),
+                )
+            })
+            .collect(),
+    );
+    assert!(batch.to_string().len() > 65_536);
+    let (status, body) = post_to(harness.app(), "example", &batch, TOKEN).await;
+    assert_eq!(
+        (status, body["decisions"].as_array().map(Vec::len)),
+        (StatusCode::ACCEPTED, Some(400))
+    );
+}

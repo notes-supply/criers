@@ -18,6 +18,7 @@ use axum::{
     routing::{get, post},
 };
 use criers_core::{Status, Webhook};
+use http_body_util::LengthLimitError;
 use serde_json::json;
 use tokio::sync::{Notify, Semaphore};
 use tower_http::{timeout::TimeoutLayer, trace::TraceLayer};
@@ -50,6 +51,8 @@ pub(crate) enum AppError {
         "request body exceeds {0} bytes; lower Alertmanager max_alerts or raise server.max_body_bytes"
     )]
     TooLarge(usize),
+    #[error("request body could not be read")]
+    BodyRead,
     #[error("ingestion capacity is occupied; retry later")]
     Busy,
     #[error("shutting down; retry later")]
@@ -63,6 +66,7 @@ impl AppError {
         match self {
             Self::Invalid(_) => "invalid",
             Self::TooLarge(_) => "too_large",
+            Self::BodyRead => "body_error",
             Self::Busy => "busy",
             Self::Draining => "draining",
             Self::Storage(_) => "storage_error",
@@ -75,6 +79,7 @@ impl IntoResponse for AppError {
         let (status, message) = match self {
             Self::Invalid(reason) => (StatusCode::UNPROCESSABLE_ENTITY, reason),
             Self::TooLarge(_) => (StatusCode::PAYLOAD_TOO_LARGE, self.to_string()),
+            Self::BodyRead => (StatusCode::BAD_REQUEST, self.to_string()),
             Self::Busy | Self::Draining => (StatusCode::SERVICE_UNAVAILABLE, self.to_string()),
             Self::Storage(error) => {
                 tracing::error!(%error, "storage operation failed");
@@ -192,6 +197,18 @@ async fn ingest(
     }
 }
 
+const INLINE_DECODE_BYTES: usize = 65_536;
+
+fn decode(body: &[u8]) -> Result<Webhook, AppError> {
+    let webhook: Webhook = serde_json::from_slice(body).map_err(|error| {
+        AppError::Invalid(format!("invalid Alertmanager webhook JSON: {error}"))
+    })?;
+    webhook
+        .validate()
+        .map_err(|reason| AppError::Invalid(reason.to_owned()))?;
+    Ok(webhook)
+}
+
 struct Admitted {
     receipt: Receipt,
     firing: u64,
@@ -208,14 +225,21 @@ async fn admit(state: &AppState, source: &str, request: Request) -> Result<Admit
     let limit = state.config.server.max_body_bytes;
     let body = axum::body::to_bytes(request.into_body(), limit)
         .await
-        .map_err(|_| AppError::TooLarge(limit))?;
-    let webhook: Webhook = serde_json::from_slice(&body).map_err(|error| {
-        AppError::Invalid(format!("invalid Alertmanager webhook JSON: {error}"))
-    })?;
-    drop(body);
-    webhook
-        .validate()
-        .map_err(|reason| AppError::Invalid(reason.to_owned()))?;
+        .map_err(|error| {
+            if error.into_inner().is::<LengthLimitError>() {
+                AppError::TooLarge(limit)
+            } else {
+                AppError::BodyRead
+            }
+        })?;
+    // Large batches are decoded on a blocking thread so they cannot stall the reactor.
+    let webhook = if body.len() > INLINE_DECODE_BYTES {
+        tokio::task::spawn_blocking(move || decode(&body))
+            .await
+            .map_err(|error| AppError::Storage(error.into()))??
+    } else {
+        decode(&body)?
+    };
     let heartbeat = state
         .config
         .sources
@@ -278,10 +302,14 @@ fn observe(state: &AppState, source: &str, admitted: &Admitted) {
     }
 }
 
+/// Status reads share ingestion admission so they cannot queue unbounded work.
 async fn snapshot(
     State(state): State<AppState>,
     Path(source): Path<String>,
 ) -> Result<Json<Snapshot>, AppError> {
+    let _permit = Arc::clone(&state.admission)
+        .try_acquire_owned()
+        .map_err(|_| AppError::Busy)?;
     Ok(Json(state.store.snapshot(source).await?))
 }
 

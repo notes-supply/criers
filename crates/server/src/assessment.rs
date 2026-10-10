@@ -9,7 +9,7 @@ use criers_core::Alert;
 use reqwest::{Client, StatusCode, header};
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Value, json, value::RawValue};
 use tokio::{sync::Notify, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 
@@ -17,7 +17,7 @@ use crate::{
     config::{Assessment, hex_sha256},
     http_body::read_bounded,
     metrics::{Metrics, OutcomeLabels},
-    store::{AssessmentJob, Store},
+    store::{AssessmentFailure, AssessmentJob, Store},
 };
 
 /// Version of the fixed question set; recorded with every result.
@@ -170,7 +170,8 @@ impl Clef {
 
     /// Requests impact and urgency probabilities for one redacted context.
     pub(crate) async fn assess(&self, context: &str) -> Result<Answers, AssessError> {
-        let state: Value = serde_json::from_str(context)
+        // The stored context is already JSON; embed it without rebuilding a Value.
+        let state: &RawValue = serde_json::from_str(context)
             .map_err(|error| AssessError::Malformed(error.to_string()))?;
         let body = json!({
             "model": self.config.model,
@@ -310,6 +311,9 @@ pub(crate) async fn run(
     let max_attempts = clef.config.max_attempts;
     let mut running: JoinSet<()> = JoinSet::new();
     loop {
+        let woken = wake.notified();
+        tokio::pin!(woken);
+        woken.as_mut().enable();
         while running.try_join_next().is_some() {}
         let capacity = concurrency.saturating_sub(running.len());
         let mut claimed = 0;
@@ -335,7 +339,7 @@ pub(crate) async fn run(
         }
         tokio::select! {
             () = cancel.cancelled() => break,
-            () = wake.notified() => {}
+            () = woken => {}
             Some(_) = running.join_next(), if !running.is_empty() => {}
             () = tokio::time::sleep(Duration::from_secs(1)) => {}
         }
@@ -373,7 +377,11 @@ async fn assess_one(
             store
                 .record_assessment(
                     job.id,
-                    Err((error.outcome(), error.to_string(), retry_at)),
+                    Err(AssessmentFailure {
+                        outcome: error.outcome(),
+                        error: error.to_string(),
+                        retry_at,
+                    }),
                     now,
                     max_attempts,
                 )

@@ -207,6 +207,16 @@ async fn serve(path: &Path) -> Result<()> {
         cancel.child_token(),
     ));
     if config.mode == config::Mode::Live {
+        let abandoned = store
+            .abandon_unconfigured(config.destinations.keys().cloned().collect())
+            .await
+            .context("cannot reconcile deliveries for removed destinations")?;
+        if abandoned > 0 {
+            tracing::warn!(
+                abandoned,
+                "ended open deliveries for destinations no longer configured"
+            );
+        }
         let settings = config.delivery;
         for (id, destination) in &config.destinations {
             let worker = delivery::Worker {

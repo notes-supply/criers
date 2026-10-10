@@ -937,10 +937,14 @@ fn resolve(base: &Path, path: &Path) -> PathBuf {
 }
 
 pub(crate) fn hex_sha256(bytes: &[u8]) -> String {
+    use std::fmt::Write;
     Sha256::digest(bytes)
         .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+        .fold(String::with_capacity(64), |mut text, byte| {
+            // Writing to a String cannot fail.
+            let _ = write!(text, "{byte:02x}");
+            text
+        })
 }
 
 fn read_bounded(path: &Path, limit: u64) -> Result<String> {

@@ -19,6 +19,7 @@ CREATE TABLE events (
     truncated_alerts INTEGER NOT NULL
 ) STRICT;
 CREATE INDEX events_received ON events(received_at);
+CREATE INDEX events_source ON events(source);
 
 CREATE TABLE occurrences (
     id INTEGER PRIMARY KEY,
@@ -79,6 +80,7 @@ CREATE UNIQUE INDEX outbox_intent ON outbox(occurrence_id, kind, action)
 CREATE INDEX outbox_open ON outbox(destination, due_at, id)
     WHERE state IN ('pending', 'in_flight');
 CREATE INDEX outbox_occurrence ON outbox(occurrence_id);
+CREATE INDEX outbox_source ON outbox(source);
 CREATE INDEX outbox_completed ON outbox(completed_at) WHERE completed_at IS NOT NULL;
 
 CREATE TABLE destination_state (
@@ -111,6 +113,7 @@ CREATE TABLE assessments (
     error TEXT
 ) STRICT;
 CREATE INDEX assessments_open ON assessments(due_at, id) WHERE state IN ('pending', 'in_flight');
+CREATE INDEX assessments_done ON assessments(completed_at) WHERE state = 'done';
 
 CREATE TABLE source_status (
     source TEXT PRIMARY KEY,

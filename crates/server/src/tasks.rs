@@ -119,6 +119,7 @@ pub(crate) async fn retention(
                 }
             };
             for (table, count) in [
+                ("decisions", deleted.decisions),
                 ("events", deleted.events),
                 ("occurrences", deleted.occurrences),
                 ("outbox", deleted.deliveries),
@@ -132,6 +133,7 @@ pub(crate) async fn retention(
                 }
             }
             let saturated = [
+                deleted.decisions,
                 deleted.events,
                 deleted.occurrences,
                 deleted.deliveries,

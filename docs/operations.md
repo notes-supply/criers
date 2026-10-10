@@ -62,7 +62,7 @@ fails on every flush until `max_alerts` or `max_body_bytes` changes. Criers neve
 answers a permanent problem with 503, so oversize input cannot cause a retry loop.
 
 `GET /v1/sources/<id>/status` returns counts and freshness for that source, with
-the same credential.
+the same credential. It shares ingestion's admission limit.
 
 ## Policy
 
@@ -80,10 +80,16 @@ recorded as superseded and changes nothing.
 ## Delivery
 
 Only `mode = "live"` sends. Intents recorded in shadow mode stay shadow when the
-mode changes.
+mode changes. As a consequence, an alert that is already firing when you switch
+to live, and was already recorded in shadow mode, is not paged at the cutover;
+only a recurrence, an escalation or a new alert produces a live message. Review
+the firing alerts in Alertmanager when you switch.
 
 - **One owner.** Each destination has one worker. It marks rows in flight in
-  SQLite before every request and records the outcome after it.
+  SQLite before every request and records the outcome after it, retrying that
+  record until it succeeds or Criers shuts down. Open deliveries for a
+  destination removed from the configuration end as failed (or ambiguous) at
+  the next live startup.
 - **Discord.** Requests use `?wait=true` and an explicit `allowed_mentions`
   with `parse: []`. Only configured user and role IDs can be mentioned; alert
   text is escaped so it cannot form mentions or links.
@@ -145,11 +151,14 @@ SQLite runs in WAL mode with full synchronous commits. `storage.max_size_mib`
 caps the main database file; the WAL is truncated to 64 MiB after checkpoints,
 so size the volume above the cap.
 
-Retention runs every `retention_interval` and deletes at most `retention_batch`
-rows per table per transaction. It removes webhook metadata and decisions older
-than `retention`, resolved or superseded occurrences closed before then, and
-finished deliveries and assessments. It keeps unresolved occurrences and any
-occurrence with a pending or in-flight delivery.
+Retention runs every `retention_interval`. Each transaction deletes at most
+`retention_batch` decisions, webhook records, closed occurrences, finished
+deliveries and finished assessments; deleting a closed occurrence also removes
+its own few remaining child rows. It removes webhook metadata and decisions
+older than `retention`, resolved or superseded occurrences closed before then,
+and finished deliveries and assessments. It keeps unresolved occurrences, any
+occurrence with a pending or in-flight delivery, and the delivery records of
+alerts that are still firing, because their recovery depends on them.
 
 The replay horizon equals `retention`: a webhook replaying a resolved occurrence
 older than that is treated as new. Keep `retention` well above Alertmanager's
@@ -163,16 +172,18 @@ repair.
 ## Health and metrics
 
 - `/health/live` reports that the process is serving.
-- `/health/ready` fails when the most recent storage write failed or no write
-  succeeded within three probe intervals. A background probe commits a small
-  write and test-allocates pages every `storage.health_interval`. Readiness
-  never takes an ingestion slot, so a busy receiver stays ready.
+- `/health/ready` fails when the most recent storage write failed, or when
+  neither an ingestion commit nor the background probe succeeded within three
+  probe intervals. The probe commits a small write and test-allocates pages
+  every `storage.health_interval`, so a full or read-only database is detected
+  without traffic. Readiness never takes an ingestion slot, so a busy receiver
+  stays ready.
 - `/metrics` exposes OpenMetrics. Labels are configured source and destination
   IDs and fixed outcome or reason names; never fingerprints or alert text.
 
 | Metric | Use |
 | --- | --- |
-| `criers_ingest_requests_total{source,outcome}` | accepted, unauthorized, invalid, too_large, busy, draining, storage_error |
+| `criers_ingest_requests_total{source,outcome}` | accepted, unauthorized, invalid, too_large, body_error, busy, draining, storage_error |
 | `criers_ingest_duration_seconds` | accepted request time including the commit |
 | `criers_decisions_total{action,reason}` | policy outcomes |
 | `criers_source_heartbeat_age_seconds`, `criers_source_coverage{source,state}` | coverage: unknown, healthy, stale, never_seen |

@@ -184,11 +184,18 @@ pub(crate) struct AssessmentJob {
     pub attempts: u32,
 }
 
-/// A failed assessment attempt: outcome, error text and an optional retry time.
-pub(crate) type AssessmentFailure = (&'static str, String, Option<i64>);
+/// A failed assessment attempt.
+#[derive(Debug)]
+pub(crate) struct AssessmentFailure {
+    pub outcome: &'static str,
+    pub error: String,
+    /// When to retry, if the failure is transient.
+    pub retry_at: Option<i64>,
+}
 
 #[derive(Debug, Default)]
 pub(crate) struct Retention {
+    pub decisions: usize,
     pub events: usize,
     pub occurrences: usize,
     pub deliveries: usize,
@@ -266,18 +273,34 @@ impl Store {
         .await?
     }
 
-    /// Runs a write and records its outcome as storage health evidence.
+    /// Runs a write whose failure counts against readiness.
+    ///
+    /// Success does not prove health: a claim or retention pass may write nothing.
     async fn write<T, F>(&self, operation: F) -> Result<T, StoreError>
     where
         T: Send + 'static,
         F: FnOnce(&mut Connection) -> Result<T, StoreError> + Send + 'static,
     {
         let result = self.with_connection(operation).await;
-        let now = crate::now_ms();
-        match &result {
-            Ok(_) => self.inner.health.ok(now),
-            Err(error) if storage_failure(error) => self.inner.health.failed(now),
-            Err(_) => {}
+        if let Err(error) = &result
+            && storage_failure(error)
+        {
+            self.inner.health.failed(crate::now_ms());
+        }
+        result
+    }
+
+    /// Runs a write whose success proves the database accepts new data.
+    ///
+    /// Only ingestion commits and the allocation probe qualify.
+    async fn proving_write<T, F>(&self, operation: F) -> Result<T, StoreError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Connection) -> Result<T, StoreError> + Send + 'static,
+    {
+        let result = self.write(operation).await;
+        if result.is_ok() {
+            self.inner.health.ok(crate::now_ms());
         }
         result
     }
@@ -294,7 +317,7 @@ impl Store {
         webhook: Webhook,
         permit: OwnedSemaphorePermit,
     ) -> Result<Receipt, StoreError> {
-        self.write(move |connection| {
+        self.proving_write(move |connection| {
             let _permit = permit;
             let now = crate::now_ms();
             let transaction = connection.transaction()?;
@@ -389,13 +412,16 @@ impl Store {
             transaction.execute(
                 "UPDATE assessments SET state = 'done', outcome = 'skipped_closed', completed_at = ?1
                  WHERE id IN (SELECT a.id FROM assessments a JOIN occurrences o ON o.id = a.occurrence_id
-                    WHERE a.state = 'pending' AND o.status != 'firing' LIMIT 100)",
+                    WHERE a.state IN ('pending', 'in_flight') AND a.state = 'pending'
+                    AND o.status != 'firing' LIMIT 100)",
                 [now],
             )?;
             let jobs = {
                 let mut statement = transaction.prepare_cached(
+                    // The repeated state term lets SQLite use the partial index.
                     "SELECT id, context, attempts FROM assessments
-                     WHERE state = 'pending' AND due_at <= ?1 ORDER BY due_at, id LIMIT ?2",
+                     WHERE state IN ('pending', 'in_flight') AND state = 'pending'
+                     AND due_at <= ?1 ORDER BY due_at, id LIMIT ?2",
                 )?;
                 statement
                     .query_map(params![now, limit as i64], |row| {
@@ -466,7 +492,11 @@ impl Store {
                     )?;
                     Some(outcome)
                 }
-                Err((outcome, error, Some(retry_at))) if attempts < max_attempts => {
+                Err(AssessmentFailure {
+                    outcome,
+                    error,
+                    retry_at: Some(retry_at),
+                }) if attempts < max_attempts => {
                     transaction.execute(
                         "UPDATE assessments SET state = 'pending', due_at = ?2, error = ?3,
                             outcome = ?4 WHERE id = ?1",
@@ -474,7 +504,7 @@ impl Store {
                     )?;
                     None
                 }
-                Err((outcome, error, _)) => {
+                Err(AssessmentFailure { outcome, error, .. }) => {
                     transaction.execute(
                         "UPDATE assessments SET state = 'done', outcome = ?2, error = ?3,
                             completed_at = ?4 WHERE id = ?1",
@@ -515,10 +545,21 @@ impl Store {
     ) -> Result<Retention, StoreError> {
         self.write(move |connection| {
             let transaction = connection.transaction()?;
+            // Decisions go first so deleting their events cascades to nothing,
+            // keeping every statement within `batch` rows.
+            let decisions = transaction.execute(
+                "DELETE FROM decisions WHERE id IN
+                    (SELECT d.id FROM events e JOIN decisions d ON d.event_id = e.id
+                     WHERE e.received_at < ?1 ORDER BY e.received_at LIMIT ?2)",
+                params![cutoff, batch],
+            )?;
             let deleted = Retention {
+                decisions,
                 events: transaction.execute(
                     "DELETE FROM events WHERE id IN
-                        (SELECT id FROM events WHERE received_at < ?1 ORDER BY received_at LIMIT ?2)",
+                            (SELECT e.id FROM events e WHERE e.received_at < ?1
+                             AND NOT EXISTS (SELECT 1 FROM decisions d WHERE d.event_id = e.id)
+                             ORDER BY e.received_at LIMIT ?2)",
                     params![cutoff, batch],
                 )?,
                 occurrences: transaction.execute(
@@ -529,16 +570,21 @@ impl Store {
                          ORDER BY o.closed_at LIMIT ?2)",
                     params![cutoff, batch],
                 )?,
+                // Deliveries of a still-firing occurrence are kept: its recovery
+                // depends on knowing that the firing message went out.
                 deliveries: transaction.execute(
                     "DELETE FROM outbox WHERE id IN
-                        (SELECT id FROM outbox WHERE completed_at < ?1
-                         AND state NOT IN ('pending', 'in_flight') ORDER BY completed_at LIMIT ?2)",
+                        (SELECT b.id FROM outbox b WHERE b.completed_at < ?1
+                         AND b.state NOT IN ('pending', 'in_flight')
+                         AND NOT EXISTS (SELECT 1 FROM occurrences o
+                            WHERE o.id = b.occurrence_id AND o.status = 'firing')
+                         ORDER BY b.completed_at LIMIT ?2)",
                     params![cutoff, batch],
                 )?,
                 assessments: transaction.execute(
                     "DELETE FROM assessments WHERE id IN
                         (SELECT id FROM assessments WHERE state = 'done' AND completed_at < ?1
-                         LIMIT ?2)",
+                         ORDER BY completed_at LIMIT ?2)",
                     params![cutoff, batch],
                 )?,
             };
@@ -548,10 +594,30 @@ impl Store {
         .await
     }
 
+    /// Ends open live deliveries whose destination is no longer configured.
+    ///
+    /// Without this, no worker would ever own them, and later intents of the same
+    /// occurrence would wait behind them forever.
+    pub(crate) async fn abandon_unconfigured(
+        &self,
+        destinations: Vec<String>,
+    ) -> Result<usize, StoreError> {
+        self.write(move |connection| {
+            Ok(connection.execute(
+                "UPDATE outbox SET completed_at = ?2, last_error = 'destination_not_configured',
+                    state = CASE WHEN possibly_delivered = 1 THEN 'ambiguous' ELSE 'failed' END
+                 WHERE state IN ('pending', 'in_flight')
+                 AND destination NOT IN (SELECT value FROM json_each(?1))",
+                params![serde_json::to_string(&destinations)?, crate::now_ms()],
+            )?)
+        })
+        .await
+    }
+
     /// Proves writability and page allocation, then gathers operational figures.
     pub(crate) async fn probe(&self) -> Result<Stats, StoreError> {
         let (page_size, max_pages) = (self.inner.page_size, self.inner.max_pages);
-        self.write(move |connection| {
+        self.proving_write(move |connection| {
             let now = crate::now_ms();
             connection.execute(
                 "INSERT INTO meta(key, value) VALUES ('probe_at', ?1)
@@ -763,6 +829,141 @@ fn process_alert(
         event_id,
         now,
     } = *context;
+    let observed = upsert_occurrence(transaction, context, alert)?;
+    let id = observed.id;
+    let recovery_destination: Option<String> = if alert.status == Status::Resolved
+        && matches!(observed.prior, Prior::New | Prior::Firing(_))
+    {
+        transaction
+            .prepare_cached(
+                "SELECT destination FROM outbox WHERE occurrence_id = ?1 AND mode = 'live'
+                 AND kind = 'notify'
+                 AND (state IN ('sent', 'ambiguous', 'in_flight') OR possibly_delivered = 1)
+                 ORDER BY id DESC LIMIT 1",
+            )?
+            .query_row([id], |row| row.get(0))
+            .optional()?
+    } else {
+        None
+    };
+    let notified = if recovery_destination.is_some() {
+        Notified::Possibly
+    } else {
+        Notified::No
+    };
+    let proposal = config
+        .policy
+        .propose(alert.severity(), source.trust_severity);
+    let transition = apply(observed.prior, alert.status, proposal, notified);
+    let firing_update = alert.status == Status::Firing && observed.prior != Prior::Superseded;
+    transaction
+        .prepare_cached(
+            "UPDATE occurrences SET last_seen_at = ?2, observations = observations + 1,
+                labels = CASE WHEN ?3 THEN ?4 ELSE labels END,
+                summary = CASE WHEN ?3 THEN ?5 ELSE summary END,
+                severity = CASE WHEN ?3 THEN ?6 ELSE severity END,
+                status = CASE WHEN ?7 THEN 'resolved' ELSE status END,
+                closed_at = CASE WHEN ?7 THEN ?2 ELSE closed_at END,
+                highest_action = max(highest_action, ?8)
+             WHERE id = ?1",
+        )?
+        .execute(params![
+            id,
+            now,
+            firing_update,
+            observed.labels,
+            observed.summary,
+            alert.severity(),
+            transition.resolve,
+            transition.escalate_to.map_or(0, Action::rank)
+        ])?;
+    match transition.cancel {
+        Cancel::Nothing | Cancel::Below(Action::Record | Action::QuietPost) => {}
+        Cancel::Below(Action::Ping) => {
+            supersede_unattempted(transaction, id, Some("quiet_post"), "escalated", now)?;
+        }
+        Cancel::All => {
+            supersede_unattempted(transaction, id, None, "resolved_before_delivery", now)?;
+        }
+    }
+    let subject = Subject {
+        source: source_id,
+        fingerprint: &observed.fingerprint,
+        alertname: alert.alertname(),
+        severity: alert.severity(),
+        summary: &observed.summary,
+    };
+    let intent = match transition.intent {
+        None => None,
+        Some(Intent::Notify(action)) => Some(NewIntent {
+            occurrence: Some(id),
+            source: source_id,
+            destination,
+            kind: "notify",
+            action,
+            content: render::firing(&subject),
+        }),
+        Some(Intent::Recovery) => Some(NewIntent {
+            occurrence: Some(id),
+            source: source_id,
+            destination: recovery_destination.as_deref().unwrap_or(destination),
+            kind: "recovery",
+            action: Action::QuietPost,
+            content: render::resolved(&subject),
+        }),
+    };
+    let intent_id = match intent {
+        Some(intent) => insert_intent(transaction, config.mode, &intent, now)?,
+        None => None,
+    };
+    if !matches!(
+        transition.reason,
+        Reason::UnchangedOrLowerPriority | Reason::AlreadyResolved
+    ) {
+        transaction
+            .prepare_cached(
+                "INSERT INTO decisions(event_id, occurrence_id, action, reason, policy_version,
+                    intent_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?
+            .execute(params![
+                event_id,
+                id,
+                transition.action.as_str(),
+                transition.reason.as_str(),
+                config.policy_version,
+                intent_id
+            ])?;
+    }
+    if observed.prior == Prior::New && alert.status == Status::Firing && !proposal.floor {
+        enqueue_assessment(transaction, config, id, alert, budget, now)?;
+    }
+    Ok(Decision {
+        occurrence_id: id,
+        action: transition.action,
+        reason: transition.reason.as_str(),
+        intent_created: intent_id.is_some(),
+    })
+}
+
+/// The occurrence an observation belongs to, and its state before the observation.
+struct Observed {
+    id: i64,
+    prior: Prior,
+    fingerprint: String,
+    labels: String,
+    summary: String,
+}
+
+/// Finds or creates the occurrence and applies stale-event protection.
+///
+/// An older `startsAt` than one already seen is recorded as superseded; a newer
+/// one supersedes older firing occurrences of the same fingerprint.
+fn upsert_occurrence(
+    transaction: &Transaction<'_>,
+    context: &AlertContext<'_>,
+    alert: &Alert,
+) -> Result<Observed, StoreError> {
+    let (source_id, now) = (context.source_id, context.now);
     let fingerprint = alert.fingerprint.to_ascii_lowercase();
     let starts_at = alert.start_key();
     let latest: Option<String> = transaction
@@ -821,157 +1022,65 @@ fn process_alert(
             _ => Prior::Firing(Action::from_rank(highest).unwrap_or(Action::Ping)),
         }
     };
-    let recovery_destination: Option<String> =
-        if alert.status == Status::Resolved && matches!(prior, Prior::New | Prior::Firing(_)) {
-            transaction
-                .prepare_cached(
-                    "SELECT destination FROM outbox WHERE occurrence_id = ?1 AND mode = 'live'
-                     AND kind = 'notify'
-                     AND (state IN ('sent', 'ambiguous', 'in_flight') OR possibly_delivered = 1)
-                     ORDER BY id DESC LIMIT 1",
-                )?
-                .query_row([id], |row| row.get(0))
-                .optional()?
-        } else {
-            None
-        };
-    let notified = if recovery_destination.is_some() {
-        Notified::Possibly
-    } else {
-        Notified::No
+    Ok(Observed {
+        id,
+        prior,
+        fingerprint,
+        labels,
+        summary,
+    })
+}
+
+/// Queues a shadow assessment, or records a skip when the queue is full.
+fn enqueue_assessment(
+    transaction: &Transaction<'_>,
+    config: &Config,
+    occurrence: i64,
+    alert: &Alert,
+    budget: &mut AssessmentBudget,
+    now: i64,
+) -> Result<(), StoreError> {
+    let Some(assessment) = &config.assessment else {
+        return Ok(());
     };
-    let proposal = config
-        .policy
-        .propose(alert.severity(), source.trust_severity);
-    let transition = apply(prior, alert.status, proposal, notified);
-    let firing_update = alert.status == Status::Firing && !stale;
+    let remaining = match budget.0 {
+        Some(remaining) => remaining,
+        None => {
+            let queued: i64 = transaction.query_row(
+                "SELECT count(*) FROM assessments WHERE state IN ('pending', 'in_flight')",
+                [],
+                |row| row.get(0),
+            )?;
+            i64::from(assessment.max_pending) - queued
+        }
+    };
+    budget.0 = Some(remaining - 1);
+    let context = assessment::context(alert, assessment)?;
+    let (state, outcome, completed_at) = if remaining > 0 {
+        ("pending", None, None)
+    } else {
+        ("done", Some("skipped_queue_full"), Some(now))
+    };
     transaction
         .prepare_cached(
-            "UPDATE occurrences SET last_seen_at = ?2, observations = observations + 1,
-                labels = CASE WHEN ?3 THEN ?4 ELSE labels END,
-                summary = CASE WHEN ?3 THEN ?5 ELSE summary END,
-                severity = CASE WHEN ?3 THEN ?6 ELSE severity END,
-                status = CASE WHEN ?7 THEN 'resolved' ELSE status END,
-                closed_at = CASE WHEN ?7 THEN ?2 ELSE closed_at END,
-                highest_action = max(highest_action, ?8)
-             WHERE id = ?1",
+            "INSERT INTO assessments(occurrence_id, state, outcome, context, context_sha256,
+                context_fields, policy_version, requested_model, due_at, created_at,
+                completed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10)",
         )?
         .execute(params![
-            id,
+            occurrence,
+            state,
+            outcome,
+            context.json,
+            context.sha256,
+            context.fields,
+            format!("{QUESTIONS_VERSION};{}", config.policy_version),
+            assessment.model,
             now,
-            firing_update,
-            labels,
-            summary,
-            alert.severity(),
-            transition.resolve,
-            transition.escalate_to.map_or(0, Action::rank)
+            completed_at
         ])?;
-    match transition.cancel {
-        Cancel::Nothing | Cancel::Below(Action::Record | Action::QuietPost) => {}
-        Cancel::Below(Action::Ping) => {
-            supersede_unattempted(transaction, id, Some("quiet_post"), "escalated", now)?;
-        }
-        Cancel::All => {
-            supersede_unattempted(transaction, id, None, "resolved_before_delivery", now)?;
-        }
-    }
-    let subject = Subject {
-        source: source_id,
-        fingerprint: &fingerprint,
-        alertname: alert.alertname(),
-        severity: alert.severity(),
-        summary: &summary,
-    };
-    let intent_id = match transition.intent {
-        None => None,
-        Some(Intent::Notify(action)) => insert_intent(
-            transaction,
-            config.mode,
-            (id, source_id, destination),
-            ("notify", action),
-            &render::firing(&subject),
-            now,
-        )?,
-        Some(Intent::Recovery) => insert_intent(
-            transaction,
-            config.mode,
-            (
-                id,
-                source_id,
-                recovery_destination.as_deref().unwrap_or(destination),
-            ),
-            ("recovery", Action::QuietPost),
-            &render::resolved(&subject),
-            now,
-        )?,
-    };
-    if !matches!(
-        transition.reason,
-        Reason::UnchangedOrLowerPriority | Reason::AlreadyResolved
-    ) {
-        transaction
-            .prepare_cached(
-                "INSERT INTO decisions(event_id, occurrence_id, action, reason, policy_version,
-                    intent_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            )?
-            .execute(params![
-                event_id,
-                id,
-                transition.action.as_str(),
-                transition.reason.as_str(),
-                config.policy_version,
-                intent_id
-            ])?;
-    }
-    if let Some(assessment) = &config.assessment
-        && prior == Prior::New
-        && alert.status == Status::Firing
-        && !proposal.floor
-    {
-        let remaining = match budget.0 {
-            Some(remaining) => remaining,
-            None => {
-                let queued: i64 = transaction.query_row(
-                    "SELECT count(*) FROM assessments WHERE state IN ('pending', 'in_flight')",
-                    [],
-                    |row| row.get(0),
-                )?;
-                i64::from(assessment.max_pending) - queued
-            }
-        };
-        budget.0 = Some(remaining - 1);
-        let context = assessment::context(alert, assessment)?;
-        let (state, outcome, completed_at) = if remaining > 0 {
-            ("pending", None, None)
-        } else {
-            ("done", Some("skipped_queue_full"), Some(now))
-        };
-        transaction
-            .prepare_cached(
-                "INSERT INTO assessments(occurrence_id, state, outcome, context, context_sha256,
-                    context_fields, policy_version, requested_model, due_at, created_at,
-                    completed_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10)",
-            )?
-            .execute(params![
-                id,
-                state,
-                outcome,
-                context.json,
-                context.sha256,
-                context.fields,
-                format!("{QUESTIONS_VERSION};{}", config.policy_version),
-                assessment.model,
-                now,
-                completed_at
-            ])?;
-    }
-    Ok(Decision {
-        occurrence_id: id,
-        action: transition.action,
-        reason: transition.reason.as_str(),
-        intent_created: intent_id.is_some(),
-    })
+    Ok(())
 }
 
 /// A newer start for the same fingerprint replaces older firing occurrences.
@@ -1018,12 +1127,21 @@ fn supersede_unattempted(
     Ok(())
 }
 
+/// A durable notification intent to record.
+struct NewIntent<'a> {
+    occurrence: Option<i64>,
+    source: &'a str,
+    destination: &'a str,
+    kind: &'static str,
+    action: Action,
+    content: String,
+}
+
+/// Records an intent; shadow intents are terminal and can never be claimed.
 fn insert_intent(
     transaction: &Transaction<'_>,
     mode: Mode,
-    (occurrence, source, destination): (i64, &str, &str),
-    (kind, action): (&str, Action),
-    content: &str,
+    intent: &NewIntent<'_>,
     now: i64,
 ) -> Result<Option<i64>, StoreError> {
     let (state, completed_at) = match mode {
@@ -1037,14 +1155,14 @@ fn insert_intent(
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?10) ON CONFLICT DO NOTHING",
         )?
         .execute(params![
-            occurrence,
-            source,
-            destination,
-            kind,
-            action.as_str(),
+            intent.occurrence,
+            intent.source,
+            intent.destination,
+            intent.kind,
+            intent.action.as_str(),
             mode.as_str(),
             state,
-            content,
+            intent.content,
             now,
             completed_at
         ])?;
@@ -1084,7 +1202,8 @@ fn claim_transaction(
             "SELECT b.id, b.kind, b.action, b.content, b.attempts - b.throttled,
                 b.possibly_delivered, b.occurrence_id
              FROM outbox b
-             WHERE b.destination = ?1 AND b.state = 'pending' AND b.due_at <= ?2
+             WHERE b.destination = ?1 AND b.state IN ('pending', 'in_flight')
+             AND b.state = 'pending' AND b.due_at <= ?2
              AND NOT EXISTS (SELECT 1 FROM outbox e WHERE e.occurrence_id = b.occurrence_id
                 AND e.id < b.id AND e.state IN ('pending', 'in_flight'))
              ORDER BY b.due_at, b.id LIMIT ?3",
@@ -1139,11 +1258,17 @@ fn claim_transaction(
         batch.lines.push(candidate.content);
     }
     if batch.ids.is_empty() {
-        let next: Option<i64> = transaction.query_row(
-            "SELECT min(due_at) FROM outbox WHERE destination = ?1 AND state = 'pending'",
-            [destination],
-            |row| row.get(0),
-        )?;
+        // Rows waiting behind an earlier send of their occurrence are not claimable,
+        // so they must not set the next wake-up either.
+        let next: Option<i64> = transaction
+            .prepare_cached(
+                "SELECT min(b.due_at) FROM outbox b
+                 WHERE b.destination = ?1 AND b.state IN ('pending', 'in_flight')
+                 AND b.state = 'pending'
+                 AND NOT EXISTS (SELECT 1 FROM outbox e WHERE e.occurrence_id = b.occurrence_id
+                    AND e.id < b.id AND e.state IN ('pending', 'in_flight'))",
+            )?
+            .query_row([destination], |row| row.get(0))?;
         return Ok(Claim::Wait(next));
     }
     transaction.execute(
@@ -1279,29 +1404,20 @@ fn coverage_transaction(
             )),
             _ => None,
         };
-        let notified = if let Some(message) = message {
-            let (state_value, completed_at) = match config.mode {
-                Mode::Shadow => ("shadow", Some(now)),
-                Mode::Live => ("pending", None),
-            };
-            transaction.execute(
-                "INSERT INTO outbox(occurrence_id, source, destination, kind, action, mode, state,
-                    content, created_at, due_at, completed_at)
-                 VALUES (NULL, ?1, ?2, 'coverage', ?3, ?4, ?5, ?6, ?7, ?7, ?8)",
-                params![
-                    source_id,
-                    heartbeat.destination,
-                    heartbeat.action.as_str(),
-                    config.mode.as_str(),
-                    state_value,
-                    message,
-                    now,
-                    completed_at
-                ],
-            )?;
-            true
-        } else {
-            false
+        let notified = match message {
+            Some(content) => {
+                let intent = NewIntent {
+                    occurrence: None,
+                    source: source_id,
+                    destination: &heartbeat.destination,
+                    kind: "coverage",
+                    action: heartbeat.action,
+                    content,
+                };
+                insert_intent(transaction, config.mode, &intent, now)?;
+                true
+            }
+            None => false,
         };
         changes.push(CoverageChange {
             source: source_id.clone(),

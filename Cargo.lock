@@ -338,6 +338,7 @@ dependencies = [
  "clap",
  "criers-core",
  "fastrand",
+ "http-body-util",
  "humantime",
  "prometheus-client",
  "reqwest",
