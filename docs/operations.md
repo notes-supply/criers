@@ -165,7 +165,30 @@ reloaded together: an update that would make one token valid for two sources,
 including a source still holding its last valid token, is rejected the same way. Configuration
 changes otherwise need an ordinary restart.
 
+## Trust boundary
+
+Criers is built for a trusted, self-hosted deployment, not a multi-tenant
+service. Per-source credentials establish identity, not resource isolation: all
+sources share the admission slots, the SQLite size cap, and each destination's
+rate-limit and mention state. A source that keeps sending new firing alerts,
+which retention keeps until they resolve, can fill storage and cause 503s for
+every source.
+
+- Run a separate instance, with its own database and volume, for sources that
+  do not trust each other or need guaranteed capacity.
+- Keep the unauthenticated ops listener reachable only from monitoring and
+  probes.
+- Configuration and secret files decide where credentials and alert data go
+  (any HTTPS endpoint is accepted), so restrict who can change them as you would
+  the Alertmanager configuration.
+- Outside a trusted network, put TLS in front of the ingestion listener; bearer
+  tokens are otherwise sent in clear text.
+
 ## Storage and retention
+
+Schema upgrades run automatically at startup in one transaction, keeping
+existing rows: the original scaffold and earlier schema-1 databases both reach
+the current schema. Downgrades are not supported.
 
 SQLite runs in WAL mode with full synchronous commits. `storage.max_size_mib`
 caps the main database file; the WAL is truncated to 64 MiB after checkpoints,
