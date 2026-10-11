@@ -88,13 +88,7 @@ impl IntoResponse for AppError {
                 )
             }
         };
-        let mut response = (status, Json(json!({ "error": message }))).into_response();
-        if status == StatusCode::SERVICE_UNAVAILABLE {
-            response
-                .headers_mut()
-                .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
-        }
-        response
+        (status, Json(json!({ "error": message }))).into_response()
     }
 }
 
@@ -142,8 +136,20 @@ pub(crate) fn ingest_router(state: AppState) -> Router {
             StatusCode::SERVICE_UNAVAILABLE,
             timeout,
         ))
+        // Timeouts bypass AppError, so apply retry guidance to the final response.
+        .layer(middleware::map_response(retry_after))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+async fn retry_after(mut response: Response) -> Response {
+    if response.status() == StatusCode::SERVICE_UNAVAILABLE {
+        response
+            .headers_mut()
+            .entry(header::RETRY_AFTER)
+            .or_insert(HeaderValue::from_static("5"));
+    }
+    response
 }
 
 /// Liveness, readiness and metrics; never authenticated, never admits alerts.

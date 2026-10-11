@@ -24,6 +24,8 @@ kind: ConfigMap
 metadata:
   name: criers-values
   namespace: criers
+  labels:
+    reconcile.fluxcd.io/watch: Enabled
 data:
   values.yaml: |
     config: |

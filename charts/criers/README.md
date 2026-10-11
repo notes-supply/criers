@@ -6,6 +6,7 @@ configuration is shadow mode: decisions are recorded and nothing is sent.
 ## Prerequisites
 
 - Kubernetes 1.29 or newer.
+- Linux/amd64 nodes for the current release image.
 - A StorageClass whose CSI driver supports `ReadWriteOncePod`, which keeps a
   second pod off the volume. Without it, set `persistence.accessMode` to
   `ReadWriteOnce`; that only limits mounting to one node, so rely on the

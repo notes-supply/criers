@@ -6,8 +6,5 @@ Alertmanager webhook URL for a configured source <id>:
 Metrics and probes (cluster-internal):
   http://{{ include "criers.fullname" . }}-ops.{{ .Release.Namespace }}.svc:{{ .Values.service.ops.port | default 9090 }}/metrics
 
-{{- if contains "mode = \"shadow\"" .Values.config }}
-
-The configuration is in shadow mode: decisions are recorded and nothing is sent.
-{{- end }}
+Only mode = "live" sends notifications. Check the mounted TOML configuration before enabling delivery.
 Data claim: {{ include "criers.claimName" . }}{{ if and (not .Values.persistence.existingClaim) .Values.persistence.retainOnUninstall }} (kept on uninstall){{ end }}

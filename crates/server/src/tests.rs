@@ -527,6 +527,51 @@ async fn occupied_admission_returns_retryable_503() {
 }
 
 #[tokio::test]
+async fn timed_out_ingestion_returns_503_with_retry_after() {
+    let harness =
+        Harness::shadow("[server]\nrequest_timeout = \"1s\"\nadmission_wait = \"100ms\"").await;
+    let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let store = harness.store.clone();
+    let blocker = tokio::spawn(async move {
+        store
+            .with_connection(move |_connection| {
+                locked_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+            .await
+    });
+    locked_rx.await.unwrap();
+
+    let response = harness
+        .app()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/sources/example/alertmanager")
+                .header("Authorization", format!("Bearer {TOKEN}"))
+                .body(Body::from(fixture().to_string()))
+                .unwrap(),
+        )
+        .await;
+
+    release_tx.send(()).unwrap();
+    blocker.await.unwrap().unwrap();
+    let response = response.unwrap();
+    assert_eq!(
+        (
+            response.status(),
+            response
+                .headers()
+                .get("Retry-After")
+                .and_then(|value| value.to_str().ok())
+        ),
+        (StatusCode::SERVICE_UNAVAILABLE, Some("5"))
+    );
+}
+
+#[tokio::test]
 async fn readiness_ignores_occupied_ingestion_admission() {
     let harness = Harness::shadow("").await;
     let mut state = harness.state.clone();
