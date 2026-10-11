@@ -1,4 +1,4 @@
--- Schema version 2; migrate_v1.sql upgrades earlier schema-1 databases.
+-- Schema version 3; migrate_v1.sql and migrate_v2.sql upgrade earlier databases.
 -- Times are Unix milliseconds unless named *_at TEXT.
 
 CREATE TABLE meta (
@@ -125,5 +125,7 @@ CREATE TABLE source_status (
     last_heartbeat_at INTEGER,
     coverage TEXT NOT NULL DEFAULT 'unknown'
         CHECK (coverage IN ('unknown', 'healthy', 'stale', 'never_seen')),
-    coverage_changed_at INTEGER
+    coverage_changed_at INTEGER,
+    -- The configured heartbeat alertname that last_heartbeat_at and coverage refer to.
+    heartbeat_alertname TEXT
 ) STRICT;

@@ -35,6 +35,8 @@ pub(crate) enum Outcome {
     RateLimited {
         retry_after: Duration,
         status: u16,
+        /// Discord's global limit applies to every webhook this process sends to.
+        global: bool,
     },
     Retry {
         status: Option<u16>,
@@ -172,14 +174,26 @@ impl Discord {
             Err(error) => return transport_outcome(error),
         };
         let status = response.status();
-        let retry_after = response
-            .headers()
+        let headers = response.headers();
+        let retry_after = headers
             .get(reqwest::header::RETRY_AFTER)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.trim().parse::<f64>().ok())
             .and_then(seconds);
+        // Discord marks global limits with X-RateLimit-Scope: global or X-RateLimit-Global.
+        let global = headers.contains_key("x-ratelimit-global")
+            || headers
+                .get("x-ratelimit-scope")
+                .is_some_and(|scope| scope.as_bytes().eq_ignore_ascii_case(b"global"));
         let body = read_bounded(response, MAX_RESPONSE_BYTES).await;
-        classify(status, retry_after, body)
+        classify(
+            status,
+            Limit {
+                retry_after,
+                global,
+            },
+            body,
+        )
     }
 }
 
@@ -211,6 +225,17 @@ struct Created {
 #[derive(serde::Deserialize)]
 struct RateLimit {
     retry_after: f64,
+    #[serde(default)]
+    global: bool,
+}
+
+/// Rate-limit hints from response headers.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Limit {
+    /// The `Retry-After` header.
+    pub retry_after: Option<Duration>,
+    /// A header marked the limit as global.
+    pub global: bool,
 }
 
 fn seconds(value: f64) -> Option<Duration> {
@@ -220,7 +245,7 @@ fn seconds(value: f64) -> Option<Duration> {
 /// Classifies a response; `retry_after` is the parsed `Retry-After` header.
 pub(crate) fn classify(
     status: StatusCode,
-    retry_after: Option<Duration>,
+    headers: Limit,
     body: Result<Vec<u8>, BodyError>,
 ) -> Outcome {
     let code = status.as_u16();
@@ -239,18 +264,20 @@ pub(crate) fn classify(
         };
     }
     if status == StatusCode::TOO_MANY_REQUESTS {
-        let from_body = body
+        let limit = body
             .ok()
-            .and_then(|bytes| serde_json::from_slice::<RateLimit>(&bytes).ok())
-            .and_then(|limit| seconds(limit.retry_after));
-        let retry_after = from_body
+            .and_then(|bytes| serde_json::from_slice::<RateLimit>(&bytes).ok());
+        let retry_after = limit
+            .as_ref()
+            .and_then(|limit| seconds(limit.retry_after))
             .into_iter()
-            .chain(retry_after)
+            .chain(headers.retry_after)
             .max()
             .unwrap_or(Duration::from_secs(1));
         return Outcome::RateLimited {
             retry_after,
             status: code,
+            global: headers.global || limit.is_some_and(|limit| limit.global),
         };
     }
     match code {
@@ -362,13 +389,15 @@ impl Worker {
             Outcome::RateLimited {
                 retry_after,
                 status,
+                global,
             } => {
                 let jitter = Duration::from_millis(fastrand::u64(0..250));
                 let delay = retry_after.min(settings.max_rate_limit_wait) + jitter;
-                tracing::warn!(destination = %self.destination, delay_ms = millis(delay), "destination rate limited");
+                tracing::warn!(destination = %self.destination, delay_ms = millis(delay), global, "rate limited");
                 Completion::RateLimited {
                     retry_at: now + millis(delay),
                     status,
+                    global,
                 }
             }
             Outcome::Retry {
@@ -431,21 +460,54 @@ mod tests {
     fn rate_limit_uses_the_longer_of_body_and_header() {
         let outcome = classify(
             StatusCode::TOO_MANY_REQUESTS,
-            Some(Duration::from_secs(3)),
+            Limit {
+                retry_after: Some(Duration::from_secs(3)),
+                global: false,
+            },
             Ok(br#"{"message":"limited","retry_after":1.5,"global":false}"#.to_vec()),
         );
         assert_eq!(
             outcome,
             Outcome::RateLimited {
                 retry_after: Duration::from_secs(3),
-                status: 429
+                status: 429,
+                global: false
             }
         );
     }
 
     #[test]
+    fn global_flag_in_the_body_marks_a_global_limit() {
+        let outcome = classify(
+            StatusCode::TOO_MANY_REQUESTS,
+            Limit::default(),
+            Ok(br#"{"message":"limited","retry_after":2,"global":true}"#.to_vec()),
+        );
+        assert!(
+            matches!(outcome, Outcome::RateLimited { global: true, .. }),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn global_scope_header_marks_a_global_limit_without_a_body() {
+        let outcome = classify(
+            StatusCode::TOO_MANY_REQUESTS,
+            Limit {
+                retry_after: Some(Duration::from_secs(1)),
+                global: true,
+            },
+            Err(BodyError::TooLarge),
+        );
+        assert!(
+            matches!(outcome, Outcome::RateLimited { global: true, .. }),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
     fn missing_webhook_is_permanent() {
-        let outcome = classify(StatusCode::NOT_FOUND, None, Ok(Vec::new()));
+        let outcome = classify(StatusCode::NOT_FOUND, Limit::default(), Ok(Vec::new()));
         assert!(matches!(
             outcome,
             Outcome::Permanent {
@@ -457,7 +519,11 @@ mod tests {
 
     #[test]
     fn gateway_timeout_is_an_ambiguous_retry() {
-        let outcome = classify(StatusCode::GATEWAY_TIMEOUT, None, Ok(Vec::new()));
+        let outcome = classify(
+            StatusCode::GATEWAY_TIMEOUT,
+            Limit::default(),
+            Ok(Vec::new()),
+        );
         assert!(matches!(
             outcome,
             Outcome::Retry {
@@ -469,7 +535,7 @@ mod tests {
 
     #[test]
     fn success_without_a_readable_body_is_still_sent() {
-        let outcome = classify(StatusCode::OK, None, Err(BodyError::TooLarge));
+        let outcome = classify(StatusCode::OK, Limit::default(), Err(BodyError::TooLarge));
         assert_eq!(
             outcome,
             Outcome::Sent {

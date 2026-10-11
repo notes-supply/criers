@@ -799,7 +799,7 @@ async fn first_v1_database_upgrades_in_place_and_recovers_every_destination() {
         .await
         .unwrap();
     assert!(
-        version == 2
+        version == super::SCHEMA_VERSION
             && receipt.decisions[0].reason == "recovery"
             && recoveries == "ops,quiet"
             && kept == "1:example:sent,2:example:sent,3:other:pending"
@@ -900,5 +900,359 @@ async fn databases_sharing_a_stem_have_separate_single_writer_locks() {
         "second={:?} same={:?}",
         second.err(),
         same.err()
+    );
+}
+
+#[tokio::test]
+async fn an_unavailable_destination_does_not_block_another_destinations_escalation() {
+    let harness = Harness::live(DEAD_DISCORD, "").await;
+    let warning = with(fixture(), "/alerts/0/labels/severity", json!("warning"));
+    harness
+        .ingest(with(warning, "/receiver", json!("quiet")))
+        .await;
+    // The quiet channel's send hangs in flight.
+    let quiet = harness
+        .store
+        .claim_deliveries("quiet".into(), crate::now_ms(), LIMITS)
+        .await
+        .unwrap();
+    harness.ingest(fixture()).await;
+    let ops = harness
+        .store
+        .claim_deliveries("ops".into(), crate::now_ms(), LIMITS)
+        .await
+        .unwrap();
+    assert!(
+        matches!(quiet, Claim::Batch(_)) && matches!(&ops, Claim::Batch(batch) if batch.ping),
+        "quiet={quiet:?} ops={ops:?}"
+    );
+}
+
+#[tokio::test]
+async fn recovery_for_a_healthy_destination_is_not_held_by_another_destinations_retry() {
+    let harness = Harness::live(DEAD_DISCORD, "").await;
+    let warning = with(fixture(), "/alerts/0/labels/severity", json!("warning"));
+    harness
+        .ingest(with(warning, "/receiver", json!("quiet")))
+        .await;
+    claim_and_complete_at(
+        &harness,
+        "quiet",
+        super::Completion::Retry {
+            retry_at: crate::now_ms() + HOUR,
+            status: Some(504),
+            error: "HTTP 504".into(),
+            ambiguous: true,
+        },
+    )
+    .await;
+    harness.ingest(fixture()).await;
+    claim_and_complete_at(&harness, "ops", sent()).await;
+    harness
+        .ingest(with(fixture(), "/alerts/0/status", json!("resolved")))
+        .await;
+    let ops = harness
+        .store
+        .claim_deliveries("ops".into(), crate::now_ms(), LIMITS)
+        .await
+        .unwrap();
+    assert!(
+        matches!(&ops, Claim::Batch(batch) if batch.lines[0].contains("**RESOLVED**")),
+        "{ops:?}"
+    );
+}
+
+fn heartbeat(alertname: &str) -> serde_json::Value {
+    with(fixture(), "/alerts/0/labels/alertname", json!(alertname))
+}
+
+async fn reopen_with(
+    harness: crate::tests::Harness,
+    edit: impl FnOnce(String) -> String,
+) -> (tempfile::TempDir, Arc<crate::config::Config>, Store) {
+    let config_path = harness.directory.path().join("criers.toml");
+    let text = edit(std::fs::read_to_string(&config_path).unwrap());
+    std::fs::write(&config_path, text).unwrap();
+    let config = Arc::new(crate::config::Config::load(&config_path).unwrap());
+    let crate::tests::Harness {
+        directory,
+        path,
+        store,
+        state,
+        ..
+    } = harness;
+    drop(state);
+    drop(store);
+    let store = Store::open(path, config.storage.max_bytes).await.unwrap();
+    (directory, config, store)
+}
+
+async fn ingest_into(store: &Store, config: &Arc<crate::config::Config>, value: serde_json::Value) {
+    let webhook: criers_core::Webhook = serde_json::from_value(value).unwrap();
+    let permit = Arc::new(tokio::sync::Semaphore::new(1))
+        .try_acquire_owned()
+        .unwrap();
+    store
+        .ingest(Arc::clone(config), "example".into(), webhook, permit)
+        .await
+        .unwrap();
+}
+
+fn states(changes: &[super::CoverageChange]) -> Vec<&'static str> {
+    changes.iter().map(|change| change.state).collect()
+}
+
+#[tokio::test]
+async fn changing_the_heartbeat_alertname_returns_coverage_to_startup_grace() {
+    let harness = Harness::live(
+        DEAD_DISCORD,
+        "[sources.example.heartbeat]\nstale_after = \"1m\"\n",
+    )
+    .await;
+    harness.ingest(heartbeat("Watchdog")).await;
+    let now = crate::now_ms();
+    let before = harness
+        .store
+        .coverage_tick(Arc::clone(&harness.config), now, now - 1000)
+        .await
+        .unwrap();
+    let (_directory, config, store) = reopen_with(harness, |text| {
+        text.replace(
+            "stale_after = \"1m\"",
+            "alertname = \"DeadMansSwitch\"\nstale_after = \"1m\"",
+        )
+    })
+    .await;
+    let started = crate::now_ms();
+    let reset = store
+        .coverage_tick(Arc::clone(&config), started, started)
+        .await
+        .unwrap();
+    let missing = store
+        .coverage_tick(Arc::clone(&config), started + 61_000, started)
+        .await
+        .unwrap();
+    ingest_into(&store, &config, heartbeat("DeadMansSwitch")).await;
+    let restored = store
+        .coverage_tick(Arc::clone(&config), crate::now_ms(), started)
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            states(&before),
+            states(&reset),
+            states(&missing),
+            states(&restored)
+        ),
+        (
+            vec!["healthy"],
+            vec!["unknown"],
+            vec!["never_seen"],
+            vec!["healthy"]
+        )
+    );
+}
+
+#[tokio::test]
+async fn unchanged_heartbeat_alertname_keeps_freshness_across_restart() {
+    let harness = Harness::live(
+        DEAD_DISCORD,
+        "[sources.example.heartbeat]\nstale_after = \"1m\"\n",
+    )
+    .await;
+    harness.ingest(heartbeat("Watchdog")).await;
+    let now = crate::now_ms();
+    harness
+        .store
+        .coverage_tick(Arc::clone(&harness.config), now, now - 1000)
+        .await
+        .unwrap();
+    let (_directory, config, store) = reopen_with(harness, |text| text).await;
+    let started = crate::now_ms();
+    let after = store
+        .coverage_tick(Arc::clone(&config), started, started)
+        .await
+        .unwrap();
+    let coverage: String = store
+        .with_connection(|connection| {
+            Ok(connection.query_row(
+                "SELECT coverage FROM source_status WHERE source = 'example'",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!((states(&after), coverage.as_str()), (vec![], "healthy"));
+}
+
+#[tokio::test]
+async fn schema_2_heartbeat_without_identity_upgrades_and_returns_to_startup_grace() {
+    let directory = tempfile::tempdir().unwrap();
+    let old = directory.path().join("v2.sqlite");
+    let recent = crate::now_ms() - 1000;
+    {
+        let connection = rusqlite::Connection::open(&old).unwrap();
+        connection
+            .execute_batch(include_str!("schema_v2.sql"))
+            .unwrap();
+        connection
+            .execute_batch(&format!(
+                "PRAGMA user_version = 2;
+                 INSERT INTO source_status(source, last_event_at, truncated_alerts,
+                    last_heartbeat_at, coverage, coverage_changed_at)
+                 VALUES ('example', {recent}, 0, {recent}, 'healthy', {recent});"
+            ))
+            .unwrap();
+    }
+    let harness = Harness::live(
+        DEAD_DISCORD,
+        "[sources.example.heartbeat]\nstale_after = \"1m\"\n",
+    )
+    .await;
+    let crate::tests::Harness {
+        directory: _harness_directory,
+        path,
+        config,
+        store,
+        state,
+    } = harness;
+    drop(state);
+    drop(store);
+    std::fs::copy(&old, &path).unwrap();
+    let store = Store::open(path, config.storage.max_bytes).await.unwrap();
+    let started = crate::now_ms();
+    let changes = store
+        .coverage_tick(Arc::clone(&config), started, started)
+        .await
+        .unwrap();
+    let (version, event_kept): (i64, Option<i64>) = store
+        .with_connection(|connection| {
+            Ok(connection.query_row(
+                "SELECT (SELECT user_version FROM pragma_user_version()),
+                    (SELECT last_event_at FROM source_status WHERE source = 'example')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        (version, states(&changes), event_kept),
+        (super::SCHEMA_VERSION, vec!["unknown"], Some(recent))
+    );
+}
+
+fn rate_limited(retry_at: i64, global: bool) -> super::Completion {
+    super::Completion::RateLimited {
+        retry_at,
+        status: 429,
+        global,
+    }
+}
+
+async fn claim_at(store: &Store, destination: &str) -> Claim {
+    store
+        .claim_deliveries(destination.into(), crate::now_ms(), LIMITS)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn global_rate_limit_pauses_every_destination_and_survives_restart() {
+    let harness = Harness::live(DEAD_DISCORD, "").await;
+    harness.ingest(fixture()).await;
+    let warning = with(fixture(), "/alerts/0/labels/severity", json!("warning"));
+    let warning = with(warning, "/alerts/0/fingerprint", json!("fedcba9876543210"));
+    harness
+        .ingest(with(warning, "/receiver", json!("quiet")))
+        .await;
+    let later = crate::now_ms() + HOUR;
+    claim_and_complete_at(&harness, "ops", rate_limited(later, true)).await;
+    let quiet = claim_at(&harness.store, "quiet").await;
+    let crate::tests::Harness {
+        directory: _directory,
+        path,
+        config,
+        store,
+        state,
+    } = harness;
+    drop(state);
+    drop(store);
+    let store = Store::open(path, config.storage.max_bytes).await.unwrap();
+    let after_restart = claim_at(&store, "quiet").await;
+    let throttled: i64 = store
+        .with_connection(|connection| {
+            Ok(connection.query_row(
+                "SELECT throttled FROM outbox WHERE destination = 'ops'",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(quiet, Claim::Wait(Some(at)) if at >= later)
+            && matches!(after_restart, Claim::Wait(Some(at)) if at >= later)
+            && throttled == 1,
+        "quiet={quiet:?} after_restart={after_restart:?} throttled={throttled}"
+    );
+}
+
+#[tokio::test]
+async fn global_pause_keeps_the_longest_deadline() {
+    let harness = Harness::live(DEAD_DISCORD, "").await;
+    harness.ingest(fixture()).await;
+    let later = crate::now_ms() + HOUR;
+    claim_and_complete_at(&harness, "ops", rate_limited(later, true)).await;
+    harness
+        .store
+        .with_connection(|connection| {
+            connection.execute(
+                "UPDATE outbox SET due_at = 0, state = 'pending' WHERE destination = 'ops'",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    // Force a second claim past the pause to record an earlier global deadline.
+    let earlier = crate::now_ms() + 1000;
+    let ids: Vec<i64> = vec![1];
+    harness
+        .store
+        .with_connection(|connection| {
+            connection.execute("UPDATE outbox SET state = 'in_flight' WHERE id = 1", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    harness
+        .store
+        .complete_deliveries("ops".into(), ids, None, rate_limited(earlier, true), 3)
+        .await
+        .unwrap();
+    let paused: String = harness
+        .query("SELECT value FROM meta WHERE key = 'discord_paused_until'")
+        .await;
+    assert_eq!(paused, later.to_string());
+}
+
+#[tokio::test]
+async fn local_rate_limit_pauses_only_its_destination() {
+    let harness = Harness::live(DEAD_DISCORD, "").await;
+    harness.ingest(fixture()).await;
+    let warning = with(fixture(), "/alerts/0/labels/severity", json!("warning"));
+    let warning = with(warning, "/alerts/0/fingerprint", json!("fedcba9876543210"));
+    harness
+        .ingest(with(warning, "/receiver", json!("quiet")))
+        .await;
+    let later = crate::now_ms() + HOUR;
+    claim_and_complete_at(&harness, "ops", rate_limited(later, false)).await;
+    let ops = claim_at(&harness.store, "ops").await;
+    let quiet = claim_at(&harness.store, "quiet").await;
+    assert!(
+        matches!(ops, Claim::Wait(Some(at)) if at >= later) && matches!(quiet, Claim::Batch(_)),
+        "ops={ops:?} quiet={quiet:?}"
     );
 }

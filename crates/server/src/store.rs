@@ -26,7 +26,7 @@ use crate::{
     render::{self, Subject},
 };
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const SUMMARY_CHARS: usize = 512;
 
 #[derive(Debug, Error)]
@@ -184,6 +184,8 @@ pub(crate) enum Completion {
     RateLimited {
         retry_at: i64,
         status: u16,
+        /// Pause every destination, not only this one.
+        global: bool,
     },
     Retry {
         retry_at: i64,
@@ -774,13 +776,16 @@ fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
     let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     match version {
         SCHEMA_VERSION => return Ok(()),
-        0 | 1 => {}
+        0..SCHEMA_VERSION => {}
         newer => return Err(StoreError::FutureSchema(newer)),
     }
     let transaction = connection.transaction()?;
-    if version == 1 {
-        tracing::info!("upgrading schema 1 database to schema 2");
-        transaction.execute_batch(include_str!("store/migrate_v1.sql"))?;
+    if version > 0 {
+        tracing::info!(from = version, to = SCHEMA_VERSION, "upgrading database schema");
+        if version < 2 {
+            transaction.execute_batch(include_str!("store/migrate_v1.sql"))?;
+        }
+        transaction.execute_batch(include_str!("store/migrate_v2.sql"))?;
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.commit()?;
         return Ok(());
@@ -791,7 +796,7 @@ fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
         |row| row.get(0),
     )?;
     if scaffold {
-        tracing::info!("migrating scaffold database to schema version 2");
+        tracing::info!(to = SCHEMA_VERSION, "migrating scaffold database");
         for table in [
             "events",
             "occurrences",
@@ -890,17 +895,20 @@ fn ingest_transaction(
         None
     };
     transaction.execute(
-        "INSERT INTO source_status(source, last_event_at, truncated_alerts, last_heartbeat_at)
-         VALUES (?1, ?2, ?3, ?4)
+        "INSERT INTO source_status(source, last_event_at, truncated_alerts, last_heartbeat_at,
+            heartbeat_alertname)
+         VALUES (?1, ?2, ?3, ?4, ?5)
          ON CONFLICT(source) DO UPDATE SET
             last_event_at = coalesce(excluded.last_event_at, last_event_at),
             truncated_alerts = excluded.truncated_alerts,
-            last_heartbeat_at = coalesce(excluded.last_heartbeat_at, last_heartbeat_at)",
+            last_heartbeat_at = coalesce(excluded.last_heartbeat_at, last_heartbeat_at),
+            heartbeat_alertname = coalesce(excluded.heartbeat_alertname, heartbeat_alertname)",
         params![
             source_id,
             event_id.map(|_| now),
             webhook.truncated_alerts,
-            heartbeat_seen.then_some(now)
+            heartbeat_seen.then_some(now),
+            heartbeat_seen.then_some(heartbeat).flatten()
         ],
     )?;
     Ok(Receipt {
@@ -1291,15 +1299,19 @@ fn insert_intent(
     Ok((inserted > 0).then(|| transaction.last_insert_rowid()))
 }
 
-/// SQL condition on outbox row `b`: no earlier intent in the same lifecycle is still
-/// pending or in flight. Occurrence intents follow their occurrence; coverage
-/// intents, which have no occurrence, follow their source.
+/// SQL condition on outbox row `b`: no earlier intent of the same lifecycle is still
+/// pending or in flight at the same destination. Occurrence intents follow their
+/// occurrence; coverage intents, which have no occurrence, follow their source.
+/// Ordering is per destination, so an unavailable channel never holds back
+/// another destination's escalation or recovery.
 macro_rules! no_open_predecessor {
     () => {
         "AND NOT EXISTS (SELECT 1 FROM outbox e WHERE e.occurrence_id = b.occurrence_id
+            AND e.destination = b.destination
             AND e.id < b.id AND e.state IN ('pending', 'in_flight'))
          AND NOT (b.kind = 'coverage' AND EXISTS (SELECT 1 FROM outbox e
             WHERE e.kind = 'coverage' AND e.source = b.source
+            AND e.destination = b.destination
             AND e.id < b.id AND e.state IN ('pending', 'in_flight')))"
     };
 }
@@ -1318,6 +1330,13 @@ fn claim_transaction(
         )
         .optional()?
         .unwrap_or((0, 0));
+    let global_pause: i64 = transaction
+        .prepare_cached(
+            "SELECT coalesce((SELECT CAST(value AS INTEGER) FROM meta
+                WHERE key = 'discord_paused_until'), 0)",
+        )?
+        .query_row([], |row| row.get(0))?;
+    let paused_until = paused_until.max(global_pause);
     if paused_until > now {
         return Ok(Claim::Wait(Some(paused_until)));
     }
@@ -1472,7 +1491,11 @@ fn complete_transaction(
                 params![ids, remote_id, status, now],
             )?;
         }
-        Completion::RateLimited { retry_at, status } => {
+        Completion::RateLimited {
+            retry_at,
+            status,
+            global,
+        } => {
             // Throttling is bounded separately so a persistent 429 cannot retry forever.
             transaction.execute(
                 "UPDATE outbox SET throttled = throttled + 1, last_status = ?2,
@@ -1484,7 +1507,18 @@ fn complete_transaction(
                  WHERE id IN (SELECT value FROM json_each(?1)) AND state = 'in_flight'",
                 params![ids, status, retry_at, max_attempts, now],
             )?;
-            set_destination("paused_until", *retry_at)?;
+            if *global {
+                // One durable deadline shared by every destination worker; a later
+                // global response can only extend it.
+                transaction.execute(
+                    "INSERT INTO meta(key, value) VALUES ('discord_paused_until', ?1)
+                     ON CONFLICT(key) DO UPDATE SET value =
+                        CAST(max(CAST(value AS INTEGER), CAST(excluded.value AS INTEGER)) AS TEXT)",
+                    [retry_at.to_string()],
+                )?;
+            } else {
+                set_destination("paused_until", *retry_at)?;
+            }
         }
         Completion::Retry {
             retry_at,
@@ -1527,14 +1561,39 @@ fn coverage_transaction(
             continue;
         };
         let stale_after = i64::try_from(heartbeat.stale_after.as_millis()).unwrap_or(i64::MAX);
-        let (last, previous): (Option<i64>, String) = transaction
-            .query_row(
-                "SELECT last_heartbeat_at, coverage FROM source_status WHERE source = ?1",
-                [source_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?
-            .unwrap_or((None, "unknown".to_owned()));
+        let (mut last, mut previous, identity): (Option<i64>, String, Option<String>) =
+            transaction
+                .query_row(
+                    "SELECT last_heartbeat_at, coverage, heartbeat_alertname
+                     FROM source_status WHERE source = ?1",
+                    [source_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?
+                .unwrap_or((None, "unknown".to_owned(), None));
+        // Freshness and coverage recorded for another (or an unrecorded) heartbeat
+        // alertname say nothing about the configured one: discard them and start
+        // the configured heartbeat's startup grace.
+        if identity.as_deref() != Some(heartbeat.alertname.as_str()) {
+            transaction.execute(
+                "INSERT INTO source_status(source, coverage, coverage_changed_at,
+                    heartbeat_alertname) VALUES (?1, 'unknown', ?2, ?3)
+                 ON CONFLICT(source) DO UPDATE SET last_heartbeat_at = NULL,
+                    coverage = 'unknown', heartbeat_alertname = excluded.heartbeat_alertname,
+                    coverage_changed_at = CASE WHEN coverage = 'unknown'
+                        THEN coverage_changed_at ELSE excluded.coverage_changed_at END",
+                params![source_id, now, heartbeat.alertname],
+            )?;
+            if previous != "unknown" {
+                changes.push(CoverageChange {
+                    source: source_id.clone(),
+                    state: "unknown",
+                    notified: false,
+                });
+            }
+            last = None;
+            previous = "unknown".to_owned();
+        }
         let state = match last {
             None if previous == "never_seen" || now - started_at >= stale_after => "never_seen",
             None => "unknown",

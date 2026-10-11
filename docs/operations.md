@@ -99,7 +99,10 @@ the firing alerts in Alertmanager when you switch.
   text is escaped so it cannot form mentions or links.
 - **Rate limits.** A 429 pauses the destination for the longer of `Retry-After`
   and the body's `retry_after`, capped by `delivery.max_rate_limit_wait`, plus
-  jitter. The pause is stored, so it survives a restart.
+  jitter. A global limit (`X-RateLimit-Scope: global`, `X-RateLimit-Global` or
+  `"global": true`) pauses every Discord destination of this instance; the
+  longest such deadline wins. Pauses are stored, so they survive a restart, and
+  429s do not count against `delivery.max_attempts`.
 - **Retries.** Transport errors and 5xx retry with capped, jittered exponential
   backoff up to `delivery.max_attempts`. Other 4xx responses (bad request,
   unknown webhook, forbidden) fail permanently.
@@ -108,10 +111,11 @@ the firing alerts in Alertmanager when you switch.
   records that, retries anyway and marks the row as a possible duplicate. If
   retries run out it ends as `ambiguous`, not `failed`. Expect occasional
   duplicate messages; Criers prefers a duplicate to a silent loss.
-- **Ordering.** Messages for one occurrence go out in order. A recovery waits
-  until every earlier send for that occurrence has finished. Coverage messages
-  for one source go out in order too, so a recovery never overtakes a delayed
-  stale notice.
+- **Ordering.** Messages for one occurrence go out in order at each destination.
+  A recovery waits until every earlier send for that occurrence to the same
+  destination has finished. Coverage messages for one source go out in order
+  per destination too, so a recovery never overtakes a delayed stale notice.
+  An unavailable destination never holds back another destination's messages.
 - **Recovery.** A resolution produces a recovery message only if a firing
   message was delivered or may have been, and it goes to each destination that
   received one (for example the quiet post's channel and, after an escalation
@@ -189,8 +193,11 @@ every source.
 ## Storage and retention
 
 Schema upgrades run automatically at startup in one transaction, keeping
-existing rows: the original scaffold and earlier schema-1 databases both reach
-the current schema. Downgrades are not supported.
+existing rows: the original scaffold and every earlier schema version reach the
+current schema (3). Downgrades are not supported. Schema 3 records which
+heartbeat alertname a source's freshness belongs to; databases upgraded from
+earlier versions have no record, so their heartbeat coverage returns to the
+startup grace once and recovers on the next heartbeat.
 
 SQLite runs in WAL mode with full synchronous commits. `storage.max_size_mib`
 caps the main database file; the WAL is truncated to 64 MiB after checkpoints,
@@ -244,7 +251,9 @@ repair.
 
 Coverage changes create durable notifications to the heartbeat destination: no
 heartbeat within `stale_after` of startup (`never_seen`), heartbeats stopped
-(`stale`), and heartbeats resumed. They do not affect readiness. An outside
+(`stale`), and heartbeats resumed. Freshness belongs to the configured heartbeat
+`alertname`: after changing it, coverage returns to `unknown` and the startup
+grace instead of trusting the old alert's timestamp. They do not affect readiness. An outside
 watchdog is still needed to notice that Criers itself is down.
 
 ## Shutdown

@@ -375,3 +375,40 @@ async fn storm_is_batched_and_mentions_are_coalesced_without_dropping_alerts() {
         requests.len()
     );
 }
+
+fn quiet_warning() -> Value {
+    let warning = with(fixture(), "/alerts/0/labels/severity", json!("warning"));
+    let warning = with(warning, "/alerts/0/fingerprint", json!("fedcba9876543210"));
+    with(warning, "/receiver", json!("quiet"))
+}
+
+async fn rate_limit_gap(scope: &str, global: bool) -> Duration {
+    let limited = Scripted::json(
+        429,
+        json!({"message": "limited", "retry_after": 1.5, "global": global}),
+    )
+    .with_header("x-ratelimit-scope", scope);
+    let discord = MockProvider::discord(vec![limited]).await;
+    let harness = Harness::live(&discord.discord_url(), "").await;
+    harness.ingest(fixture()).await;
+    harness.ingest(quiet_warning()).await;
+    let ops = spawn(worker(&harness, "ops", Duration::from_secs(2)));
+    discord.wait_for(1).await;
+    let quiet = spawn(worker(&harness, "quiet", Duration::from_secs(2)));
+    let requests = discord.wait_for(2).await;
+    ops.cancel();
+    quiet.cancel();
+    requests[1].at - requests[0].at
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn global_rate_limit_pauses_every_destination_worker() {
+    let gap = rate_limit_gap("global", true).await;
+    assert!(gap >= Duration::from_millis(1400), "{gap:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shared_rate_limit_pauses_only_its_own_destination() {
+    let gap = rate_limit_gap("shared", false).await;
+    assert!(gap < Duration::from_secs(1), "{gap:?}");
+}
