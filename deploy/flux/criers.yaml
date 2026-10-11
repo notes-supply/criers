@@ -17,6 +17,42 @@ spec:
   # secretRef:
   #   name: ghcr-credentials
 ---
+# Chart values kept outside the release. `config` holds the complete Criers TOML
+# unchanged; the ConfigMap key is the default `values.yaml`.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: criers-values
+  namespace: criers
+data:
+  values.yaml: |
+    config: |
+      mode = "shadow"
+
+      [server]
+      listen = "0.0.0.0:8080"
+      ops_listen = "0.0.0.0:9090"
+      shutdown_grace = "12s"
+
+      [storage]
+      path = "/var/lib/criers/criers.sqlite"
+      max_size_mib = 1024
+      retention = "30d"
+
+      [sources.alertmanager]
+      credential_files = ["/run/secrets/criers/alertmanager-token"]
+      default_destination = "ops"
+
+      [sources.alertmanager.heartbeat]
+      alertname = "Watchdog"
+      stale_after = "10m"
+
+      [destinations.ops]
+      kind = "discord"
+      webhook_url_file = "/run/secrets/criers/discord-ops-url"
+      mention_users = []
+      mention_roles = []
+---
 apiVersion: helm.toolkit.fluxcd.io/v2
 kind: HelmRelease
 metadata:
@@ -33,12 +69,9 @@ spec:
   upgrade:
     remediation:
       retries: 3
-  # The complete Criers TOML, managed separately from the release.
   valuesFrom:
     - kind: ConfigMap
-      name: criers-config
-      valuesKey: criers.toml
-      targetPath: config
+      name: criers-values
   values:
     # Existing Secrets, for example from an external secret operator.
     secrets:

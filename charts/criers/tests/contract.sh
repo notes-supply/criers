@@ -95,9 +95,18 @@ flux="$chart/../../deploy/flux/criers.yaml"
 kubeconform -strict -summary -kubernetes-version "$k8s_version" -schema-location default \
   -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
   "$flux"
+# Flux merges valuesFrom first and inline values over it, like these -f files.
+yq 'select(.kind == "ConfigMap") | .data["values.yaml"]' "$flux" > "$out/flux-configmap-values.yaml"
 yq 'select(.kind == "HelmRelease") | .spec.values' "$flux" > "$out/flux-values.yaml"
-render flux-example -f "$out/flux-values.yaml"
+render flux-example -f "$out/flux-configmap-values.yaml" -f "$out/flux-values.yaml"
 check "Flux example values render a claim on the example class" "$claim" '.spec.storageClassName == "example-replicated"' flux-example
+yq '.config' "$out/flux-configmap-values.yaml" > "$out/flux-source.toml"
+yq 'select(.kind == "ConfigMap") | .data["criers.toml"]' "$out/flux-example.yaml" > "$out/flux-rendered.toml"
+if ! cmp -s "$out/flux-source.toml" "$out/flux-rendered.toml"; then
+  echo "FAIL [flux-example]: rendered criers.toml differs from the values ConfigMap" >&2
+  exit 1
+fi
+echo "ok   [flux-example]: values ConfigMap TOML reaches criers.toml byte for byte"
 
 helm package "$chart" --destination "$out" > /dev/null
 echo "packaged $out/criers-$(yq '.version' "$chart/Chart.yaml").tgz"

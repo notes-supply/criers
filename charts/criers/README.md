@@ -50,15 +50,15 @@ Uninstalling keeps the created claim and its history
 
 ## Endpoints and metrics
 
-The Service names are `<name>` and `<name>-ops`, where `<name>` is the release
-name if it contains `criers` (so `criers` for the commands above), otherwise
-`<release>-criers`. `helm install` prints the exact URLs.
+With the release name `criers` used above:
 
-- `<name>:8080` receives Alertmanager webhooks at
+- `criers:8080` receives Alertmanager webhooks at
   `/v1/sources/<id>/alertmanager`.
-- `<name>-ops:9090` serves probes and `/metrics`. It is always
+- `criers-ops:9090` serves probes and `/metrics`. It is always
   ClusterIP and unauthenticated; restrict who can reach it with NetworkPolicy
   where your cluster enforces it.
+
+For another release name, `helm get notes <release>` prints the Service URLs.
 
 For plain Prometheus, scrape the ops Service as a static target, or use
 `kubernetes_sd_configs` with the `prometheus.io/scrape`, `port` and `path`
