@@ -262,12 +262,14 @@ async fn admit(state: &AppState, source: &str, request: Request) -> Result<Admit
             }
         })?;
     // Large batches are decoded on a blocking thread so they cannot stall the reactor.
-    let webhook = if body.len() > INLINE_DECODE_BYTES {
-        tokio::task::spawn_blocking(move || decode(&body))
+    // The permit travels with that job, so cancellation cannot free it early.
+    let (webhook, permit) = if body.len() > INLINE_DECODE_BYTES {
+        let (decoded, permit) = tokio::task::spawn_blocking(move || (decode(&body), permit))
             .await
-            .map_err(|error| AppError::Storage(error.into()))??
+            .map_err(|error| AppError::Storage(error.into()))?;
+        (decoded?, permit)
     } else {
-        decode(&body)?
+        (decode(&body)?, permit)
     };
     let heartbeat = state
         .config
@@ -336,8 +338,8 @@ async fn snapshot(
     State(state): State<AppState>,
     Path(source): Path<String>,
 ) -> Result<Json<Snapshot>, AppError> {
-    let _permit = state.admission.enter().await?;
-    Ok(Json(state.store.snapshot(source).await?))
+    let permit = state.admission.enter().await?;
+    Ok(Json(state.store.snapshot(source, permit).await?))
 }
 
 async fn ready(State(state): State<AppState>) -> Response {

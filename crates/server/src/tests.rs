@@ -160,7 +160,8 @@ webhook_url_file = "ops.url"
     }
 
     pub(crate) async fn snapshot(&self) -> crate::store::Snapshot {
-        self.store.snapshot("example".into()).await.unwrap()
+        let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+        self.store.snapshot("example".into(), permit).await.unwrap()
     }
 
     pub(crate) async fn query<T: rusqlite::types::FromSql + Send + 'static>(
@@ -256,7 +257,8 @@ async fn duplicate_delivery_after_database_reopen_does_not_create_a_second_inten
         )
         .await
         .unwrap();
-    let snapshot = reopened.snapshot("example".into()).await.unwrap();
+    let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+    let snapshot = reopened.snapshot("example".into(), permit).await.unwrap();
     assert_eq!(
         (
             receipt.decisions[0].intent_created,
@@ -653,5 +655,94 @@ async fn a_burst_within_the_waiting_line_is_admitted_instead_of_rejected() {
             .iter()
             .all(|&status| status == StatusCode::ACCEPTED),
         "{statuses:?}"
+    );
+}
+
+/// Probes admission without touching SQLite: a malformed body is rejected with
+/// 422 after a slot is granted, or with 503 when no slot is free.
+async fn admission_probe(app: Router) -> StatusCode {
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/sources/example/alertmanager")
+                .header("Authorization", format!("Bearer {TOKEN}"))
+                .body(Body::from("{"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    response.status()
+}
+
+fn status_request() -> Request<Body> {
+    Request::builder()
+        .uri("/v1/sources/example/status")
+        .header("Authorization", format!("Bearer {TOKEN}"))
+        .body(Body::empty())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn cancelled_status_read_keeps_its_admission_slot_until_the_read_settles() {
+    let harness = Harness::shadow("").await;
+    let mut state = harness.state.clone();
+    state.admission = Arc::new(http::Admission::new(1, std::time::Duration::ZERO));
+    let app = http::ingest_router(state);
+
+    // Hold the only SQLite connection so the status read queues behind it.
+    let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let store = harness.store.clone();
+    let blocker = async move {
+        store
+            .with_connection(move |_connection| {
+                locked_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+            .await
+    };
+    let blocker = tokio::spawn(blocker);
+    locked_rx.await.unwrap();
+
+    let request = tokio::spawn(app.clone().oneshot(status_request()));
+    let mut held_while_queued = false;
+    for _ in 0..1000 {
+        if admission_probe(app.clone()).await == StatusCode::SERVICE_UNAVAILABLE {
+            held_while_queued = true;
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    request.abort();
+    let cancelled = request.await.unwrap_err().is_cancelled();
+    let after_cancel = admission_probe(app.clone()).await;
+
+    release_tx.send(()).unwrap();
+    blocker.await.unwrap().unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut after_settle = admission_probe(app.clone()).await;
+    while after_settle != StatusCode::UNPROCESSABLE_ENTITY && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        after_settle = admission_probe(app.clone()).await;
+    }
+    let ordinary = app.oneshot(status_request()).await.unwrap().status();
+    assert_eq!(
+        (
+            held_while_queued,
+            cancelled,
+            after_cancel,
+            after_settle,
+            ordinary
+        ),
+        (
+            true,
+            true,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            StatusCode::OK
+        )
     );
 }

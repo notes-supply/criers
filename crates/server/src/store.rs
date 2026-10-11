@@ -328,8 +328,17 @@ impl Store {
         .await
     }
 
-    pub(crate) async fn snapshot(&self, source: String) -> Result<Snapshot, StoreError> {
+    /// Reads a source's counts and freshness.
+    ///
+    /// Like ingestion, the admission `permit` moves into the blocking job, so a
+    /// cancelled caller cannot free capacity while the read is queued or running.
+    pub(crate) async fn snapshot(
+        &self,
+        source: String,
+        permit: OwnedSemaphorePermit,
+    ) -> Result<Snapshot, StoreError> {
         self.with_connection(move |connection| {
+            let _permit = permit;
             let status = connection
                 .query_row(
                     "SELECT last_event_at, last_heartbeat_at, truncated_alerts, coverage
