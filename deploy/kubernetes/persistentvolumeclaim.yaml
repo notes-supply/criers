@@ -1,0 +1,13 @@
+# ReadWriteOncePod requires a CSI driver that supports it. It fences a second pod
+# on any node; plain ReadWriteOnce only limits mounts to one node. Criers also
+# holds an exclusive lock file, which fences a second process on the same node.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: criers-data
+spec:
+  accessModes:
+    - ReadWriteOncePod
+  resources:
+    requests:
+      storage: 2Gi

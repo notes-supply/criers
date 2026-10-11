@@ -5,6 +5,9 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 
+/// Largest admitted batch; match it with Alertmanager's webhook `max_alerts`.
+pub const MAX_ALERTS: usize = 512;
+
 /// Normalized supported fields from an Alertmanager webhook.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -54,7 +57,7 @@ pub enum Status {
 }
 
 /// A policy proposal, separate from assessment and actual delivery.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Action {
     /// Persist the observation without notifying anyone.
@@ -83,6 +86,16 @@ impl Action {
             Self::Ping => 2,
         }
     }
+
+    /// Inverse of [`Action::rank`] for stored values.
+    pub fn from_rank(rank: u8) -> Option<Self> {
+        match rank {
+            0 => Some(Self::Record),
+            1 => Some(Self::QuietPost),
+            2 => Some(Self::Ping),
+            _ => None,
+        }
+    }
 }
 
 impl Alert {
@@ -91,25 +104,14 @@ impl Alert {
         self.starts_at.to_rfc3339_opts(SecondsFormat::Nanos, true)
     }
 
-    /// Selects the conservative default action without consulting a model.
-    ///
-    /// Unknown severity cannot quietly downgrade a potentially urgent alert.
-    /// This requires a source explicitly trusted to supply severity labels.
-    ///
-    /// ```
-    /// use criers_core::{Action, Webhook};
-    /// let webhook: Webhook = serde_json::from_str(include_str!("../../../examples/critical.json"))?;
-    /// webhook.validate()?;
-    /// assert_eq!(webhook.alerts[0].policy().0, Action::Ping);
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
-    /// ```
-    pub fn policy(&self) -> (Action, &'static str) {
-        match self.labels.get("severity").map(String::as_str) {
-            Some("critical") => (Action::Ping, "trusted_critical_floor"),
-            Some("warning") => (Action::QuietPost, "warning_fallback"),
-            Some("info") => (Action::Record, "informational"),
-            _ => (Action::Ping, "unknown_severity_conservative_fallback"),
-        }
+    /// The source-supplied severity label, if any.
+    pub fn severity(&self) -> Option<&str> {
+        self.labels.get("severity").map(String::as_str)
+    }
+
+    /// The required alert name.
+    pub fn alertname(&self) -> &str {
+        self.labels.get("alertname").map_or("", String::as_str)
     }
 }
 
@@ -123,8 +125,10 @@ impl Webhook {
         if self.version != "4" {
             return Err("only Alertmanager webhook version 4 is supported");
         }
-        if self.alerts.is_empty() || self.alerts.len() > 512 {
-            return Err("batch must contain 1 to 512 alerts; no alerts are silently dropped");
+        if self.alerts.is_empty() || self.alerts.len() > MAX_ALERTS {
+            return Err(
+                "batch must contain 1 to 512 alerts; set Alertmanager max_alerts to 512 or less",
+            );
         }
         if self.group_key.len() > 4096 || self.receiver.len() > 256 {
             return Err("group metadata exceeds bounds");

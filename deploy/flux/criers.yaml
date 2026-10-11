@@ -1,0 +1,86 @@
+# Example Flux resources for the Criers chart. Adjust names, the namespace,
+# the storage class and the Secrets to your cluster; nothing here is required.
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: OCIRepository
+metadata:
+  name: criers
+  namespace: criers
+spec:
+  interval: 1h
+  url: oci://ghcr.io/notes-supply/charts/criers
+  ref:
+    tag: 0.1.0
+  layerSelector:
+    mediaType: application/vnd.cncf.helm.chart.content.v1.tar+gzip
+    operation: copy
+  # Needed only while the GHCR package is private.
+  # secretRef:
+  #   name: ghcr-credentials
+---
+# Chart values kept outside the release. `config` holds the complete Criers TOML
+# unchanged; the ConfigMap key is the default `values.yaml`.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: criers-values
+  namespace: criers
+  labels:
+    reconcile.fluxcd.io/watch: Enabled
+data:
+  values.yaml: |
+    config: |
+      mode = "shadow"
+
+      [server]
+      listen = "0.0.0.0:8080"
+      ops_listen = "0.0.0.0:9090"
+      shutdown_grace = "12s"
+
+      [storage]
+      path = "/var/lib/criers/criers.sqlite"
+      max_size_mib = 1024
+      retention = "30d"
+
+      [sources.alertmanager]
+      credential_files = ["/run/secrets/criers/alertmanager-token"]
+      default_destination = "ops"
+
+      [sources.alertmanager.heartbeat]
+      alertname = "Watchdog"
+      stale_after = "10m"
+
+      [destinations.ops]
+      kind = "discord"
+      webhook_url_file = "/run/secrets/criers/discord-ops-url"
+      mention_users = []
+      mention_roles = []
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: criers
+  namespace: criers
+spec:
+  interval: 30m
+  chartRef:
+    kind: OCIRepository
+    name: criers
+  install:
+    remediation:
+      retries: 3
+  upgrade:
+    remediation:
+      retries: 3
+  valuesFrom:
+    - kind: ConfigMap
+      name: criers-values
+  values:
+    # Existing Secrets, for example from an external secret operator.
+    secrets:
+      - name: criers-secrets
+    persistence:
+      storageClass: example-replicated
+      size: 2Gi
+      # existingClaim: criers-data
+    # image:
+    #   digest: sha256:<digest from the release summary>

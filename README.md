@@ -1,38 +1,57 @@
 # Criers
 
-A Rust alert router for Alertmanager. It stores alert history and decides
-whether an alert needs a ping, a quiet post, or no notification.
+A Rust alert router for Alertmanager. Criers authenticates webhooks per source,
+records every decision in SQLite before acknowledging, and delivers Discord
+notifications through a durable outbox. It can also record Cloudflare Clef
+impact probabilities, which never change who gets notified.
 
-Early development. Decisions are recorded locally in shadow mode; Discord
-delivery and Cloudflare Clef integration are planned.
+Alertmanager keeps grouping, silences and inhibition. Criers decides between
+recording, a quiet post and a ping, and keeps the delivery history.
 
-## Run
+## Quickstart
 
-Install [Mise](https://mise.jdx.dev/) and create a private token file containing
-32 to 256 random printable ASCII characters. Keep the token outside the checkout.
+Install [Mise](https://mise.jdx.dev/), then run from the repository root:
 
 ```sh
 mise trust
-mise install --locked
-mkdir -p data
-
-export CRIERS_SOURCE=local
-export CRIERS_TOKEN_FILE=/path/to/private-token
+mise install --locked rust aqua:nextest-rs/nextest/cargo-nextest
+mkdir -p data secrets
+head -c 32 /dev/urandom | base64 > secrets/alertmanager-token
 mise run dev
 ```
 
-Defaults: `127.0.0.1:8080` and `data/alerts.sqlite`. Override with `CRIERS_BIND`
-and `CRIERS_DATABASE`.
+`mise run dev` starts Criers with [examples/criers.toml](examples/criers.toml)
+in shadow mode: decisions are stored, nothing is sent. In another terminal:
 
-Send webhooks to `POST /v1/alertmanager` with `Authorization: Bearer <token>`.
-A [sample alert](examples/critical.json) is included. Status is available at
-`GET /v1/status` with the same credential.
+```sh
+curl -H "Authorization: Bearer $(cat secrets/alertmanager-token)" \
+  --data @examples/critical.json \
+  http://127.0.0.1:8080/v1/sources/local/alertmanager
+curl http://127.0.0.1:9090/metrics
+```
+
+Validate a configuration without opening the database or sending anything:
+
+```sh
+cargo run --package criers -- check --config examples/criers.toml
+```
+
+## Configuration
+
+One TOML file plus separately mounted secret files. The
+[example](examples/criers.toml) documents every section: sources and their
+credential files, severity policy, Discord destinations, delivery retries,
+retention and optional assessment. Set `mode = "live"` to deliver.
+
+[Operating Criers](docs/operations.md) covers the Alertmanager setup, HTTP and
+delivery contracts, rotation, retention, metrics and Kubernetes.
 
 ## Development
 
-- `criers-core`: alert types, validation, and notification policy.
-- `criers`: HTTP receiver and SQLite storage.
+`mise run ci` runs formatting, strict Clippy, nextest, doctests and a build.
+`mise run chart` checks the [Helm chart](charts/criers/README.md),
+`mise run manifests` validates the plain Kubernetes manifests and
+`mise run image` builds the OCI image.
 
-`mise run ci` runs formatting, Clippy, tests, doctests, and a build.
-
-[Architecture](docs/adr/001-workspace.md) · [Glossary](GLOSSARY.md) · [MIT license](LICENSE)
+[Architecture](docs/adr/001-workspace.md) · [Delivery](docs/adr/002-durable-outbox.md) ·
+[Glossary](GLOSSARY.md) · [MIT license](LICENSE)

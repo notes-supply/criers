@@ -1,0 +1,28 @@
+# Shadow mode records decisions without sending. Set mode = "live" after review.
+mode = "shadow"
+
+[server]
+listen = "0.0.0.0:8080"
+ops_listen = "0.0.0.0:9090"
+# Keep below terminationGracePeriodSeconds (30s): HTTP drain and worker stop each get this long.
+shutdown_grace = "12s"
+
+[storage]
+path = "/var/lib/criers/criers.sqlite"
+# Leave room on the 2Gi volume for the WAL and filesystem overhead.
+max_size_mib = 1024
+retention = "30d"
+
+[sources.alertmanager]
+credential_files = ["/run/secrets/criers/alertmanager-token"]
+default_destination = "ops"
+
+[sources.alertmanager.heartbeat]
+alertname = "Watchdog"
+stale_after = "10m"
+
+[destinations.ops]
+kind = "discord"
+webhook_url_file = "/run/secrets/criers/discord-ops-url"
+mention_roles = []
+mention_users = []

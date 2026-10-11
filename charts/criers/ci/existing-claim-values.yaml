@@ -1,0 +1,20 @@
+# Render variant used by `mise run chart`: existing claim, immutable digest and
+# mapped Secret keys. Names here are examples, not defaults.
+image:
+  digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+imagePullSecrets:
+  - name: registry-credentials
+secrets:
+  - name: alertmanager-credentials
+    items:
+      - key: token
+        path: alertmanager-token
+  - name: discord-webhooks
+persistence:
+  existingClaim: criers-history
+metrics:
+  scrapeAnnotations: false
+podLabels:
+  team: alerting
+podAnnotations:
+  example.com/owner: alerting
