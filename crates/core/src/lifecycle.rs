@@ -7,7 +7,8 @@ use crate::{Action, Proposal, Status};
 pub enum Prior {
     /// The occurrence was just created by this observation.
     New,
-    /// Firing, with the highest action already proposed for it.
+    /// Firing, with the highest action already announced to the target
+    /// destination (`Record` if none was).
     Firing(Action),
     /// Already resolved.
     Resolved,
@@ -118,8 +119,8 @@ impl Transition {
 /// * `proposal` - the policy proposal for a firing observation
 /// * `notified` - whether live delivery may already have reached someone
 ///
-/// Escalation is monotonic: only a strictly higher action produces another
-/// intent. Resolution never reopens, and recovery requires a possible prior
+/// Escalation is monotonic per destination: only a strictly higher action than
+/// the destination already received produces another intent. Resolution never reopens, and recovery requires a possible prior
 /// notification rather than merely a recorded intent.
 ///
 /// ```

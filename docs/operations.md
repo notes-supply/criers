@@ -76,8 +76,11 @@ the same credential. It shares ingestion's admission limit.
 are never sent to assessment. A source with `trust_severity = false` always gets
 `unknown_severity` and never reaches the floor.
 
-Within one occurrence (source, fingerprint, `startsAt`) escalation only goes up:
-warning then critical sends again, critical then warning does not. A later
+Within one occurrence (source, fingerprint, `startsAt`) escalation only goes up
+at each destination: warning then critical sends again, critical then warning
+does not. When Alertmanager routes the same alert through several receivers
+(`continue: true`) that map to different destinations, each destination gets
+its own notification, and repeats are suppressed per destination. A later
 `startsAt` is a new occurrence. An older `startsAt` than one already seen is
 recorded as superseded and changes nothing.
 
@@ -209,8 +212,9 @@ deliveries and finished assessments; deleting a closed occurrence also removes
 its own few remaining child rows. It removes webhook metadata and decisions
 older than `retention`, and finished deliveries and assessments older than that.
 A resolved or superseded occurrence is removed only once it was closed and last
-seen before the cutoff and every delivery and assessment it owns is finished and
-older too, so recent delivery evidence is never cascaded away. It keeps
+seen before the cutoff, its decisions have been drained in bounded batches, and
+every delivery and assessment it owns is finished and older too, so recent
+delivery evidence is never cascaded away. It keeps
 unresolved occurrences and the delivery records of alerts that are still firing,
 because their recovery depends on them. A pending assessment of an occurrence
 closed before the cutoff is marked `skipped_closed`, which restarts that
@@ -253,7 +257,9 @@ Coverage changes create durable notifications to the heartbeat destination: no
 heartbeat within `stale_after` of startup (`never_seen`), heartbeats stopped
 (`stale`), and heartbeats resumed. Freshness belongs to the configured heartbeat
 `alertname`: after changing it, coverage returns to `unknown` and the startup
-grace instead of trusting the old alert's timestamp. They do not affect readiness. An outside
+grace instead of trusting the old alert's timestamp. Removing a source's
+heartbeat clears its freshness and coverage at the next startup, without a
+notice. Coverage does not affect readiness. An outside
 watchdog is still needed to notice that Criers itself is down.
 
 ## Shutdown
@@ -281,9 +287,15 @@ which needs a CSI driver that supports it and then prevents a second pod from
 mounting the volume. Plain `ReadWriteOnce` only restricts mounting to one node.
 Criers also takes an exclusive lock file next to the database, which stops a
 second process on the same node but does not fence writers on other nodes over
-network storage.
+network storage. Criers resolves symbolic links in `storage.path` before locking
+and opening, so aliases through a symlinked file or directory share one lock and
+one set of SQLite `-wal`/`-shm` files. It refuses a database file with more than
+one hard link, since neither SQLite nor the lock can tell those names apart.
+This is a pathname lock on the resolved file, not an inode lock: a single file
+bind-mounted into another directory is not detected, so mount the directory
+instead. Use a local filesystem.
 
-The lock file is the database file name plus `.lock` (for example
+The lock file is the resolved database file name plus `.lock` (for example
 `criers.sqlite.lock`). Earlier builds used `criers.lock`, so when
 upgrading, stop the old process before starting the new one, as the `Recreate`
 strategy does; a leftover `criers.lock` is unused and can be deleted.

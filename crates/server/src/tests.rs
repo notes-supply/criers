@@ -150,7 +150,13 @@ webhook_url_file = "ops.url"
         webhook.validate().unwrap();
         let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
         self.store
-            .ingest(Arc::clone(&self.config), source.into(), webhook, permit)
+            .ingest(
+                Arc::clone(&self.config),
+                source.into(),
+                webhook,
+                permit,
+                |_| {},
+            )
             .await
             .unwrap()
     }
@@ -250,6 +256,7 @@ async fn duplicate_delivery_after_database_reopen_does_not_create_a_second_inten
             "example".into(),
             webhook,
             permit,
+            |_| {},
         )
         .await
         .unwrap();
@@ -800,4 +807,120 @@ async fn first_record_only_observation_is_a_durable_decision_and_repeats_are_com
         (first.decisions[0].reason, decisions, reason.as_str()),
         ("configured_severity", 1, "configured_severity")
     );
+}
+
+fn series_line(harness: &Harness, series: &str) -> Option<String> {
+    let text = harness.state.metrics.render().unwrap();
+    text.lines()
+        .find(|line| line.starts_with(series))
+        .map(str::to_owned)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn commit_after_an_http_timeout_still_records_observations_and_wakes_workers() {
+    let harness =
+        Harness::shadow("[server]\nrequest_timeout = \"1s\"\nadmission_wait = \"100ms\"\n").await;
+    let app = harness.app();
+    let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let store = harness.store.clone();
+    let blocker = tokio::spawn(async move {
+        store
+            .with_connection(move |_connection| {
+                locked_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+            .await
+    });
+    locked_rx.await.unwrap();
+    let wake = Arc::clone(&harness.state.wake);
+    let woken = wake.notified();
+    tokio::pin!(woken);
+    woken.as_mut().enable();
+    // The request times out while its transaction waits behind the held connection.
+    let (status, _) = post_to(app, "example", &fixture(), TOKEN).await;
+    release_tx.send(()).unwrap();
+    blocker.await.unwrap().unwrap();
+    let woke = tokio::time::timeout(std::time::Duration::from_secs(5), woken)
+        .await
+        .is_ok();
+    let events: i64 = harness.query("SELECT count(*) FROM events").await;
+    assert_eq!(
+        (
+            status,
+            events,
+            woke,
+            series_line(
+                &harness,
+                r#"criers_decisions_total{action="ping",reason="trusted_critical_floor"}"#
+            ),
+            series_line(
+                &harness,
+                r#"criers_alerts_observed_total{source="example",status="firing"}"#
+            ),
+            series_line(
+                &harness,
+                r#"criers_ingest_requests_total{source="example",outcome="accepted"}"#
+            )
+        ),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            1,
+            true,
+            Some(
+                r#"criers_decisions_total{action="ping",reason="trusted_critical_floor"} 1"#
+                    .to_owned()
+            ),
+            Some(r#"criers_alerts_observed_total{source="example",status="firing"} 1"#.to_owned()),
+            None
+        )
+    );
+}
+
+#[tokio::test]
+async fn a_rolled_back_ingest_emits_no_success_observations() {
+    let harness = Harness::shadow("").await;
+    harness
+        .store
+        .with_connection(|connection| {
+            connection.execute_batch("PRAGMA query_only = ON")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let wake = Arc::clone(&harness.state.wake);
+    let woken = wake.notified();
+    tokio::pin!(woken);
+    woken.as_mut().enable();
+    let (status, _) = post_to(harness.app(), "example", &fixture(), TOKEN).await;
+    let woke = tokio::time::timeout(std::time::Duration::from_millis(300), woken)
+        .await
+        .is_ok();
+    assert_eq!(
+        (
+            status,
+            woke,
+            series_line(&harness, "criers_decisions_total"),
+            series_line(&harness, "criers_alerts_observed_total")
+        ),
+        (StatusCode::SERVICE_UNAVAILABLE, false, None, None)
+    );
+}
+
+#[tokio::test]
+async fn equal_priority_fanout_notifies_each_mapped_destination_once() {
+    let harness = Harness::shadow("").await;
+    let via_quiet = with(fixture(), "/receiver", json!("quiet"));
+    harness.ingest(fixture()).await;
+    harness.ingest(via_quiet.clone()).await;
+    harness.ingest(fixture()).await;
+    harness.ingest(via_quiet).await;
+    let intents: String = harness
+        .query(
+            "SELECT group_concat(destination || ':' || action) FROM
+                (SELECT destination, action FROM outbox WHERE kind = 'notify' ORDER BY destination)",
+        )
+        .await;
+    assert_eq!(intents, "ops:ping,quiet:ping");
 }

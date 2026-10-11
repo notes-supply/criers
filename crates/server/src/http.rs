@@ -213,15 +213,14 @@ async fn ingest(
 ) -> Response {
     let started = Instant::now();
     match admit(&state, &source, request).await {
-        Ok(admitted) => {
-            state.wake.notify_waiters();
-            observe(&state, &source, &admitted);
+        Ok(receipt) => {
+            // Commit-side observations already ran in the store's commit observer.
             state
                 .metrics
                 .ingest_duration
                 .observe(started.elapsed().as_secs_f64());
             record(&state, source, "accepted");
-            (StatusCode::ACCEPTED, Json(admitted.receipt)).into_response()
+            (StatusCode::ACCEPTED, Json(receipt)).into_response()
         }
         Err(error) => {
             record(&state, source, error.outcome());
@@ -242,13 +241,7 @@ fn decode(body: &[u8]) -> Result<Webhook, AppError> {
     Ok(webhook)
 }
 
-struct Admitted {
-    receipt: Receipt,
-    firing: u64,
-    resolved: u64,
-}
-
-async fn admit(state: &AppState, source: &str, request: Request) -> Result<Admitted, AppError> {
+async fn admit(state: &AppState, source: &str, request: Request) -> Result<Receipt, AppError> {
     if state.draining.load(Ordering::Relaxed) {
         return Err(AppError::Draining);
     }
@@ -287,25 +280,29 @@ async fn admit(state: &AppState, source: &str, request: Request) -> Result<Admit
             Status::Firing => (firing + 1, resolved),
             Status::Resolved => (firing, resolved + 1),
         });
-    let receipt = state
+    let metrics = Arc::clone(&state.metrics);
+    let wake = Arc::clone(&state.wake);
+    let observed = source.to_owned();
+    let on_commit = move |receipt: &Receipt| {
+        observe(&metrics, &observed, receipt, firing, resolved);
+        wake.notify_waiters();
+    };
+    Ok(state
         .store
         .ingest(
             Arc::clone(&state.config),
             source.to_owned(),
             webhook,
             permit,
+            on_commit,
         )
-        .await?;
-    Ok(Admitted {
-        receipt,
-        firing,
-        resolved,
-    })
+        .await?)
 }
 
-fn observe(state: &AppState, source: &str, admitted: &Admitted) {
-    let metrics = &state.metrics;
-    if admitted.receipt.heartbeat {
+/// Records what a committed webhook changed. Runs only after a successful commit,
+/// whether or not the HTTP response was still awaited.
+fn observe(metrics: &Metrics, source: &str, receipt: &Receipt, firing: u64, resolved: u64) {
+    if receipt.heartbeat {
         metrics
             .heartbeats
             .get_or_create(&SourceLabels {
@@ -313,15 +310,15 @@ fn observe(state: &AppState, source: &str, admitted: &Admitted) {
             })
             .inc();
     }
-    if admitted.receipt.assessments_skipped > 0 {
+    if receipt.assessments_skipped > 0 {
         metrics
             .assessments
             .get_or_create(&OutcomeLabels {
                 outcome: "skipped_queue_full",
             })
-            .inc_by(admitted.receipt.assessments_skipped);
+            .inc_by(receipt.assessments_skipped);
     }
-    for decision in &admitted.receipt.decisions {
+    for decision in &receipt.decisions {
         metrics
             .decisions
             .get_or_create(&DecisionLabels {
@@ -330,7 +327,7 @@ fn observe(state: &AppState, source: &str, admitted: &Admitted) {
             })
             .inc();
     }
-    for (status, count) in [("firing", admitted.firing), ("resolved", admitted.resolved)] {
+    for (status, count) in [("firing", firing), ("resolved", resolved)] {
         if count > 0 {
             metrics
                 .alerts

@@ -169,14 +169,13 @@ pub(crate) async fn coverage(
     started_at: i64,
     cancel: CancellationToken,
 ) {
-    if config
+    // The first pass runs at startup even with no heartbeat configured, so
+    // coverage persisted under an earlier configuration is reconciled.
+    let monitored = config
         .sources
         .values()
-        .all(|source| source.heartbeat.is_none())
-    {
-        return;
-    }
-    while tick(&cancel, Duration::from_secs(5)).await {
+        .any(|source| source.heartbeat.is_some());
+    loop {
         match store
             .coverage_tick(Arc::clone(&config), crate::now_ms(), started_at)
             .await
@@ -190,6 +189,9 @@ pub(crate) async fn coverage(
                 }
             }
             Err(error) => tracing::error!(%error, "coverage evaluation failed"),
+        }
+        if !monitored || !tick(&cancel, Duration::from_secs(5)).await {
+            break;
         }
     }
 }
