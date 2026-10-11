@@ -1,0 +1,45 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "criers.fullname" . }}
+  labels:
+    {{- include "criers.labels" . | nindent 4 }}
+  {{- with .Values.service.ingest.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.ingest.type | default "ClusterIP" }}
+  selector:
+    {{- include "criers.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: ingest
+      port: {{ .Values.service.ingest.port | default 8080 }}
+      targetPort: ingest
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "criers.fullname" . }}-ops
+  labels:
+    {{- include "criers.labels" . | nindent 4 }}
+  {{- if or .Values.metrics.scrapeAnnotations .Values.service.ops.annotations }}
+  annotations:
+    {{- if .Values.metrics.scrapeAnnotations }}
+    prometheus.io/scrape: "true"
+    prometheus.io/port: {{ .Values.ports.ops | quote }}
+    prometheus.io/path: /metrics
+    {{- end }}
+    {{- with .Values.service.ops.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- end }}
+spec:
+  # Probes and metrics are unauthenticated and stay inside the cluster.
+  type: ClusterIP
+  selector:
+    {{- include "criers.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: ops
+      port: {{ .Values.service.ops.port | default 9090 }}
+      targetPort: ops

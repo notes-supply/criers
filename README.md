@@ -49,8 +49,9 @@ delivery contracts, rotation, retention, metrics and Kubernetes.
 ## Development
 
 `mise run ci` runs formatting, strict Clippy, nextest, doctests and a build.
-`mise run manifests` validates the Kubernetes manifests and `mise run image`
-builds the OCI image.
+`mise run chart` checks the [Helm chart](charts/criers/README.md),
+`mise run manifests` validates the plain Kubernetes manifests and
+`mise run image` builds the OCI image.
 
 [Architecture](docs/adr/001-workspace.md) · [Delivery](docs/adr/002-durable-outbox.md) ·
 [Glossary](GLOSSARY.md) · [MIT license](LICENSE)

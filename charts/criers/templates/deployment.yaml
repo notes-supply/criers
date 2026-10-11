@@ -1,0 +1,131 @@
+{{- include "criers.validatePodMetadata" . }}
+{{- if eq (int .Values.ports.ingest) (int .Values.ports.ops) }}
+{{- fail "ports.ingest and ports.ops must differ" }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "criers.fullname" . }}
+  labels:
+    {{- include "criers.labels" . | nindent 4 }}
+spec:
+  # SQLite has one writer: never more than one replica, never overlapping pods.
+  replicas: 1
+  strategy:
+    type: Recreate
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      {{- include "criers.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "criers.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        # Configuration is read at startup; a change rolls the pod.
+        checksum/config: {{ .Values.config | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: criers
+          image: {{ include "criers.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["serve", "--config", "/etc/criers/criers.toml"]
+          ports:
+            - name: ingest
+              containerPort: {{ .Values.ports.ingest }}
+            - name: ops
+              containerPort: {{ .Values.ports.ops }}
+          startupProbe:
+            httpGet:
+              path: /health/live
+              port: ops
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: ops
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: ops
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/criers
+              readOnly: true
+            # A projected directory receives Secret updates; subPath mounts never do.
+            - name: secrets
+              mountPath: /run/secrets/criers
+              readOnly: true
+            - name: data
+              mountPath: /var/lib/criers
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "criers.fullname" . }}
+        - name: secrets
+          projected:
+            defaultMode: 0440
+            sources:
+              {{- range .Values.secrets }}
+              - secret:
+                  name: {{ .name }}
+                  {{- with .items }}
+                  items:
+                    {{- toYaml . | nindent 20 }}
+                  {{- end }}
+              {{- end }}
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "criers.claimName" . }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

@@ -1,0 +1,51 @@
+# Example Flux resources for the Criers chart. Adjust names, the namespace,
+# the storage class and the Secrets to your cluster; nothing here is required.
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: OCIRepository
+metadata:
+  name: criers
+  namespace: criers
+spec:
+  interval: 1h
+  url: oci://ghcr.io/notes-supply/charts/criers
+  ref:
+    tag: 0.1.0
+  layerSelector:
+    mediaType: application/vnd.cncf.helm.chart.content.v1.tar+gzip
+    operation: copy
+  # Needed only while the GHCR package is private.
+  # secretRef:
+  #   name: ghcr-credentials
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: criers
+  namespace: criers
+spec:
+  interval: 30m
+  chartRef:
+    kind: OCIRepository
+    name: criers
+  install:
+    remediation:
+      retries: 3
+  upgrade:
+    remediation:
+      retries: 3
+  # The complete Criers TOML, managed separately from the release.
+  valuesFrom:
+    - kind: ConfigMap
+      name: criers-config
+      valuesKey: criers.toml
+      targetPath: config
+  values:
+    # Existing Secrets, for example from an external secret operator.
+    secrets:
+      - name: criers-secrets
+    persistence:
+      storageClass: example-replicated
+      size: 2Gi
+      # existingClaim: criers-data
+    # image:
+    #   digest: sha256:<digest from the release summary>

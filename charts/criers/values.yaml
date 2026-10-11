@@ -1,0 +1,108 @@
+# Criers runs as exactly one replica: SQLite has a single writer.
+
+image:
+  repository: ghcr.io/notes-supply/criers
+  # Defaults to the chart's appVersion.
+  tag: ""
+  # An immutable digest (sha256:...) takes precedence over the tag.
+  digest: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# The complete Criers TOML configuration (see docs/operations.md and
+# examples/criers.toml). Paths must match the mounts below:
+#   secrets:  /run/secrets/criers/<key>
+#   database: /var/lib/criers/<file>
+# server.listen and server.ops_listen must use the ports in `ports`.
+# The default is shadow mode: decisions are recorded, nothing is sent.
+config: |
+  mode = "shadow"
+
+  [server]
+  listen = "0.0.0.0:8080"
+  ops_listen = "0.0.0.0:9090"
+  # Each shutdown phase waits up to this long; keep 2x below terminationGracePeriodSeconds.
+  shutdown_grace = "12s"
+
+  [storage]
+  path = "/var/lib/criers/criers.sqlite"
+  # Leave room on the volume for the WAL and filesystem overhead.
+  max_size_mib = 1024
+  retention = "30d"
+
+  [sources.alertmanager]
+  credential_files = ["/run/secrets/criers/alertmanager-token"]
+  default_destination = "ops"
+
+  # Alertmanager's always-firing Watchdog is consumed as a coverage heartbeat.
+  [sources.alertmanager.heartbeat]
+  alertname = "Watchdog"
+  stale_after = "10m"
+
+  [destinations.ops]
+  kind = "discord"
+  # Read only in live mode.
+  webhook_url_file = "/run/secrets/criers/discord-ops-url"
+  mention_users = []
+  mention_roles = []
+
+# Existing Secrets, created outside the chart, projected together into
+# /run/secrets/criers. Each key becomes a file named after the key unless
+# `items` maps keys to paths. Projected volumes receive Secret updates, which
+# Criers rereads for credential rotation; subPath mounts would not.
+secrets:
+  - name: criers-secrets
+    # items:
+    #   - key: token
+    #     path: alertmanager-token
+
+ports:
+  ingest: 8080
+  ops: 9090
+
+persistence:
+  # Use an existing PersistentVolumeClaim instead of creating one.
+  existingClaim: ""
+  # ReadWriteOncePod needs a CSI driver that supports it and then prevents a
+  # second pod from mounting the volume. ReadWriteOnce only limits mounting to
+  # one node; use it for local or test storage without that support.
+  accessMode: ReadWriteOncePod
+  # Empty uses the cluster's default StorageClass.
+  storageClass: ""
+  size: 2Gi
+  # Keep the created claim, and its alert history, when the release is uninstalled.
+  retainOnUninstall: true
+  annotations: {}
+
+service:
+  ingest:
+    type: ClusterIP
+    port: 8080
+    annotations: {}
+  # The ops Service (probes and /metrics) is always ClusterIP and unauthenticated.
+  ops:
+    port: 9090
+    annotations: {}
+
+metrics:
+  # Adds prometheus.io/scrape, port and path annotations to the ops Service for
+  # Prometheus kubernetes_sd configurations that honor them.
+  scrapeAnnotations: true
+
+# Must exceed both shutdown phases (2 x server.shutdown_grace) with some margin.
+terminationGracePeriodSeconds: 30
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    memory: 256Mi
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+priorityClassName: ""

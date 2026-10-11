@@ -256,6 +256,11 @@ retried after restart as a possible duplicate.
 
 ## Kubernetes
 
+The [Helm chart](../charts/criers/README.md) is the supported way to install on
+an existing cluster, with a generic Flux example in
+[deploy/flux](../deploy/flux/criers.yaml). The plain manifests below describe
+the same shape.
+
 [deploy/kubernetes](../deploy/kubernetes) is a minimal kustomization: one
 replica with the `Recreate` strategy, a ConfigMap, two Secrets mounted through a
 projected volume (so updates reach the files), a PersistentVolumeClaim, probes,

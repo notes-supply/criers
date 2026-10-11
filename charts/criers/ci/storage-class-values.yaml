@@ -1,0 +1,7 @@
+# Render variant used by `mise run chart`: created claim on a named class with
+# ReadWriteOnce for storage without ReadWriteOncePod support, not retained.
+persistence:
+  accessMode: ReadWriteOnce
+  storageClass: example-replicated
+  size: 5Gi
+  retainOnUninstall: false

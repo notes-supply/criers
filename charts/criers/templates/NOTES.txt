@@ -1,0 +1,13 @@
+Criers {{ .Chart.AppVersion }} is installed as one replica ({{ include "criers.image" . }}).
+
+Alertmanager webhook URL for a configured source <id>:
+  http://{{ include "criers.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.ingest.port | default 8080 }}/v1/sources/<id>/alertmanager
+
+Metrics and probes (cluster-internal):
+  http://{{ include "criers.fullname" . }}-ops.{{ .Release.Namespace }}.svc:{{ .Values.service.ops.port | default 9090 }}/metrics
+
+{{- if contains "mode = \"shadow\"" .Values.config }}
+
+The configuration is in shadow mode: decisions are recorded and nothing is sent.
+{{- end }}
+Data claim: {{ include "criers.claimName" . }}{{ if and (not .Values.persistence.existingClaim) .Values.persistence.retainOnUninstall }} (kept on uninstall){{ end }}

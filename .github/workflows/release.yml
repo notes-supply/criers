@@ -1,0 +1,105 @@
+name: Release
+
+# Publishes the image and Helm chart for a version tag such as v0.1.0. The tag
+# must match the crate, chart and appVersion. Maintainers push tags; forks and
+# pull requests cannot trigger this workflow.
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Publish image and chart
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read # check out the tagged source
+      packages: write # push the image and chart to GHCR with GITHUB_TOKEN
+    env:
+      MISE_TASK_RUN_AUTO_INSTALL: "false"
+      IMAGE: ghcr.io/notes-supply/criers
+      CHART_REPOSITORY: oci://ghcr.io/notes-supply/charts
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1, Node 24
+        with:
+          persist-credentials: false
+      - name: Install pinned tools
+        uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1, Node 24
+        with:
+          version: 2026.10.7
+          install_args: --locked aqua:helm/helm aqua:mikefarah/yq aqua:yannh/kubeconform
+          cache: false
+      - name: Check versions
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          mise run release-check
+          echo "VERSION=${RELEASE_TAG#v}" >> "$GITHUB_ENV"
+      - name: Validate and package the chart
+        run: mise run chart
+      - name: Build the image once
+        run: |
+          docker build \
+            --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.version=${VERSION}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --label "org.opencontainers.image.licenses=MIT" \
+            -t "${IMAGE}:${VERSION}" .
+      - name: Exercise the packaged binary
+        run: |
+          test "$(docker run --rm "${IMAGE}:${VERSION}" --version)" = "criers ${VERSION}"
+          smoke="${RUNNER_TEMP}/smoke"
+          mkdir -p "${smoke}/etc" "${smoke}/secrets"
+          head -c 32 /dev/urandom | base64 > "${smoke}/secrets/token"
+          cat > "${smoke}/etc/criers.toml" <<'EOF'
+          [server]
+          listen = "127.0.0.1:18080"
+          ops_listen = "127.0.0.1:19090"
+          [storage]
+          path = "/var/lib/criers/criers.sqlite"
+          [sources.smoke]
+          credential_files = ["/run/secrets/criers/token"]
+          default_destination = "ops"
+          [destinations.ops]
+          kind = "discord"
+          webhook_url_file = "/run/secrets/criers/unused"
+          EOF
+          chmod -R a+rX "${smoke}"
+          docker run -d --name criers-smoke --network host --read-only --cap-drop ALL \
+            --security-opt no-new-privileges \
+            -v "${smoke}/etc:/etc/criers:ro" -v "${smoke}/secrets:/run/secrets/criers:ro" \
+            -v criers-smoke-data:/var/lib/criers "${IMAGE}:${VERSION}"
+          for _ in $(seq 1 100); do
+            curl -fsS -o /dev/null http://127.0.0.1:19090/health/ready && break
+            sleep 0.2
+          done
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer $(cat "${smoke}/secrets/token")" \
+            --data @examples/critical.json http://127.0.0.1:18080/v1/sources/smoke/alertmanager)
+          docker stop -t 20 criers-smoke
+          exit_code=$(docker inspect -f '{{.State.ExitCode}}' criers-smoke)
+          docker logs criers-smoke | tail -n 5
+          docker rm criers-smoke
+          docker volume rm criers-smoke-data
+          test "${code}" = 202
+          test "${exit_code}" = 0
+      - name: Publish image and chart
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "${GITHUB_TOKEN}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+          docker push "${IMAGE}:${VERSION}"
+          digest=$(docker inspect --format '{{index .RepoDigests 0}}' "${IMAGE}:${VERSION}")
+          echo "${GITHUB_TOKEN}" | helm registry login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
+          helm push "target/chart/criers-${VERSION}.tgz" "${CHART_REPOSITORY}"
+          {
+            echo "Image: \`${digest}\`"
+            echo "Chart: \`${CHART_REPOSITORY}/criers\` version \`${VERSION}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

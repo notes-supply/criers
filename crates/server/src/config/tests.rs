@@ -235,3 +235,41 @@ fn distinct_specific_addresses_may_share_a_port() {
     let loaded = Config::load(&write(directory.path(), &body));
     assert!(loaded.is_ok(), "{:#}", loaded.unwrap_err());
 }
+
+/// The `config: |` block of the Helm chart's default values, unindented.
+fn helm_default_config() -> String {
+    let values = include_str!("../../../../charts/criers/values.yaml");
+    let block = values
+        .split_once("\nconfig: |\n")
+        .expect("values.yaml has a config block")
+        .1;
+    block
+        .lines()
+        .take_while(|line| line.is_empty() || line.starts_with("  "))
+        .map(|line| line.strip_prefix("  ").unwrap_or(line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn helm_default_configuration_is_valid_with_mounted_paths() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    std::fs::create_dir(root.join("data")).unwrap();
+    std::fs::create_dir(root.join("secrets")).unwrap();
+    std::fs::write(root.join("secrets/alertmanager-token"), TOKEN).unwrap();
+    let text = helm_default_config()
+        .replace(
+            "/run/secrets/criers/",
+            &format!("{}/secrets/", root.display()),
+        )
+        .replace("/var/lib/criers/", &format!("{}/data/", root.display()));
+    let config = root.join("criers.toml");
+    std::fs::write(&config, text).unwrap();
+    let loaded = Config::load(&config).unwrap();
+    let heartbeat = loaded.sources["alertmanager"].heartbeat.as_ref().unwrap();
+    assert_eq!(
+        (loaded.mode, heartbeat.alertname.as_str()),
+        (Mode::Shadow, "Watchdog")
+    );
+}
