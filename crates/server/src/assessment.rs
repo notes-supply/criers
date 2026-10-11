@@ -374,8 +374,10 @@ async fn assess_one(
     max_attempts: u32,
     cancel: CancellationToken,
 ) {
-    let now = crate::now_ms();
-    let result = match clef.assess(&job.context).await {
+    let response = clef.assess(&job.context).await;
+    // Retry deadlines count from when the provider answered, not when it was asked.
+    let responded_at = crate::now_ms();
+    let result = match response {
         Ok(answers) => Ok(answers),
         Err(error) => {
             tracing::info!(assessment = job.id, outcome = error.outcome(), %error, "assessment attempt failed");
@@ -386,7 +388,7 @@ async fn assess_one(
                     } => *delay,
                     _ => Duration::from_secs(2u64.pow(job.attempts.min(6))),
                 };
-                now + i64::try_from(delay.as_millis()).unwrap_or(i64::MAX / 4)
+                responded_at + i64::try_from(delay.as_millis()).unwrap_or(i64::MAX / 4)
             });
             Err(AssessmentFailure {
                 outcome: error.outcome(),
@@ -401,8 +403,10 @@ async fn assess_one(
     // returns the row to pending.
     let mut attempt = 0u32;
     let outcome = loop {
+        // Each write attempt stamps its own completion time, so a result stored
+        // after an outage starts its retention window when it became durable.
         match store
-            .record_assessment(job.id, result.clone(), now, max_attempts)
+            .record_assessment(job.id, result.clone(), crate::now_ms(), max_attempts)
             .await
         {
             Ok(outcome) => break outcome,

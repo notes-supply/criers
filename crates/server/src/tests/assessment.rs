@@ -267,12 +267,67 @@ async fn finished_result_is_recorded_after_a_transient_write_failure_without_res
     // The provider answers while storage rejects writes.
     tokio::time::sleep(Duration::from_millis(800)).await;
     let during: String = harness.query("SELECT state FROM assessments").await;
+    let writable_at = crate::now_ms();
     read_only(false).await.unwrap();
     let outcome = wait_for_outcome(&harness).await;
     cancel.cancel();
+    // The completion time is when the result was durably recorded, so the
+    // retention window starts after storage recovered.
+    let completed_at: i64 = harness.query("SELECT completed_at FROM assessments").await;
     assert_eq!(
-        (during.as_str(), outcome.as_deref(), clef.requests().len()),
-        ("in_flight", Some("assessed"), 1)
+        (
+            during.as_str(),
+            outcome.as_deref(),
+            clef.requests().len(),
+            completed_at >= writable_at
+        ),
+        ("in_flight", Some("assessed"), 1, true),
+        "completed_at={completed_at} writable_at={writable_at}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rate_limit_deadline_counts_from_the_delayed_provider_response() {
+    let limited = Scripted::json(429, json!({"success": false}))
+        .with_header("retry-after", "3")
+        .delayed(Duration::from_millis(800));
+    let clef = MockProvider::start(vec![limited], answer(0.5)).await;
+    let harness = Harness::shadow(&format!(
+        "[assessment]\naccount_id = \"{ACCOUNT}\"\napi_token_file = \"clef.token\"\n\
+         base_url = \"http://{}/client/v4\"\ntimeout = \"2s\"\nmax_attempts = 2\n",
+        clef.address
+    ))
+    .await;
+    harness.ingest(warning()).await;
+    let cancel = spawn(&harness);
+    clef.wait_for(1).await;
+    // Observed after the request arrived, so at or after the provider call began.
+    let requested_at = crate::now_ms();
+    let mut due: Option<(String, i64)> = None;
+    for _ in 0..200 {
+        let row: Option<String> = harness
+            .query(
+                "SELECT (SELECT outcome || ' ' || due_at FROM assessments
+                 WHERE state = 'pending' AND outcome IS NOT NULL)",
+            )
+            .await;
+        due = row.map(|text| {
+            let (outcome, at) = text.split_once(' ').unwrap();
+            (outcome.to_owned(), at.parse().unwrap())
+        });
+        if due.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    cancel.cancel();
+    let (outcome, due_at) = due.expect("rate-limited retry was not scheduled");
+    // Retry-After (3 s) counts from the 800 ms response, not from the request;
+    // 100 ms covers the observation delay of `requested_at`.
+    assert!(
+        outcome == "rate_limited" && due_at >= requested_at + 3_700,
+        "outcome={outcome} due_at={due_at} requested_at={requested_at} delta={}",
+        due_at - requested_at
     );
 }
 
