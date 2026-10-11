@@ -781,7 +781,11 @@ fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
     }
     let transaction = connection.transaction()?;
     if version > 0 {
-        tracing::info!(from = version, to = SCHEMA_VERSION, "upgrading database schema");
+        tracing::info!(
+            from = version,
+            to = SCHEMA_VERSION,
+            "upgrading database schema"
+        );
         if version < 2 {
             transaction.execute_batch(include_str!("store/migrate_v1.sql"))?;
         }
@@ -1561,16 +1565,15 @@ fn coverage_transaction(
             continue;
         };
         let stale_after = i64::try_from(heartbeat.stale_after.as_millis()).unwrap_or(i64::MAX);
-        let (mut last, mut previous, identity): (Option<i64>, String, Option<String>) =
-            transaction
-                .query_row(
-                    "SELECT last_heartbeat_at, coverage, heartbeat_alertname
+        let (mut last, mut previous, identity): (Option<i64>, String, Option<String>) = transaction
+            .query_row(
+                "SELECT last_heartbeat_at, coverage, heartbeat_alertname
                      FROM source_status WHERE source = ?1",
-                    [source_id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )
-                .optional()?
-                .unwrap_or((None, "unknown".to_owned(), None));
+                [source_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?
+            .unwrap_or((None, "unknown".to_owned(), None));
         // Freshness and coverage recorded for another (or an unrecorded) heartbeat
         // alertname say nothing about the configured one: discard them and start
         // the configured heartbeat's startup grace.
