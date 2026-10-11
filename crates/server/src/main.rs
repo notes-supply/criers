@@ -172,6 +172,40 @@ async fn serve(path: &Path) -> Result<()> {
         .await
         .with_context(|| format!("cannot bind server.ops_listen {}", config.server.ops_listen))?;
 
+    // Finish every fallible preparation before any background worker can write,
+    // so a startup failure leaves storage exactly as it was.
+    let mut delivery_workers = Vec::new();
+    if config.mode == config::Mode::Live {
+        let abandoned = store
+            .abandon_unconfigured(config.destinations.keys().cloned().collect())
+            .await
+            .context("cannot reconcile deliveries for removed destinations")?;
+        if abandoned > 0 {
+            tracing::warn!(
+                abandoned,
+                "ended open deliveries for destinations no longer configured"
+            );
+        }
+        for (id, destination) in &config.destinations {
+            delivery_workers.push(delivery::Worker {
+                destination: id.clone(),
+                discord: delivery::Discord::new(destination, config.delivery.timeout)
+                    .with_context(|| format!("destinations.{id}"))?,
+                mention_cooldown: destination.mention_cooldown,
+                store: store.clone(),
+                metrics: Arc::clone(&metrics),
+                wake: Arc::clone(&wake),
+                settings: config.delivery,
+            });
+        }
+    }
+    let clef = config
+        .assessment
+        .as_ref()
+        .map(|settings| assessment::Clef::new(Arc::clone(settings)))
+        .transpose()
+        .context("cannot build assessment client")?;
+
     let cancel = CancellationToken::new();
     let mut workers = JoinSet::new();
     let started_at = now_ms();
@@ -201,35 +235,10 @@ async fn serve(path: &Path) -> Result<()> {
         config.server.credential_reload_interval,
         cancel.child_token(),
     ));
-    if config.mode == config::Mode::Live {
-        let abandoned = store
-            .abandon_unconfigured(config.destinations.keys().cloned().collect())
-            .await
-            .context("cannot reconcile deliveries for removed destinations")?;
-        if abandoned > 0 {
-            tracing::warn!(
-                abandoned,
-                "ended open deliveries for destinations no longer configured"
-            );
-        }
-        let settings = config.delivery;
-        for (id, destination) in &config.destinations {
-            let worker = delivery::Worker {
-                destination: id.clone(),
-                discord: delivery::Discord::new(destination, settings.timeout)
-                    .with_context(|| format!("destinations.{id}"))?,
-                mention_cooldown: destination.mention_cooldown,
-                store: store.clone(),
-                metrics: Arc::clone(&metrics),
-                wake: Arc::clone(&wake),
-                settings,
-            };
-            workers.spawn(worker.run(cancel.child_token()));
-        }
+    for worker in delivery_workers {
+        workers.spawn(worker.run(cancel.child_token()));
     }
-    if let Some(settings) = &config.assessment {
-        let clef = assessment::Clef::new(Arc::clone(settings))
-            .context("cannot build assessment client")?;
+    if let Some(clef) = clef {
         workers.spawn(assessment::run(
             store.clone(),
             clef,
