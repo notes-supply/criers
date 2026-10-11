@@ -476,3 +476,63 @@ async fn credential_rotation_applies_and_invalid_updates_keep_the_last_good_toke
         "{overlap_old} {overlap_new} {retired} {kept}\n{metrics}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_process_through_a_symlinked_database_path_is_refused() {
+    let deployment = Deployment::new("shadow", None, "");
+    let client = reqwest::Client::new();
+    let mut first = deployment.spawn();
+    deployment.wait_ready(&client).await;
+    // A second instance on other ports names the same database through a symlink.
+    let root = deployment.directory.path();
+    std::os::unix::fs::symlink(root.join("data/criers.sqlite"), root.join("alias.sqlite")).unwrap();
+    let second_config = root.join("second.toml");
+    let text = std::fs::read_to_string(&deployment.config)
+        .unwrap()
+        .replace(
+            &deployment.ingest.to_string(),
+            &format!("127.0.0.1:{}", free_port()),
+        )
+        .replace(
+            &deployment.ops.to_string(),
+            &format!("127.0.0.1:{}", free_port()),
+        )
+        .replace("path = \"data/criers.sqlite\"", "path = \"alias.sqlite\"");
+    assert!(
+        text.contains("path = \"alias.sqlite\"") && !text.contains("path = \"data/criers.sqlite\""),
+        "second config must name the database symlink"
+    );
+    std::fs::write(&second_config, text).unwrap();
+    let mut second = Command::new(binary())
+        .args(["serve", "--config"])
+        .arg(&second_config)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let second_status = loop {
+        if let Some(status) = second.try_wait().unwrap() {
+            break Some(status);
+        }
+        if Instant::now() > deadline {
+            second.kill().unwrap();
+            second.wait().unwrap();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    // Serve logs structured JSON to stdout, including the startup error.
+    let mut output = String::new();
+    if let Some(mut pipe) = second.stdout.take() {
+        use std::io::Read;
+        pipe.read_to_string(&mut output).unwrap();
+    }
+    let first_exit = terminate(&mut first);
+    assert!(
+        second_status.is_some_and(|status| !status.success())
+            && output.contains("another Criers process owns")
+            && first_exit.success(),
+        "second={second_status:?} output={output}"
+    );
+}

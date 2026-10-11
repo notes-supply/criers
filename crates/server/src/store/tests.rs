@@ -231,6 +231,7 @@ async fn scaffold_database_migrates_and_keeps_shadow_intents_shadow() {
             "example".into(),
             webhook,
             permit,
+            |_| {},
         )
         .await
         .unwrap();
@@ -776,7 +777,13 @@ async fn first_v1_database_upgrades_in_place_and_recovers_every_destination() {
         .try_acquire_owned()
         .unwrap();
     let receipt = store
-        .ingest(Arc::clone(&config), "example".into(), webhook, permit)
+        .ingest(
+            Arc::clone(&config),
+            "example".into(),
+            webhook,
+            permit,
+            |_| {},
+        )
         .await
         .unwrap();
     let (version, recoveries, kept, coverage): (i64, String, String, String) = store
@@ -851,7 +858,13 @@ async fn recovery_for_a_removed_destination_is_terminal_and_does_not_pin_retenti
         .try_acquire_owned()
         .unwrap();
     store
-        .ingest(Arc::clone(&reduced), "example".into(), webhook, permit)
+        .ingest(
+            Arc::clone(&reduced),
+            "example".into(),
+            webhook,
+            permit,
+            |_| {},
+        )
         .await
         .unwrap();
     let recovery: String = store
@@ -993,7 +1006,13 @@ async fn ingest_into(store: &Store, config: &Arc<crate::config::Config>, value: 
         .try_acquire_owned()
         .unwrap();
     store
-        .ingest(Arc::clone(config), "example".into(), webhook, permit)
+        .ingest(
+            Arc::clone(config),
+            "example".into(),
+            webhook,
+            permit,
+            |_| {},
+        )
         .await
         .unwrap();
 }
@@ -1255,4 +1274,396 @@ async fn local_rate_limit_pauses_only_its_destination() {
         matches!(ops, Claim::Wait(Some(at)) if at >= later) && matches!(quiet, Claim::Batch(_)),
         "ops={ops:?} quiet={quiet:?}"
     );
+}
+
+#[tokio::test]
+async fn a_symlinked_database_path_shares_the_single_writer_lock() {
+    let directory = tempfile::tempdir().unwrap();
+    let real = directory.path().join("criers.sqlite");
+    let link = directory.path().join("alias.sqlite");
+    let _first = Store::open(real.clone(), 64 << 20).await.unwrap();
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let second = Store::open(link, 64 << 20).await;
+    assert!(
+        matches!(second, Err(StoreError::Locked(_))),
+        "{:?}",
+        second.err()
+    );
+}
+
+#[tokio::test]
+async fn a_symlinked_directory_shares_the_single_writer_lock() {
+    let directory = tempfile::tempdir().unwrap();
+    let data = directory.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    let alias = directory.path().join("alias");
+    std::os::unix::fs::symlink(&data, &alias).unwrap();
+    let _first = Store::open(data.join("criers.sqlite"), 64 << 20)
+        .await
+        .unwrap();
+    let second = Store::open(alias.join("criers.sqlite"), 64 << 20).await;
+    assert!(
+        matches!(second, Err(StoreError::Locked(_))),
+        "{:?}",
+        second.err()
+    );
+}
+
+#[tokio::test]
+async fn a_hard_linked_database_is_refused() {
+    let directory = tempfile::tempdir().unwrap();
+    let real = directory.path().join("criers.sqlite");
+    drop(Store::open(real.clone(), 64 << 20).await.unwrap());
+    let link = directory.path().join("alias.sqlite");
+    std::fs::hard_link(&real, &link).unwrap();
+    let _first = Store::open(real, 64 << 20).await;
+    let second = Store::open(link, 64 << 20).await;
+    assert!(
+        matches!(second, Err(StoreError::HardLinked(_))),
+        "{:?}",
+        second.err()
+    );
+}
+
+#[tokio::test]
+async fn retention_drains_decisions_before_deleting_their_occurrence() {
+    let harness = Harness::shadow("").await;
+    harness.ingest(fixture()).await;
+    harness
+        .ingest(with(fixture(), "/alerts/0/status", json!("resolved")))
+        .await;
+    // Every late firing after resolution is recorded as its own decision.
+    for _ in 0..5 {
+        harness.ingest(fixture()).await;
+    }
+    let old = crate::now_ms() - 2 * HOUR;
+    harness
+        .store
+        .with_connection(move |connection| {
+            connection.execute_batch(&format!(
+                "UPDATE occurrences SET closed_at = {old}, last_seen_at = {old};
+                 UPDATE events SET received_at = {old};
+                 UPDATE outbox SET created_at = {old}, completed_at = {old};"
+            ))?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let total: i64 = harness.query("SELECT count(*) FROM decisions").await;
+    let first = harness
+        .store
+        .retention_step(crate::now_ms() - HOUR, 2)
+        .await
+        .unwrap();
+    let after_first: i64 = harness.query("SELECT count(*) FROM decisions").await;
+    let mut steps = vec![(first.decisions, first.occurrences)];
+    for _ in 0..10 {
+        let step = harness
+            .store
+            .retention_step(crate::now_ms() - HOUR, 2)
+            .await
+            .unwrap();
+        if step.decisions == 0 && step.occurrences == 0 && step.events == 0 {
+            break;
+        }
+        steps.push((step.decisions, step.occurrences));
+    }
+    let occurrences: i64 = harness.query("SELECT count(*) FROM occurrences").await;
+    let decided: usize = steps.iter().map(|(decisions, _)| decisions).sum();
+    assert!(
+        total > 2
+            && first.occurrences == 0
+            && after_first == total - 2
+            && steps.iter().all(|(decisions, _)| *decisions <= 2)
+            && decided as i64 == total
+            && occurrences == 0,
+        "total={total} first={first:?} after_first={after_first} steps={steps:?} occurrences={occurrences}"
+    );
+}
+
+#[tokio::test]
+async fn disabling_heartbeats_clears_persisted_coverage_at_startup() {
+    let harness = Harness::live(
+        DEAD_DISCORD,
+        "[sources.example.heartbeat]\nstale_after = \"1m\"\n",
+    )
+    .await;
+    harness.ingest(heartbeat("Watchdog")).await;
+    let now = crate::now_ms();
+    harness
+        .store
+        .coverage_tick(Arc::clone(&harness.config), now, now - 1000)
+        .await
+        .unwrap();
+    let (_directory, config, store) = reopen_with(harness, |text| {
+        text.replace("[sources.example.heartbeat]\nstale_after = \"1m\"\n", "")
+    })
+    .await;
+    assert!(
+        config
+            .sources
+            .values()
+            .all(|source| source.heartbeat.is_none())
+    );
+    let cancel = tokio_util::sync::CancellationToken::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        crate::tasks::coverage(
+            store.clone(),
+            Arc::clone(&config),
+            Arc::new(tokio::sync::Notify::new()),
+            crate::now_ms(),
+            cancel,
+        ),
+    )
+    .await
+    .unwrap();
+    let permit = Arc::new(tokio::sync::Semaphore::new(1))
+        .try_acquire_owned()
+        .unwrap();
+    let snapshot = store.snapshot("example".into(), permit).await.unwrap();
+    let notices: i64 = store
+        .with_connection(|connection| {
+            Ok(connection.query_row(
+                "SELECT count(*) FROM outbox WHERE kind = 'coverage'",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            snapshot.coverage.as_str(),
+            snapshot.last_heartbeat_at,
+            notices
+        ),
+        ("unknown", None, 0)
+    );
+}
+
+#[tokio::test]
+async fn escalation_at_one_destination_keeps_another_destinations_pending_post() {
+    let harness = Harness::live(DEAD_DISCORD, "").await;
+    let warning = with(fixture(), "/alerts/0/labels/severity", json!("warning"));
+    harness
+        .ingest(with(warning.clone(), "/receiver", json!("quiet")))
+        .await;
+    harness.ingest(fixture()).await;
+    let after_ops_ping: String = harness
+        .query(
+            "SELECT group_concat(destination || ':' || action || ':' || state) FROM
+                (SELECT * FROM outbox WHERE kind = 'notify' ORDER BY id)",
+        )
+        .await;
+    harness
+        .ingest(with(fixture(), "/receiver", json!("quiet")))
+        .await;
+    let after_quiet_ping: String = harness
+        .query(
+            "SELECT group_concat(destination || ':' || action || ':' || state) FROM
+                (SELECT * FROM outbox WHERE kind = 'notify' ORDER BY id)",
+        )
+        .await;
+    assert_eq!(
+        (after_ops_ping.as_str(), after_quiet_ping.as_str()),
+        (
+            "quiet:quiet_post:pending,ops:ping:pending",
+            "quiet:quiet_post:superseded,ops:ping:pending,quiet:ping:pending"
+        )
+    );
+}
+
+#[tokio::test]
+async fn disabling_heartbeats_clears_stale_coverage_without_a_new_notice() {
+    let harness = Harness::live(
+        DEAD_DISCORD,
+        "[sources.example.heartbeat]\nstale_after = \"1m\"\n",
+    )
+    .await;
+    harness.ingest(heartbeat("Watchdog")).await;
+    let now = crate::now_ms();
+    let config = Arc::clone(&harness.config);
+    harness
+        .store
+        .coverage_tick(Arc::clone(&config), now, now - 1000)
+        .await
+        .unwrap();
+    let stale = harness
+        .store
+        .coverage_tick(Arc::clone(&config), now + 120_000, now - 1000)
+        .await
+        .unwrap();
+    let notices_before: i64 = harness
+        .query("SELECT count(*) FROM outbox WHERE kind = 'coverage'")
+        .await;
+    let (_directory, config, store) = reopen_with(harness, |text| {
+        text.replace("[sources.example.heartbeat]\nstale_after = \"1m\"\n", "")
+    })
+    .await;
+    crate::tasks::coverage(
+        store.clone(),
+        Arc::clone(&config),
+        Arc::new(tokio::sync::Notify::new()),
+        crate::now_ms(),
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await;
+    let stats = store.probe().await.unwrap();
+    let observed = stats
+        .sources
+        .iter()
+        .find(|source| source.source == "example")
+        .map(|source| (source.coverage.clone(), source.last_heartbeat_at));
+    let notices_after: i64 = store
+        .with_connection(|connection| {
+            Ok(connection.query_row(
+                "SELECT count(*) FROM outbox WHERE kind = 'coverage'",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        (states(&stale), observed, notices_after - notices_before),
+        (vec!["stale"], Some(("unknown".to_owned(), None)), 0)
+    );
+}
+
+#[tokio::test]
+async fn equal_priority_fanout_recovers_each_destination_it_reached() {
+    let harness = Harness::live(DEAD_DISCORD, "").await;
+    harness.ingest(fixture()).await;
+    harness
+        .ingest(with(fixture(), "/receiver", json!("quiet")))
+        .await;
+    claim_and_complete_at(&harness, "ops", sent()).await;
+    claim_and_complete_at(&harness, "quiet", sent()).await;
+    harness.ingest(fixture()).await;
+    let repeats: i64 = harness
+        .query("SELECT count(*) FROM outbox WHERE kind = 'notify'")
+        .await;
+    harness
+        .ingest(with(fixture(), "/alerts/0/status", json!("resolved")))
+        .await;
+    let recoveries: String = harness
+        .query(
+            "SELECT group_concat(destination) FROM (SELECT destination FROM outbox
+             WHERE kind = 'recovery' ORDER BY destination)",
+        )
+        .await;
+    assert_eq!((repeats, recoveries.as_str()), (2, "ops,quiet"));
+}
+
+async fn read_only(store: &Store, enabled: bool) {
+    store
+        .with_connection(move |connection| {
+            connection.pragma_update(None, "query_only", enabled)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn disabled_heartbeat_reconciliation_retries_until_it_succeeds() {
+    let harness = Harness::live(
+        DEAD_DISCORD,
+        "[sources.example.heartbeat]\nstale_after = \"1m\"\n",
+    )
+    .await;
+    harness.ingest(heartbeat("Watchdog")).await;
+    let now = crate::now_ms();
+    harness
+        .store
+        .coverage_tick(Arc::clone(&harness.config), now, now - 1000)
+        .await
+        .unwrap();
+    let (_directory, config, store) = reopen_with(harness, |text| {
+        text.replace("[sources.example.heartbeat]\nstale_after = \"1m\"\n", "")
+    })
+    .await;
+    // The startup reconciliation's write fails transiently.
+    read_only(&store, true).await;
+    let task = tokio::spawn(crate::tasks::coverage(
+        store.clone(),
+        Arc::clone(&config),
+        Arc::new(tokio::sync::Notify::new()),
+        crate::now_ms(),
+        tokio_util::sync::CancellationToken::new(),
+    ));
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let retired_while_failing = task.is_finished();
+    read_only(&store, false).await;
+    let finished = tokio::time::timeout(std::time::Duration::from_secs(10), task)
+        .await
+        .is_ok();
+    let permit = Arc::new(tokio::sync::Semaphore::new(1))
+        .try_acquire_owned()
+        .unwrap();
+    let snapshot = store.snapshot("example".into(), permit).await.unwrap();
+    assert_eq!(
+        (
+            retired_while_failing,
+            finished,
+            snapshot.coverage.as_str(),
+            snapshot.last_heartbeat_at
+        ),
+        (false, true, "unknown", None)
+    );
+}
+
+#[tokio::test]
+async fn reconciled_heartbeat_removes_the_exported_heartbeat_age() {
+    let harness = Harness::live(
+        DEAD_DISCORD,
+        "[sources.example.heartbeat]\nstale_after = \"1m\"\n",
+    )
+    .await;
+    harness.ingest(heartbeat("Watchdog")).await;
+    let (_directory, config, store) = reopen_with(harness, |text| {
+        text.replace("[sources.example.heartbeat]\nstale_after = \"1m\"\n", "")
+    })
+    .await;
+    let metrics = Arc::new(crate::metrics::Metrics::new());
+    // One real probe-and-publish pass of the storage observer.
+    let observe_once = || {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        crate::tasks::observe(
+            store.clone(),
+            Arc::clone(&config),
+            Arc::clone(&metrics),
+            60_000,
+            cancel,
+        )
+    };
+    let series = r#"criers_source_heartbeat_age_seconds{source="example"}"#;
+    let exported = |metrics: &crate::metrics::Metrics| {
+        metrics
+            .render()
+            .unwrap()
+            .lines()
+            .any(|line| line.starts_with(series))
+    };
+    // Observation can run before startup reconciliation and export the old age.
+    observe_once().await;
+    let before = exported(&metrics);
+    crate::tasks::coverage(
+        store.clone(),
+        Arc::clone(&config),
+        Arc::new(tokio::sync::Notify::new()),
+        crate::now_ms(),
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await;
+    observe_once().await;
+    let after = exported(&metrics);
+    let coverage_unknown = metrics
+        .render()
+        .unwrap()
+        .lines()
+        .any(|line| line == r#"criers_source_coverage{source="example",state="unknown"} 1"#);
+    assert_eq!((before, after, coverage_unknown), (true, false, true));
 }

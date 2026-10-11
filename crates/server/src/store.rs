@@ -46,6 +46,16 @@ pub(crate) enum StoreError {
     },
     #[error("another Criers process owns {0}; run exactly one replica per database")]
     Locked(PathBuf),
+    #[error(
+        "database {0} has more than one hard link; SQLite and the single-writer lock \
+         cannot tell the names apart, so remove the extra links"
+    )]
+    HardLinked(PathBuf),
+    #[error("cannot resolve database path {path}: {source}")]
+    Identity {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("database schema version {0} is newer than this Criers build supports")]
     FutureSchema(i64),
     #[error("source {0:?} is not configured")]
@@ -344,19 +354,28 @@ impl Store {
     /// The caller acknowledges the webhook only after this returns `Ok`.
     /// The admission `permit` is held until the blocking transaction finishes, so
     /// a cancelled request cannot free capacity while its write is still queued.
-    pub(crate) async fn ingest(
+    ///
+    /// `on_commit` runs in the same blocking job right after a successful commit,
+    /// so commit-side effects (metrics, waking workers) happen even if the caller
+    /// has given up waiting. It never runs for a failed or rolled-back write.
+    pub(crate) async fn ingest<F>(
         &self,
         config: Arc<Config>,
         source: String,
         webhook: Webhook,
         permit: OwnedSemaphorePermit,
-    ) -> Result<Receipt, StoreError> {
+        on_commit: F,
+    ) -> Result<Receipt, StoreError>
+    where
+        F: FnOnce(&Receipt) + Send + 'static,
+    {
         self.proving_write(move |connection| {
             let _permit = permit;
             let now = crate::now_ms();
             let transaction = connection.transaction()?;
             let receipt = ingest_transaction(&transaction, &config, &source, &webhook, now)?;
             transaction.commit()?;
+            on_commit(&receipt);
             Ok(receipt)
         })
         .await
@@ -639,11 +658,13 @@ impl Store {
                     params![cutoff, batch],
                 )?,
                 // Deleting an occurrence cascades to its children, so every child must
-                // itself be finished and older than the cutoff.
+                // itself be finished and older than the cutoff, and its decisions must
+                // already be drained in bounded batches above.
                 occurrences: transaction.execute(
                     "DELETE FROM occurrences WHERE id IN
                         (SELECT o.id FROM occurrences o
                          WHERE o.closed_at < ?1 AND o.last_seen_at < ?1
+                         AND NOT EXISTS (SELECT 1 FROM decisions d WHERE d.occurrence_id = o.id)
                          AND NOT EXISTS (SELECT 1 FROM outbox b WHERE b.occurrence_id = o.id
                             AND (b.state IN ('pending', 'in_flight') OR b.completed_at >= ?1))
                          AND NOT EXISTS (SELECT 1 FROM assessments a WHERE a.occurrence_id = o.id
@@ -718,7 +739,53 @@ impl Store {
     }
 }
 
+/// Resolves the database to the one name every Criers process must use.
+///
+/// Symbolic links (to the file or any parent directory) are resolved, so all
+/// aliases share one lock file and SQLite derives one set of `-wal` and `-shm`
+/// names. A database with more than one hard link is refused: neither SQLite
+/// nor the lock file can tell its names apart. The lock is a pathname lock next
+/// to the resolved file; it does not detect a single file bind-mounted under
+/// another directory.
+fn database_identity(path: &Path) -> Result<PathBuf, StoreError> {
+    use std::os::unix::fs::MetadataExt;
+    let failed = |source| StoreError::Identity {
+        path: path.to_path_buf(),
+        source,
+    };
+    match std::fs::canonicalize(path) {
+        Ok(real) => {
+            if std::fs::metadata(&real).map_err(failed)?.nlink() > 1 {
+                return Err(StoreError::HardLinked(real));
+            }
+            Ok(real)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // A dangling symbolic link would make SQLite create its target.
+            if std::fs::symlink_metadata(path).is_ok() {
+                return Err(failed(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "the symbolic link's target does not exist",
+                )));
+            }
+            let parent = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            let name = path.file_name().ok_or_else(|| {
+                failed(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "the path has no file name",
+                ))
+            })?;
+            Ok(std::fs::canonicalize(parent).map_err(failed)?.join(name))
+        }
+        Err(error) => Err(failed(error)),
+    }
+}
+
 fn open_blocking(path: &Path, max_bytes: u64) -> Result<Inner, StoreError> {
+    let path = &database_identity(path)?;
     // Append to the whole file name: replacing the extension would make
     // `alerts.sqlite` and `alerts.db` share one lock.
     let lock_path = {
@@ -939,8 +1006,11 @@ fn process_alert(
         event_id,
         now,
     } = *context;
-    let observed = upsert_occurrence(transaction, context, alert)?;
+    let mut observed = upsert_occurrence(transaction, context, alert)?;
     let id = observed.id;
+    if let Prior::Firing(_) = observed.prior {
+        observed.prior = Prior::Firing(announced_at(transaction, id, destination)?);
+    }
     // Every destination that was, or may have been, told about the occurrence gets
     // its own recovery; destinations whose sends never happened get none.
     let recovery_destinations: Vec<String> = if alert.status == Status::Resolved
@@ -991,12 +1061,21 @@ fn process_alert(
         ])?;
     match transition.cancel {
         Cancel::Nothing | Cancel::Below(Action::Record | Action::QuietPost) => {}
-        Cancel::Below(Action::Ping) => {
-            supersede_unattempted(transaction, id, Some("quiet_post"), "escalated", now)?;
-        }
-        Cancel::All => {
-            supersede_unattempted(transaction, id, None, "resolved_before_delivery", now)?;
-        }
+        // Escalation replaces a lower post only at the destination it escalates.
+        Cancel::Below(Action::Ping) => supersede_unattempted(
+            transaction,
+            id,
+            (Some("quiet_post"), Some(destination)),
+            "escalated",
+            now,
+        )?,
+        Cancel::All => supersede_unattempted(
+            transaction,
+            id,
+            (None, None),
+            "resolved_before_delivery",
+            now,
+        )?,
     }
     let subject = Subject {
         source: source_id,
@@ -1244,10 +1323,12 @@ fn supersede_older(
 }
 
 /// Cancels live intents that never reached a destination.
+///
+/// `(action, destination)` narrows the cancellation; `None` matches any.
 fn supersede_unattempted(
     transaction: &Transaction<'_>,
     occurrence: i64,
-    action: Option<&str>,
+    (action, destination): (Option<&str>, Option<&str>),
     reason: &str,
     now: i64,
 ) -> Result<(), StoreError> {
@@ -1255,10 +1336,34 @@ fn supersede_unattempted(
         .prepare_cached(
             "UPDATE outbox SET state = 'superseded', completed_at = ?2, last_error = ?3
              WHERE occurrence_id = ?1 AND state = 'pending' AND possibly_delivered = 0
-             AND kind = 'notify' AND (?4 IS NULL OR action = ?4)",
+             AND kind = 'notify' AND (?4 IS NULL OR action = ?4)
+             AND (?5 IS NULL OR destination = ?5)",
         )?
-        .execute(params![occurrence, now, reason, action])?;
+        .execute(params![occurrence, now, reason, action, destination])?;
     Ok(())
+}
+
+/// The highest action this occurrence has already announced to `destination`.
+///
+/// Notification history is kept per destination: Alertmanager can route one
+/// alert through several receivers (`continue: true`), and each destination they
+/// map to gets its own announcement, deduplication and escalation. Intents in
+/// every state count, so a repeat never re-announces what was cancelled,
+/// rejected or recorded in shadow mode. Intents migrated from the scaffold have
+/// no destination (it had none) and count for every destination.
+fn announced_at(
+    transaction: &Transaction<'_>,
+    occurrence: i64,
+    destination: &str,
+) -> Result<Action, StoreError> {
+    let rank: Option<u8> = transaction
+        .prepare_cached(
+            "SELECT max(CASE action WHEN 'ping' THEN 2 WHEN 'quiet_post' THEN 1 END)
+             FROM outbox WHERE occurrence_id = ?1 AND kind = 'notify'
+             AND destination IN (?2, '')",
+        )?
+        .query_row(params![occurrence, destination], |row| row.get(0))?;
+    Ok(rank.and_then(Action::from_rank).unwrap_or(Action::Record))
 }
 
 /// A durable notification intent to record.
@@ -1562,6 +1667,22 @@ fn coverage_transaction(
     let mut changes = Vec::new();
     for (source_id, source) in &config.sources {
         let Some(heartbeat) = &source.heartbeat else {
+            // Monitoring is off: drop freshness and coverage left by an earlier
+            // configuration so nothing keeps advertising them. No notice is sent.
+            let cleared = transaction.execute(
+                "UPDATE source_status SET last_heartbeat_at = NULL, heartbeat_alertname = NULL,
+                    coverage = 'unknown', coverage_changed_at = ?2
+                 WHERE source = ?1 AND (last_heartbeat_at IS NOT NULL
+                    OR heartbeat_alertname IS NOT NULL OR coverage != 'unknown')",
+                params![source_id, now],
+            )?;
+            if cleared > 0 {
+                changes.push(CoverageChange {
+                    source: source_id.clone(),
+                    state: "unknown",
+                    notified: false,
+                });
+            }
             continue;
         };
         let stale_after = i64::try_from(heartbeat.stale_after.as_millis()).unwrap_or(i64::MAX);

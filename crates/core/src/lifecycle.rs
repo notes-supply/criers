@@ -7,7 +7,8 @@ use crate::{Action, Proposal, Status};
 pub enum Prior {
     /// The occurrence was just created by this observation.
     New,
-    /// Firing, with the highest action already proposed for it.
+    /// Firing, with the highest notification action recorded for the target
+    /// destination (`Record` if no intent was recorded).
     Firing(Action),
     /// Already resolved.
     Resolved,
@@ -118,9 +119,10 @@ impl Transition {
 /// * `proposal` - the policy proposal for a firing observation
 /// * `notified` - whether live delivery may already have reached someone
 ///
-/// Escalation is monotonic: only a strictly higher action produces another
-/// intent. Resolution never reopens, and recovery requires a possible prior
-/// notification rather than merely a recorded intent.
+/// Escalation is monotonic per destination: only a strictly higher action than
+/// an intent already recorded for that destination produces another intent.
+/// Pending and in-flight intents count. Resolution never reopens, and recovery
+/// requires a possible prior notification rather than merely a recorded intent.
 ///
 /// ```
 /// use criers_core::{Action, Cancel, Intent, Notified, Policy, Prior, Status, apply};
