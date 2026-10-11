@@ -25,7 +25,7 @@ use tower_http::{timeout::TimeoutLayer, trace::TraceLayer};
 use crate::{
     config::Config,
     credentials::Credentials,
-    metrics::{DecisionLabels, Metrics, SourceLabels, SourceOutcome, SourceStatus},
+    metrics::{DecisionLabels, Metrics, OutcomeLabels, SourceLabels, SourceOutcome, SourceStatus},
     store::{Receipt, Snapshot, Store, StoreError},
 };
 
@@ -306,6 +306,14 @@ fn observe(state: &AppState, source: &str, admitted: &Admitted) {
                 source: source.to_owned(),
             })
             .inc();
+    }
+    if admitted.receipt.assessments_skipped > 0 {
+        metrics
+            .assessments
+            .get_or_create(&OutcomeLabels {
+                outcome: "skipped_queue_full",
+            })
+            .inc_by(admitted.receipt.assessments_skipped);
     }
     for decision in &admitted.receipt.decisions {
         metrics

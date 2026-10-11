@@ -200,3 +200,38 @@ fn live_delivery_with_assessment_is_allowed_with_an_explicit_warning() {
         config.warnings
     );
 }
+
+#[test]
+fn wildcard_and_specific_listeners_on_one_port_are_rejected() {
+    let message = error(&format!(
+        "{MINIMAL}\n[server]\nlisten = \"0.0.0.0:8080\"\nops_listen = \"127.0.0.1:8080\"\n"
+    ));
+    assert!(message.contains("cannot both bind"), "{message}");
+}
+
+#[test]
+fn ipv6_wildcard_and_specific_listeners_on_one_port_are_rejected() {
+    let message = error(&format!(
+        "{MINIMAL}\n[server]\nlisten = \"[::1]:8080\"\nops_listen = \"[::]:8080\"\n"
+    ));
+    assert!(message.contains("cannot both bind"), "{message}");
+}
+
+#[test]
+fn ephemeral_port_zero_listeners_are_accepted() {
+    let directory = tempfile::tempdir().unwrap();
+    let body =
+        format!("{MINIMAL}\n[server]\nlisten = \"127.0.0.1:0\"\nops_listen = \"127.0.0.1:0\"\n");
+    let loaded = Config::load(&write(directory.path(), &body));
+    assert!(loaded.is_ok(), "{:#}", loaded.unwrap_err());
+}
+
+#[test]
+fn distinct_specific_addresses_may_share_a_port() {
+    let directory = tempfile::tempdir().unwrap();
+    let body = format!(
+        "{MINIMAL}\n[server]\nlisten = \"127.0.0.1:8080\"\nops_listen = \"127.0.0.2:8080\"\n"
+    );
+    let loaded = Config::load(&write(directory.path(), &body));
+    assert!(loaded.is_ok(), "{:#}", loaded.unwrap_err());
+}

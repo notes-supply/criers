@@ -373,3 +373,133 @@ async fn included_alertname_is_truncated_like_every_other_field() {
         "fields={fields} body={body}"
     );
 }
+
+fn metric(harness: &Harness, series: &str) -> Option<String> {
+    let text = harness.state.metrics.render().unwrap();
+    text.lines()
+        .find(|line| line.starts_with(series))
+        .map(str::to_owned)
+}
+
+#[tokio::test]
+async fn queue_full_skips_are_counted_in_the_assessment_metric() {
+    let clef = MockProvider::start(Vec::new(), answer(0.5)).await;
+    let harness = harness(&clef, "max_pending = 1\n").await;
+    let mut batch = warning();
+    let template = batch["alerts"][0].clone();
+    batch["alerts"] = Value::Array(
+        (0..3)
+            .map(|index| {
+                with(
+                    template.clone(),
+                    "/fingerprint",
+                    json!(format!("{index:016x}")),
+                )
+            })
+            .collect(),
+    );
+    let (status, _) = super::post_to(harness.app(), "example", &batch, super::TOKEN).await;
+    assert_eq!(
+        (
+            status,
+            metric(
+                &harness,
+                r#"criers_assessments_total{outcome="skipped_queue_full"}"#
+            )
+        ),
+        (
+            axum::http::StatusCode::ACCEPTED,
+            Some(r#"criers_assessments_total{outcome="skipped_queue_full"} 2"#.to_owned())
+        )
+    );
+}
+
+#[tokio::test]
+async fn assessments_skipped_for_closed_occurrences_are_counted() {
+    let clef = MockProvider::start(Vec::new(), answer(0.5)).await;
+    let harness = harness(&clef, "").await;
+    harness.ingest(warning()).await;
+    harness
+        .ingest(with(warning(), "/alerts/0/status", json!("resolved")))
+        .await;
+    let cancel = spawn(&harness);
+    let outcome = wait_for_outcome(&harness).await;
+    cancel.cancel();
+    assert_eq!(
+        (
+            outcome.as_deref(),
+            clef.requests().len(),
+            metric(
+                &harness,
+                r#"criers_assessments_total{outcome="skipped_closed"}"#
+            )
+        ),
+        (
+            Some("skipped_closed"),
+            0,
+            Some(r#"criers_assessments_total{outcome="skipped_closed"} 1"#.to_owned())
+        )
+    );
+}
+
+#[tokio::test]
+async fn queued_assessment_is_not_sent_to_a_different_model_after_a_config_change() {
+    let clef = MockProvider::start(Vec::new(), answer(0.5)).await;
+    let harness = harness(&clef, "model = \"clef\"\n").await;
+    harness.ingest(warning()).await;
+    // Restart with the other model configured; the queued job was asked for `clef`.
+    let config_path = harness.directory.path().join("criers.toml");
+    let text = std::fs::read_to_string(&config_path)
+        .unwrap()
+        .replace("model = \"clef\"\n", "model = \"clef-flash\"\n");
+    std::fs::write(&config_path, text).unwrap();
+    let config = Arc::new(crate::config::Config::load(&config_path).unwrap());
+    let Harness {
+        directory: _directory,
+        path,
+        store,
+        state,
+        ..
+    } = harness;
+    drop(state);
+    drop(store);
+    let store = crate::store::Store::open(path, config.storage.max_bytes)
+        .await
+        .unwrap();
+    let cancel = CancellationToken::new();
+    tokio::spawn(assessment::run(
+        store.clone(),
+        Clef::new(Arc::clone(config.assessment.as_ref().unwrap())).unwrap(),
+        Arc::new(crate::metrics::Metrics::new()),
+        Arc::new(tokio::sync::Notify::new()),
+        cancel.clone(),
+    ));
+    let mut row = String::new();
+    for _ in 0..200 {
+        row = store
+            .with_connection(|connection| {
+                Ok(connection.query_row(
+                    "SELECT state || ':' || coalesce(outcome, '') || ':' || requested_model
+                     || ':' || coalesce(model, '') FROM assessments",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        if row.starts_with("done") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    cancel.cancel();
+    assert_eq!(
+        (row.as_str(), clef.requests().len()),
+        ("done:skipped_model_changed:clef:", 0),
+        "requests={:?}",
+        clef.requests()
+            .iter()
+            .map(|request| &request.path)
+            .collect::<Vec<_>>()
+    );
+}

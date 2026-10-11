@@ -544,13 +544,13 @@ async fn retention_keeps_an_old_occurrence_with_a_pending_assessment() {
         })
         .await
         .unwrap();
-    harness
+    let retained = harness
         .store
         .retention_step(crate::now_ms() - HOUR, 1000)
         .await
         .unwrap();
     let assessments: i64 = harness.query("SELECT count(*) FROM assessments").await;
-    assert_eq!(assessments, 1);
+    assert_eq!((assessments, retained.assessments_closed), (1, 1));
 }
 
 fn pager_extra() -> String {

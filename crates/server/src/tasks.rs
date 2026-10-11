@@ -10,7 +10,9 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     config::Config,
     credentials::Credentials,
-    metrics::{CoverageLabels, DestinationLabels, Metrics, SourceLabels, TableLabels},
+    metrics::{
+        CoverageLabels, DestinationLabels, Metrics, OutcomeLabels, SourceLabels, TableLabels,
+    },
     store::{Stats, Store},
 };
 
@@ -118,6 +120,14 @@ pub(crate) async fn retention(
                     break;
                 }
             };
+            if deleted.assessments_closed > 0 {
+                metrics
+                    .assessments
+                    .get_or_create(&OutcomeLabels {
+                        outcome: "skipped_closed",
+                    })
+                    .inc_by(deleted.assessments_closed as u64);
+            }
             for (table, count) in [
                 ("decisions", deleted.decisions),
                 ("events", deleted.events),
@@ -133,6 +143,7 @@ pub(crate) async fn retention(
                 }
             }
             let saturated = [
+                deleted.assessments_closed,
                 deleted.decisions,
                 deleted.events,
                 deleted.occurrences,

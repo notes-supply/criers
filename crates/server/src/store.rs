@@ -104,6 +104,9 @@ pub(crate) struct Receipt {
     pub coverage_gap: bool,
     pub heartbeat: bool,
     pub decisions: Vec<Decision>,
+    /// Assessments recorded as `skipped_queue_full`; reported through metrics.
+    #[serde(skip)]
+    pub assessments_skipped: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -194,6 +197,16 @@ pub(crate) enum Completion {
     },
 }
 
+/// Assessments claimed for the provider, and those closed without a call.
+#[derive(Debug)]
+pub(crate) struct AssessmentClaim {
+    pub jobs: Vec<AssessmentJob>,
+    /// Marked `skipped_closed`: the occurrence resolved before assessment.
+    pub closed: usize,
+    /// Marked `skipped_model_changed`: queued for a model no longer configured.
+    pub model_changed: usize,
+}
+
 #[derive(Debug)]
 pub(crate) struct AssessmentJob {
     pub id: i64,
@@ -212,6 +225,8 @@ pub(crate) struct AssessmentFailure {
 
 #[derive(Debug, Default)]
 pub(crate) struct Retention {
+    /// Pending assessments of long-closed occurrences marked `skipped_closed`.
+    pub assessments_closed: usize,
     pub decisions: usize,
     pub events: usize,
     pub occurrences: usize,
@@ -430,29 +445,43 @@ impl Store {
         .await
     }
 
+    /// Claims due assessments for the active `model`.
+    ///
+    /// Jobs of closed occurrences, and jobs queued for a different model before a
+    /// configuration change, are closed instead of being sent: a result must
+    /// come from the model its row records as requested.
     pub(crate) async fn claim_assessments(
         &self,
         now: i64,
         limit: usize,
-    ) -> Result<Vec<AssessmentJob>, StoreError> {
+        model: &'static str,
+    ) -> Result<AssessmentClaim, StoreError> {
         self.write(move |connection| {
             let transaction = connection.transaction()?;
-            transaction.execute(
+            let closed = transaction.execute(
                 "UPDATE assessments SET state = 'done', outcome = 'skipped_closed', completed_at = ?1
                  WHERE id IN (SELECT a.id FROM assessments a JOIN occurrences o ON o.id = a.occurrence_id
                     WHERE a.state IN ('pending', 'in_flight') AND a.state = 'pending'
                     AND o.status != 'firing' LIMIT 100)",
                 [now],
             )?;
+            let model_changed = transaction.execute(
+                "UPDATE assessments SET state = 'done', outcome = 'skipped_model_changed',
+                    completed_at = ?1
+                 WHERE id IN (SELECT id FROM assessments
+                    WHERE state IN ('pending', 'in_flight') AND state = 'pending'
+                    AND requested_model != ?2 LIMIT 100)",
+                params![now, model],
+            )?;
             let jobs = {
                 let mut statement = transaction.prepare_cached(
                     // The repeated state term lets SQLite use the partial index.
                     "SELECT id, context, attempts FROM assessments
                      WHERE state IN ('pending', 'in_flight') AND state = 'pending'
-                     AND due_at <= ?1 ORDER BY due_at, id LIMIT ?2",
+                     AND due_at <= ?1 AND requested_model = ?3 ORDER BY due_at, id LIMIT ?2",
                 )?;
                 statement
-                    .query_map(params![now, limit as i64], |row| {
+                    .query_map(params![now, limit as i64, model], |row| {
                         Ok(AssessmentJob {
                             id: row.get(0)?,
                             context: row.get(1)?,
@@ -468,7 +497,11 @@ impl Store {
                 )?;
             }
             transaction.commit()?;
-            Ok(jobs)
+            Ok(AssessmentClaim {
+                jobs,
+                closed,
+                model_changed,
+            })
         })
         .await
     }
@@ -576,7 +609,7 @@ impl Store {
             // A pending assessment of a long-closed occurrence would only be skipped by
             // the worker; closing it here keeps a disabled worker from pinning the
             // occurrence forever. Its new completion time restarts the window.
-            transaction.execute(
+            let assessments_closed = transaction.execute(
                 "UPDATE assessments SET state = 'done', outcome = 'skipped_closed',
                     completed_at = ?3
                  WHERE id IN (SELECT a.id FROM assessments a
@@ -594,6 +627,7 @@ impl Store {
                 params![cutoff, batch],
             )?;
             let deleted = Retention {
+                assessments_closed,
                 decisions,
                 events: transaction.execute(
                     "DELETE FROM events WHERE id IN
@@ -792,8 +826,13 @@ struct AlertContext<'a> {
     now: i64,
 }
 
-/// Remaining assessment queue capacity, counted lazily once per webhook.
-struct AssessmentBudget(Option<i64>);
+/// Remaining assessment queue capacity, counted lazily once per webhook, and the
+/// number of assessments this webhook skipped because the queue was full.
+#[derive(Default)]
+struct AssessmentBudget {
+    remaining: Option<i64>,
+    skipped: u64,
+}
 
 fn ingest_transaction(
     transaction: &Transaction<'_>,
@@ -821,6 +860,7 @@ fn ingest_transaction(
         .filter(|alert| !is_heartbeat(alert))
         .count();
     let mut decisions = Vec::with_capacity(observed);
+    let mut budget = AssessmentBudget::default();
     let event_id = if observed > 0 {
         transaction.execute(
             "INSERT INTO events(source, received_at, receiver, group_key, alerts, truncated_alerts)
@@ -842,7 +882,6 @@ fn ingest_transaction(
             event_id: transaction.last_insert_rowid(),
             now,
         };
-        let mut budget = AssessmentBudget(None);
         for alert in webhook.alerts.iter().filter(|alert| !is_heartbeat(alert)) {
             decisions.push(process_alert(transaction, &context, alert, &mut budget)?);
         }
@@ -870,6 +909,7 @@ fn ingest_transaction(
         coverage_gap: webhook.truncated_alerts > 0,
         heartbeat: heartbeat_seen,
         decisions,
+        assessments_skipped: budget.skipped,
     })
 }
 
@@ -1124,7 +1164,7 @@ fn enqueue_assessment(
     let Some(assessment) = &config.assessment else {
         return Ok(());
     };
-    let remaining = match budget.0 {
+    let remaining = match budget.remaining {
         Some(remaining) => remaining,
         None => {
             let queued: i64 = transaction.query_row(
@@ -1135,11 +1175,12 @@ fn enqueue_assessment(
             i64::from(assessment.max_pending) - queued
         }
     };
-    budget.0 = Some(remaining - 1);
+    budget.remaining = Some(remaining - 1);
     let context = assessment::context(alert, assessment)?;
     let (state, outcome, completed_at) = if remaining > 0 {
         ("pending", None, None)
     } else {
+        budget.skipped += 1;
         ("done", Some("skipped_queue_full"), Some(now))
     };
     transaction

@@ -146,8 +146,10 @@ truncated to `max_value_chars`. Results store the impact probability, urgency
 score and probabilities, confidence, requested and reported model, question set
 and policy version, the context hash and the list of fields sent. Outcomes are
 `assessed`, `stale` (the occurrence resolved first), `timeout`, `rate_limited`,
-`http_error`, `malformed`, `transport_error`, `skipped_closed` and
-`skipped_queue_full` when `max_pending` is reached.
+`http_error`, `malformed`, `transport_error`, `skipped_closed`,
+`skipped_queue_full` when `max_pending` is reached, and `skipped_model_changed`
+for jobs queued before `assessment.model` changed (they are never sent to the
+new model). Every outcome is counted in `criers_assessments_total`.
 
 ## Credentials and rotation
 

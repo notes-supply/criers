@@ -529,9 +529,12 @@ fn validate(raw: RawConfig, base: &Path) -> Result<Config> {
 
 fn validate_server(raw: RawServer) -> Result<Server> {
     ensure!(
-        raw.listen != raw.ops_listen,
-        "server.listen and server.ops_listen must differ so probes and metrics stay separate \
-         from authenticated ingestion"
+        !listeners_conflict(raw.listen, raw.ops_listen),
+        "server.listen {} and server.ops_listen {} cannot both bind: they must differ, and a \
+         wildcard address takes its port on every interface of that address family; use \
+         different ports so probes and metrics stay separate from authenticated ingestion",
+        raw.listen,
+        raw.ops_listen
     );
     ensure!(
         (4096..=16_777_216).contains(&raw.max_body_bytes),
@@ -564,6 +567,20 @@ fn validate_server(raw: RawServer) -> Result<Server> {
         shutdown_grace: raw.shutdown_grace.0,
         credential_reload_interval: raw.credential_reload_interval.0,
     })
+}
+
+/// Whether two listeners provably cannot be bound together on one host.
+///
+/// Port 0 asks the OS for a fresh port and never conflicts. An unspecified
+/// address reserves the port for its whole family; whether an IPv6 wildcard also
+/// covers IPv4 depends on the host's `bindv6only` setting, so that pair is not
+/// rejected.
+fn listeners_conflict(first: SocketAddr, second: SocketAddr) -> bool {
+    let same_family = first.is_ipv4() == second.is_ipv4();
+    first.port() != 0
+        && first.port() == second.port()
+        && (first.ip() == second.ip()
+            || (same_family && (first.ip().is_unspecified() || second.ip().is_unspecified())))
 }
 
 fn validate_storage(raw: RawStorage, base: &Path) -> Result<Storage> {

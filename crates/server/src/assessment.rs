@@ -335,10 +335,24 @@ pub(crate) async fn run(
         let capacity = concurrency.saturating_sub(running.len());
         let mut claimed = 0;
         if capacity > 0 {
-            match store.claim_assessments(crate::now_ms(), capacity).await {
-                Ok(jobs) => {
-                    claimed = jobs.len();
-                    for job in jobs {
+            match store
+                .claim_assessments(crate::now_ms(), capacity, clef.config.model)
+                .await
+            {
+                Ok(claim) => {
+                    for (outcome, count) in [
+                        ("skipped_closed", claim.closed),
+                        ("skipped_model_changed", claim.model_changed),
+                    ] {
+                        if count > 0 {
+                            metrics
+                                .assessments
+                                .get_or_create(&OutcomeLabels { outcome })
+                                .inc_by(count as u64);
+                        }
+                    }
+                    claimed = claim.jobs.len();
+                    for job in claim.jobs {
                         running.spawn(assess_one(
                             store.clone(),
                             Arc::clone(&clef),
