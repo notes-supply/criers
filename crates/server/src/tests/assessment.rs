@@ -424,16 +424,19 @@ async fn assessments_skipped_for_closed_occurrences_are_counted() {
         .await;
     let cancel = spawn(&harness);
     let outcome = wait_for_outcome(&harness).await;
+    // The worker counts the skip just after its claim commits; wait for it boundedly.
+    let series = r#"criers_assessments_total{outcome="skipped_closed"}"#;
+    let mut counted = metric(&harness, series);
+    for _ in 0..100 {
+        if counted.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        counted = metric(&harness, series);
+    }
     cancel.cancel();
     assert_eq!(
-        (
-            outcome.as_deref(),
-            clef.requests().len(),
-            metric(
-                &harness,
-                r#"criers_assessments_total{outcome="skipped_closed"}"#
-            )
-        ),
+        (outcome.as_deref(), clef.requests().len(), counted),
         (
             Some("skipped_closed"),
             0,
