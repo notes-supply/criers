@@ -810,3 +810,95 @@ async fn first_v1_database_upgrades_in_place_and_recovers_every_destination() {
         receipt.decisions[0].reason
     );
 }
+
+#[tokio::test]
+async fn recovery_for_a_removed_destination_is_terminal_and_does_not_pin_retention() {
+    let harness = Harness::live(DEAD_DISCORD, "").await;
+    let warning = with(fixture(), "/alerts/0/labels/severity", json!("warning"));
+    harness
+        .ingest(with(warning.clone(), "/receiver", json!("quiet")))
+        .await;
+    claim_and_complete_at(&harness, "quiet", sent()).await;
+    // Restart with the quiet destination and its receiver mapping removed.
+    let config_path = harness.directory.path().join("criers.toml");
+    let text = std::fs::read_to_string(&config_path)
+        .unwrap()
+        .replace("receivers = { quiet = \"quiet\" }\n", "")
+        .replace(
+            "[destinations.quiet]\nkind = \"discord\"\nwebhook_url_file = \"ops.url\"\n",
+            "",
+        );
+    std::fs::write(&config_path, text).unwrap();
+    let reduced = Arc::new(crate::config::Config::load(&config_path).unwrap());
+    assert!(!reduced.destinations.contains_key("quiet"));
+    let crate::tests::Harness {
+        directory: _directory,
+        path,
+        store,
+        state,
+        ..
+    } = harness;
+    drop(state);
+    drop(store);
+    let store = Store::open(path, reduced.storage.max_bytes).await.unwrap();
+    let abandoned = store
+        .abandon_unconfigured(reduced.destinations.keys().cloned().collect())
+        .await
+        .unwrap();
+    let webhook: criers_core::Webhook =
+        serde_json::from_value(with(warning, "/alerts/0/status", json!("resolved"))).unwrap();
+    let permit = Arc::new(tokio::sync::Semaphore::new(1))
+        .try_acquire_owned()
+        .unwrap();
+    store
+        .ingest(Arc::clone(&reduced), "example".into(), webhook, permit)
+        .await
+        .unwrap();
+    let recovery: String = store
+        .with_connection(|connection| {
+            Ok(connection.query_row(
+                "SELECT destination || ':' || state || ':' || coalesce(last_error, '')
+                 FROM outbox WHERE kind = 'recovery'",
+                [],
+                |row| row.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    let claim = store
+        .claim_deliveries("ops".into(), crate::now_ms(), LIMITS)
+        .await
+        .unwrap();
+    let early = store
+        .retention_step(crate::now_ms() - HOUR, 1000)
+        .await
+        .unwrap();
+    let later = store
+        .retention_step(crate::now_ms() + HOUR, 1000)
+        .await
+        .unwrap();
+    assert!(
+        abandoned == 0
+            && recovery == "quiet:failed:destination_not_configured"
+            && matches!(claim, Claim::Wait(None))
+            && early.occurrences == 0
+            && later.occurrences == 1,
+        "abandoned={abandoned} recovery={recovery} claim={claim:?} early={early:?} later={later:?}"
+    );
+}
+
+#[tokio::test]
+async fn databases_sharing_a_stem_have_separate_single_writer_locks() {
+    let directory = tempfile::tempdir().unwrap();
+    let sqlite = directory.path().join("alerts.sqlite");
+    let db = directory.path().join("alerts.db");
+    let _first = Store::open(sqlite.clone(), 64 << 20).await.unwrap();
+    let second = Store::open(db, 64 << 20).await;
+    let same = Store::open(sqlite, 64 << 20).await;
+    assert!(
+        second.is_ok() && matches!(same, Err(StoreError::Locked(_))),
+        "second={:?} same={:?}",
+        second.err(),
+        same.err()
+    );
+}

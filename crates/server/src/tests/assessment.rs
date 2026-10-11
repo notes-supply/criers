@@ -248,3 +248,73 @@ async fn assessment_in_live_delivery_never_changes_deterministic_routing() {
         (2, "notify:quiet_post:pending", "notify:quiet_post:pending")
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn finished_result_is_recorded_after_a_transient_write_failure_without_restart() {
+    let clef =
+        MockProvider::start(Vec::new(), answer(0.7).delayed(Duration::from_millis(300))).await;
+    let harness = harness(&clef, "").await;
+    harness.ingest(warning()).await;
+    let cancel = spawn(&harness);
+    clef.wait_for(1).await;
+    let read_only = |enabled: bool| {
+        harness.store.with_connection(move |connection| {
+            connection.pragma_update(None, "query_only", enabled)?;
+            Ok(())
+        })
+    };
+    read_only(true).await.unwrap();
+    // The provider answers while storage rejects writes.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let during: String = harness.query("SELECT state FROM assessments").await;
+    read_only(false).await.unwrap();
+    let outcome = wait_for_outcome(&harness).await;
+    cancel.cancel();
+    assert_eq!(
+        (during.as_str(), outcome.as_deref(), clef.requests().len()),
+        ("in_flight", Some("assessed"), 1)
+    );
+}
+
+#[tokio::test]
+async fn excluded_alertname_never_reaches_the_provider() {
+    let clef = MockProvider::start(Vec::new(), answer(0.4)).await;
+    let harness = harness(&clef, "labels = [\"service\"]\n").await;
+    harness.ingest(warning()).await;
+    let cancel = spawn(&harness);
+    wait_for_outcome(&harness).await;
+    cancel.cancel();
+    let body = clef.requests()[0].body.to_string();
+    let fields: String = harness
+        .query("SELECT context_fields FROM assessments")
+        .await;
+    assert!(
+        !body.contains("ExampleStorageFailure")
+            && fields == r#"["labels.service","annotations.summary"]"#,
+        "fields={fields} body={body}"
+    );
+}
+
+#[tokio::test]
+async fn included_alertname_is_truncated_like_every_other_field() {
+    let clef = MockProvider::start(Vec::new(), answer(0.4)).await;
+    let harness = harness(&clef, "max_value_chars = 16\n").await;
+    let long = "VeryLongAlertName".repeat(10);
+    harness
+        .ingest(with(warning(), "/alerts/0/labels/alertname", json!(long)))
+        .await;
+    let cancel = spawn(&harness);
+    wait_for_outcome(&harness).await;
+    cancel.cancel();
+    let request = &clef.requests()[0];
+    let body = request.body.to_string();
+    let fields: String = harness
+        .query("SELECT context_fields FROM assessments")
+        .await;
+    assert!(
+        request.body["state"]["labels"]["alertname"] == json!(&long[..16])
+            && !body.contains(&long[..17])
+            && fields.contains("labels.alertname"),
+        "fields={fields} body={body}"
+    );
+}

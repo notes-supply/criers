@@ -202,7 +202,7 @@ pub(crate) struct AssessmentJob {
 }
 
 /// A failed assessment attempt.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct AssessmentFailure {
     pub outcome: &'static str,
     pub error: String,
@@ -683,7 +683,13 @@ impl Store {
 }
 
 fn open_blocking(path: &Path, max_bytes: u64) -> Result<Inner, StoreError> {
-    let lock_path = path.with_extension("lock");
+    // Append to the whole file name: replacing the extension would make
+    // `alerts.sqlite` and `alerts.db` share one lock.
+    let lock_path = {
+        let mut name = path.as_os_str().to_owned();
+        name.push(".lock");
+        PathBuf::from(name)
+    };
     let lock = File::options()
         .create(true)
         .truncate(false)
@@ -973,6 +979,19 @@ fn process_alert(
                     content: content.clone(),
                 };
                 let inserted = insert_intent(transaction, config.mode, &intent, now)?;
+                // A destination removed from the configuration has no worker, so its
+                // recovery could never be sent: record that honestly as a failure.
+                if let Some(row) = inserted
+                    && config.mode == Mode::Live
+                    && !config.destinations.contains_key(recovery_destination)
+                {
+                    transaction
+                        .prepare_cached(
+                            "UPDATE outbox SET state = 'failed', completed_at = ?2,
+                                last_error = 'destination_not_configured' WHERE id = ?1",
+                        )?
+                        .execute(params![row, now])?;
+                }
                 first = first.or(inserted);
             }
             first

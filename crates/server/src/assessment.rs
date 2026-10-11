@@ -39,7 +39,6 @@ pub(crate) struct Context {
 
 #[derive(Serialize)]
 struct State<'a> {
-    alertname: &'a str,
     status: &'static str,
     labels: BTreeMap<&'a str, String>,
     annotations: BTreeMap<&'a str, String>,
@@ -71,8 +70,8 @@ pub(crate) fn context(alert: &Alert, config: &Assessment) -> Result<Context, ser
         .map(|name| format!("labels.{name}"))
         .chain(annotations.keys().map(|name| format!("annotations.{name}")))
         .collect();
+    // The alert name is a label like any other: it is sent only if allowlisted.
     let state = State {
-        alertname: alert.alertname(),
         status: "firing",
         labels,
         annotations,
@@ -86,7 +85,7 @@ pub(crate) fn context(alert: &Alert, config: &Assessment) -> Result<Context, ser
 }
 
 /// Validated provider answers with provenance.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Answers {
     pub model: String,
     pub impact_probability: f64,
@@ -346,6 +345,7 @@ pub(crate) async fn run(
                             Arc::clone(&metrics),
                             job,
                             max_attempts,
+                            cancel.clone(),
                         ));
                     }
                 }
@@ -372,15 +372,11 @@ async fn assess_one(
     metrics: Arc<Metrics>,
     job: AssessmentJob,
     max_attempts: u32,
+    cancel: CancellationToken,
 ) {
-    let result = clef.assess(&job.context).await;
     let now = crate::now_ms();
-    let outcome = match result {
-        Ok(answers) => {
-            store
-                .record_assessment(job.id, Ok(answers), now, max_attempts)
-                .await
-        }
+    let result = match clef.assess(&job.context).await {
+        Ok(answers) => Ok(answers),
         Err(error) => {
             tracing::info!(assessment = job.id, outcome = error.outcome(), %error, "assessment attempt failed");
             let retry_at = error.retryable().then(|| {
@@ -392,30 +388,45 @@ async fn assess_one(
                 };
                 now + i64::try_from(delay.as_millis()).unwrap_or(i64::MAX / 4)
             });
-            store
-                .record_assessment(
-                    job.id,
-                    Err(AssessmentFailure {
-                        outcome: error.outcome(),
-                        error: error.to_string(),
-                        retry_at,
-                    }),
-                    now,
-                    max_attempts,
-                )
-                .await
+            Err(AssessmentFailure {
+                outcome: error.outcome(),
+                error: error.to_string(),
+                retry_at,
+            })
         }
     };
-    match outcome {
-        Ok(Some(outcome)) => {
-            metrics
-                .assessments
-                .get_or_create(&OutcomeLabels { outcome })
-                .inc();
+    // Keep the obtained result and retry only the write: a row left in flight
+    // would hold queue capacity until restart, and asking the provider again
+    // would repeat a paid call. Shutdown abandons the write; restart then
+    // returns the row to pending.
+    let mut attempt = 0u32;
+    let outcome = loop {
+        match store
+            .record_assessment(job.id, result.clone(), now, max_attempts)
+            .await
+        {
+            Ok(outcome) => break outcome,
+            Err(error) => {
+                attempt = attempt.saturating_add(1);
+                tracing::warn!(assessment = job.id, %error, attempt, "cannot record assessment; retrying");
+                let delay = crate::delivery::backoff(
+                    attempt,
+                    Duration::from_millis(200),
+                    Duration::from_secs(10),
+                );
+                tokio::select! {
+                    () = cancel.cancelled() => return,
+                    () = tokio::time::sleep(delay) => {}
+                }
+            }
         }
-        Ok(None) => {}
-        Err(error) => tracing::warn!(%error, "cannot record assessment"),
     };
+    if let Some(outcome) = outcome {
+        metrics
+            .assessments
+            .get_or_create(&OutcomeLabels { outcome })
+            .inc();
+    }
 }
 
 #[cfg(test)]

@@ -267,6 +267,11 @@ Criers also takes an exclusive lock file next to the database, which stops a
 second process on the same node but does not fence writers on other nodes over
 network storage.
 
+The lock file is the database file name plus `.lock` (for example
+`criers.sqlite.lock`). Earlier builds used `criers.lock`, so when
+upgrading, stop the old process before starting the new one, as the `Recreate`
+strategy does; a leftover `criers.lock` is unused and can be deleted.
+
 Build the image with `mise run image`. It compiles with the toolchain pinned in
 `mise.toml` on Debian 13 and runs on distroless Debian 13 as UID 65532, with
 `/var/lib/criers` pre-owned by that user.
