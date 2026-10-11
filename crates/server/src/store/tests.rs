@@ -723,3 +723,90 @@ async fn coverage_recovery_waits_for_a_delayed_stale_notification() {
         "never={never:?} recovered={recovered:?} claim={claim:?}"
     );
 }
+
+#[tokio::test]
+async fn first_v1_database_upgrades_in_place_and_recovers_every_destination() {
+    // Recreate a database written by the first schema-1 build: narrow intent index
+    // and none of the later indexes, holding sent, pending and coverage state.
+    let directory = tempfile::tempdir().unwrap();
+    let old = directory.path().join("old-v1.sqlite");
+    {
+        let connection = rusqlite::Connection::open(&old).unwrap();
+        connection
+            .execute_batch(include_str!("schema_v1_initial.sql"))
+            .unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA user_version = 1;
+                 INSERT INTO events(id, source, received_at, receiver, group_key, alerts, truncated_alerts)
+                 VALUES (1, 'example', 1000, 'router', 'g', 1, 0);
+                 INSERT INTO occurrences(id, source, fingerprint, starts_at, status, highest_action,
+                    alertname, severity, labels, summary, first_seen_at, last_seen_at, observations)
+                 VALUES (1, 'example', '0123456789abcdef', '2026-10-10T10:00:00.000000000Z', 'firing', 2,
+                    'ExampleStorageFailure', 'critical', '{}', '', 1000, 1000, 2),
+                    (2, 'other', 'fedcba9876543210', '2026-10-10T10:00:00.000000000Z', 'firing', 1,
+                    'Other', 'warning', '{}', '', 1000, 1000, 1);
+                 INSERT INTO decisions(event_id, occurrence_id, action, reason, policy_version)
+                 VALUES (1, 1, 'ping', 'trusted_critical_floor', 'policy-old');
+                 INSERT INTO outbox(id, occurrence_id, source, destination, kind, action, mode, state,
+                    content, created_at, due_at, attempts, remote_id, completed_at)
+                 VALUES (1, 1, 'example', 'quiet', 'notify', 'quiet_post', 'live', 'sent', 'q', 1000, 1000, 1, '7', 1001),
+                    (2, 1, 'example', 'ops', 'notify', 'ping', 'live', 'sent', 'p', 1002, 1002, 1, '8', 1003),
+                    (3, 2, 'other', 'ops', 'notify', 'quiet_post', 'live', 'pending', 'w', 1004, 1004, 0, NULL, NULL);
+                 INSERT INTO source_status(source, last_event_at, truncated_alerts, last_heartbeat_at, coverage)
+                 VALUES ('example', 1000, 0, 900, 'healthy');",
+            )
+            .unwrap();
+    }
+    let harness = Harness::live(DEAD_DISCORD, "").await;
+    let crate::tests::Harness {
+        directory: _directory,
+        path,
+        config,
+        store,
+        state,
+    } = harness;
+    drop(state);
+    drop(store);
+    std::fs::copy(&old, &path).unwrap();
+    let store = Store::open(path, config.storage.max_bytes).await.unwrap();
+    let webhook: criers_core::Webhook =
+        serde_json::from_value(with(fixture(), "/alerts/0/status", json!("resolved"))).unwrap();
+    let permit = Arc::new(tokio::sync::Semaphore::new(1))
+        .try_acquire_owned()
+        .unwrap();
+    let receipt = store
+        .ingest(Arc::clone(&config), "example".into(), webhook, permit)
+        .await
+        .unwrap();
+    let (version, recoveries, kept, coverage): (i64, String, String, String) = store
+        .with_connection(|connection| {
+            Ok(connection.query_row(
+                "SELECT (SELECT user_version FROM pragma_user_version()),
+                    (SELECT group_concat(destination) FROM (SELECT destination FROM outbox
+                        WHERE kind = 'recovery' ORDER BY destination)),
+                    (SELECT group_concat(id || ':' || source || ':' || state) FROM (SELECT * FROM outbox
+                        WHERE id <= 3 ORDER BY id)),
+                    (SELECT coverage FROM source_status WHERE source = 'example')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?)
+        })
+        .await
+        .unwrap();
+    let claim = store
+        .claim_deliveries("ops".into(), crate::now_ms(), LIMITS)
+        .await
+        .unwrap();
+    assert!(
+        version == 2
+            && receipt.decisions[0].reason == "recovery"
+            && recoveries == "ops,quiet"
+            && kept == "1:example:sent,2:example:sent,3:other:pending"
+            && coverage == "healthy"
+            && matches!(&claim, Claim::Batch(batch) if batch.ids.contains(&3)),
+        "version={version} reason={} recoveries={recoveries} kept={kept} coverage={coverage} \
+         claim={claim:?}",
+        receipt.decisions[0].reason
+    );
+}

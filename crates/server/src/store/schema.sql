@@ -1,4 +1,5 @@
--- Schema version 1. Times are Unix milliseconds unless named *_at TEXT.
+-- Schema version 2; migrate_v1.sql upgrades earlier schema-1 databases.
+-- Times are Unix milliseconds unless named *_at TEXT.
 
 CREATE TABLE meta (
     key TEXT PRIMARY KEY,

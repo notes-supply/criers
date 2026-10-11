@@ -1,4 +1,4 @@
--- Upgrades the original shadow-only scaffold (user_version 0) to schema version 1.
+-- Upgrades the original shadow-only scaffold (user_version 0) to the current schema.
 -- Runs inside one transaction after schema.sql has created the new tables, with the
 -- scaffold tables copied to temp.legacy_* and dropped beforehand.
 

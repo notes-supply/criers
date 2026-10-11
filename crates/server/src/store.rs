@@ -26,7 +26,7 @@ use crate::{
     render::{self, Subject},
 };
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const SUMMARY_CHARS: usize = 512;
 
 #[derive(Debug, Error)]
@@ -734,17 +734,24 @@ fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
     let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     match version {
         SCHEMA_VERSION => return Ok(()),
-        0 => {}
+        0 | 1 => {}
         newer => return Err(StoreError::FutureSchema(newer)),
     }
     let transaction = connection.transaction()?;
+    if version == 1 {
+        tracing::info!("upgrading schema 1 database to schema 2");
+        transaction.execute_batch(include_str!("store/migrate_v1.sql"))?;
+        transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        transaction.commit()?;
+        return Ok(());
+    }
     let scaffold: bool = transaction.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'events')",
         [],
         |row| row.get(0),
     )?;
     if scaffold {
-        tracing::info!("migrating scaffold database to schema version 1");
+        tracing::info!("migrating scaffold database to schema version 2");
         for table in [
             "events",
             "occurrences",
