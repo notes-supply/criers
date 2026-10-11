@@ -83,11 +83,18 @@ fn publish(config: &Config, metrics: &Metrics, stats: &Stats) {
                 .get_or_create(&labels)
                 .set(seconds(at));
         }
-        if let Some(at) = freshness.last_heartbeat_at {
-            metrics
-                .source_heartbeat_age
-                .get_or_create(&labels)
-                .set(seconds(at));
+        // Without a heartbeat timestamp there is no age to report; a zero would
+        // claim a fresh heartbeat, so the series is removed instead.
+        match freshness.last_heartbeat_at {
+            Some(at) => {
+                metrics
+                    .source_heartbeat_age
+                    .get_or_create(&labels)
+                    .set(seconds(at));
+            }
+            None => {
+                metrics.source_heartbeat_age.remove(&labels);
+            }
         }
         for state in COVERAGE_STATES {
             metrics
@@ -170,17 +177,20 @@ pub(crate) async fn coverage(
     cancel: CancellationToken,
 ) {
     // The first pass runs at startup even with no heartbeat configured, so
-    // coverage persisted under an earlier configuration is reconciled.
+    // coverage persisted under an earlier configuration is reconciled. Without
+    // monitored sources the task retires only after that pass has committed.
     let monitored = config
         .sources
         .values()
         .any(|source| source.heartbeat.is_some());
+    let mut failures = 0u32;
     loop {
         match store
             .coverage_tick(Arc::clone(&config), crate::now_ms(), started_at)
             .await
         {
             Ok(changes) => {
+                failures = 0;
                 for change in &changes {
                     tracing::warn!(source = %change.source, state = change.state, notified = change.notified, "source coverage changed");
                 }
@@ -188,9 +198,21 @@ pub(crate) async fn coverage(
                     wake.notify_waiters();
                 }
             }
-            Err(error) => tracing::error!(%error, "coverage evaluation failed"),
+            Err(error) => {
+                failures = failures.saturating_add(1);
+                tracing::error!(%error, "coverage evaluation failed");
+            }
         }
-        if !monitored || !tick(&cancel, Duration::from_secs(5)).await {
+        let period = match (monitored, failures) {
+            (true, _) => Duration::from_secs(5),
+            (false, 0) => break,
+            (false, failures) => crate::delivery::backoff(
+                failures,
+                Duration::from_millis(200),
+                Duration::from_secs(5),
+            ),
+        };
+        if !tick(&cancel, period).await {
             break;
         }
     }

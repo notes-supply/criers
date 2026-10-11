@@ -1555,3 +1555,115 @@ async fn equal_priority_fanout_recovers_each_destination_it_reached() {
         .await;
     assert_eq!((repeats, recoveries.as_str()), (2, "ops,quiet"));
 }
+
+async fn read_only(store: &Store, enabled: bool) {
+    store
+        .with_connection(move |connection| {
+            connection.pragma_update(None, "query_only", enabled)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn disabled_heartbeat_reconciliation_retries_until_it_succeeds() {
+    let harness = Harness::live(
+        DEAD_DISCORD,
+        "[sources.example.heartbeat]\nstale_after = \"1m\"\n",
+    )
+    .await;
+    harness.ingest(heartbeat("Watchdog")).await;
+    let now = crate::now_ms();
+    harness
+        .store
+        .coverage_tick(Arc::clone(&harness.config), now, now - 1000)
+        .await
+        .unwrap();
+    let (_directory, config, store) = reopen_with(harness, |text| {
+        text.replace("[sources.example.heartbeat]\nstale_after = \"1m\"\n", "")
+    })
+    .await;
+    // The startup reconciliation's write fails transiently.
+    read_only(&store, true).await;
+    let task = tokio::spawn(crate::tasks::coverage(
+        store.clone(),
+        Arc::clone(&config),
+        Arc::new(tokio::sync::Notify::new()),
+        crate::now_ms(),
+        tokio_util::sync::CancellationToken::new(),
+    ));
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let retired_while_failing = task.is_finished();
+    read_only(&store, false).await;
+    let finished = tokio::time::timeout(std::time::Duration::from_secs(10), task)
+        .await
+        .is_ok();
+    let permit = Arc::new(tokio::sync::Semaphore::new(1))
+        .try_acquire_owned()
+        .unwrap();
+    let snapshot = store.snapshot("example".into(), permit).await.unwrap();
+    assert_eq!(
+        (
+            retired_while_failing,
+            finished,
+            snapshot.coverage.as_str(),
+            snapshot.last_heartbeat_at
+        ),
+        (false, true, "unknown", None)
+    );
+}
+
+#[tokio::test]
+async fn reconciled_heartbeat_removes_the_exported_heartbeat_age() {
+    let harness = Harness::live(
+        DEAD_DISCORD,
+        "[sources.example.heartbeat]\nstale_after = \"1m\"\n",
+    )
+    .await;
+    harness.ingest(heartbeat("Watchdog")).await;
+    let (_directory, config, store) = reopen_with(harness, |text| {
+        text.replace("[sources.example.heartbeat]\nstale_after = \"1m\"\n", "")
+    })
+    .await;
+    let metrics = Arc::new(crate::metrics::Metrics::new());
+    // One real probe-and-publish pass of the storage observer.
+    let observe_once = || {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        crate::tasks::observe(
+            store.clone(),
+            Arc::clone(&config),
+            Arc::clone(&metrics),
+            60_000,
+            cancel,
+        )
+    };
+    let series = r#"criers_source_heartbeat_age_seconds{source="example"}"#;
+    let exported = |metrics: &crate::metrics::Metrics| {
+        metrics
+            .render()
+            .unwrap()
+            .lines()
+            .any(|line| line.starts_with(series))
+    };
+    // Observation can run before startup reconciliation and export the old age.
+    observe_once().await;
+    let before = exported(&metrics);
+    crate::tasks::coverage(
+        store.clone(),
+        Arc::clone(&config),
+        Arc::new(tokio::sync::Notify::new()),
+        crate::now_ms(),
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await;
+    observe_once().await;
+    let after = exported(&metrics);
+    let coverage_unknown = metrics
+        .render()
+        .unwrap()
+        .lines()
+        .any(|line| line == r#"criers_source_coverage{source="example",state="unknown"} 1"#);
+    assert_eq!((before, after, coverage_unknown), (true, false, true));
+}
