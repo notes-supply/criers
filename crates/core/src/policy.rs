@@ -161,16 +161,70 @@ impl Policy {
     }
 
     /// Canonical text form used to fingerprint the policy for decision provenance.
+    ///
+    /// Severity names may contain any printable character, so each one is
+    /// length-prefixed; no name can be mistaken for another field or entry.
+    /// Entries follow the severity map's sorted order.
     pub fn canonical(&self) -> String {
-        let mut text = format!("unknown={};", self.unknown.as_str());
+        use std::fmt::Write;
+        let mut text = format!("v2;unknown={};", self.unknown.as_str());
         for (severity, action) in &self.severities {
-            let floor = if self.floors.contains(severity) {
-                "!"
-            } else {
-                ""
-            };
-            text.push_str(&format!("{severity}{floor}={};", action.as_str()));
+            let floor = u8::from(self.floors.contains(severity));
+            // Writing to a String cannot fail.
+            let _ = write!(
+                text,
+                "{}:{severity}={};floor={floor};",
+                severity.len(),
+                action.as_str()
+            );
         }
         text
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonical_form_distinguishes_a_floor_from_a_severity_ending_in_its_marker() {
+        let floor = Policy::new(
+            BTreeMap::from([("critical".to_owned(), Action::Ping)]),
+            Action::Ping,
+            BTreeSet::from(["critical".to_owned()]),
+        )
+        .unwrap();
+        let lookalike = Policy::new(
+            BTreeMap::from([("critical!".to_owned(), Action::Ping)]),
+            Action::Ping,
+            BTreeSet::new(),
+        )
+        .unwrap();
+        assert_ne!(floor.canonical(), lookalike.canonical());
+    }
+
+    #[test]
+    fn canonical_form_distinguishes_delimiters_inside_severity_names() {
+        let joined = Policy::new(
+            BTreeMap::from([("a=ping;b".to_owned(), Action::Record)]),
+            Action::Ping,
+            BTreeSet::new(),
+        )
+        .unwrap();
+        let split = Policy::new(
+            BTreeMap::from([
+                ("a".to_owned(), Action::Ping),
+                ("b".to_owned(), Action::Record),
+            ]),
+            Action::Ping,
+            BTreeSet::new(),
+        )
+        .unwrap();
+        assert_ne!(joined.canonical(), split.canonical());
+    }
+
+    #[test]
+    fn canonical_form_is_stable_for_equal_policies() {
+        assert_eq!(Policy::default().canonical(), Policy::default().canonical());
     }
 }
