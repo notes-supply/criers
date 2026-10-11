@@ -498,6 +498,10 @@ async fn a_second_process_through_a_symlinked_database_path_is_refused() {
             &format!("127.0.0.1:{}", free_port()),
         )
         .replace("path = \"data/criers.sqlite\"", "path = \"alias.sqlite\"");
+    assert!(
+        text.contains("path = \"alias.sqlite\"") && !text.contains("path = \"data/criers.sqlite\""),
+        "second config must name the database symlink"
+    );
     std::fs::write(&second_config, text).unwrap();
     let mut second = Command::new(binary())
         .args(["serve", "--config"])
