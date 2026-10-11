@@ -172,8 +172,7 @@ async fn serve(path: &Path) -> Result<()> {
         .await
         .with_context(|| format!("cannot bind server.ops_listen {}", config.server.ops_listen))?;
 
-    // Finish every fallible preparation before any background worker can write,
-    // so a startup failure leaves storage exactly as it was.
+    // Finish fallible preparation before background workers can start writing.
     let mut delivery_workers = Vec::new();
     if config.mode == config::Mode::Live {
         let abandoned = store
