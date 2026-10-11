@@ -243,6 +243,7 @@ async fn recovery_cannot_overtake_an_unresolved_ambiguous_send() {
         .complete_deliveries(
             "ops".into(),
             batch.ids,
+            batch.mention,
             Completion::Retry {
                 retry_at: crate::now_ms(),
                 status: Some(504),

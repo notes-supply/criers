@@ -57,7 +57,8 @@ mention_users = []
 mention_roles = []
 mention_cooldown = "1m"
 
-# Optional shadow assessment with Cloudflare Clef. It never changes notifications.
+# Optional, opt-in assessment with Cloudflare Clef in either delivery mode. It sends
+# the allowlisted fields below to Cloudflare; results never change notifications.
 # [assessment]
 # account_id = "0123456789abcdef0123456789abcdef"
 # api_token_file = "../secrets/cloudflare-ai-token"

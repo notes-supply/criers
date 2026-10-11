@@ -176,3 +176,27 @@ fn kubernetes_placeholder_secret_is_rejected() {
     std::fs::write(&path, "replace with 32 to 256 random printable characters").unwrap();
     assert!(crate::credentials::read_token(&path).is_err());
 }
+
+#[test]
+fn live_delivery_with_assessment_is_allowed_with_an_explicit_warning() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join("clef.token"),
+        "synthetic-clef-token-not-live",
+    )
+    .unwrap();
+    let body = format!(
+        "mode = \"live\"\n{MINIMAL}\n[assessment]\naccount_id = \"0123456789abcdef0123456789abcdef\"\n\
+         api_token_file = \"clef.token\"\n"
+    );
+    let config = Config::load(&write(directory.path(), &body)).unwrap();
+    assert!(
+        config.assessment.is_some()
+            && config
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("sent to Cloudflare")),
+        "{:?}",
+        config.warnings
+    );
+}

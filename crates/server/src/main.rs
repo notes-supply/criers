@@ -1,7 +1,6 @@
 //! Criers: durable Alertmanager receiver, notification policy and Discord outbox.
 
 use std::{
-    collections::BTreeMap,
     path::{Path, PathBuf},
     process::ExitCode,
     sync::{Arc, atomic::AtomicBool},
@@ -27,7 +26,7 @@ mod tasks;
 #[cfg(test)]
 mod tests;
 
-use crate::{config::Config, credentials::CredentialSet, metrics::Metrics, store::Store};
+use crate::{config::Config, credentials::Credentials, metrics::Metrics, store::Store};
 
 #[derive(Parser)]
 #[command(
@@ -136,17 +135,13 @@ async fn serve(path: &Path) -> Result<()> {
     for warning in &config.warnings {
         tracing::warn!(%warning, "configuration warning");
     }
-    let credentials: BTreeMap<String, CredentialSet> = config
-        .sources
-        .iter()
-        .map(|(id, source)| {
-            CredentialSet::load(source.credential_files.clone())
-                .map(|set| (id.clone(), set))
-                .map_err(|(path, error)| {
-                    anyhow::anyhow!("sources.{id} credential {}: {error}", path.display())
-                })
-        })
-        .collect::<Result<_>>()?;
+    let credentials = Credentials::load(
+        config
+            .sources
+            .iter()
+            .map(|(id, source)| (id.clone(), source.credential_files.clone())),
+    )
+    .map_err(|(path, error)| anyhow::anyhow!("credential {}: {error}", path.display()))?;
     let credentials = Arc::new(credentials);
     let store = Store::open(config.storage.path.clone(), config.storage.max_bytes)
         .await

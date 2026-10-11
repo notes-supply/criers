@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeMap,
     path::PathBuf,
     sync::{Arc, atomic::AtomicBool},
 };
@@ -16,7 +15,7 @@ use tower::ServiceExt;
 
 use crate::{
     config::Config,
-    credentials::CredentialSet,
+    credentials::Credentials,
     http::{self, AppState},
     metrics::Metrics,
     store::Store,
@@ -105,16 +104,13 @@ webhook_url_file = "ops.url"
         let store = Store::open(path.clone(), config.storage.max_bytes)
             .await
             .unwrap();
-        let credentials: BTreeMap<String, CredentialSet> = config
-            .sources
-            .iter()
-            .map(|(id, source)| {
-                (
-                    id.clone(),
-                    CredentialSet::load(source.credential_files.clone()).unwrap(),
-                )
-            })
-            .collect();
+        let credentials = Credentials::load(
+            config
+                .sources
+                .iter()
+                .map(|(id, source)| (id.clone(), source.credential_files.clone())),
+        )
+        .unwrap();
         let state = AppState {
             config: Arc::clone(&config),
             credentials: Arc::new(credentials),
@@ -744,5 +740,19 @@ async fn cancelled_status_read_keeps_its_admission_slot_until_the_read_settles()
             StatusCode::UNPROCESSABLE_ENTITY,
             StatusCode::OK
         )
+    );
+}
+
+#[tokio::test]
+async fn first_record_only_observation_is_a_durable_decision_and_repeats_are_compacted() {
+    let harness = Harness::shadow("").await;
+    let info = with(fixture(), "/alerts/0/labels/severity", json!("info"));
+    let first = harness.ingest(info.clone()).await;
+    harness.ingest(info).await;
+    let decisions: i64 = harness.query("SELECT count(*) FROM decisions").await;
+    let reason: String = harness.query("SELECT reason FROM decisions").await;
+    assert_eq!(
+        (first.decisions[0].reason, decisions, reason.as_str()),
+        ("configured_severity", 1, "configured_severity")
     );
 }

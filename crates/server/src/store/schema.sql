@@ -75,7 +75,9 @@ CREATE TABLE outbox (
     completed_at INTEGER,
     CHECK ((mode = 'shadow') = (state = 'shadow'))
 ) STRICT;
-CREATE UNIQUE INDEX outbox_intent ON outbox(occurrence_id, kind, action)
+-- One intent per occurrence, kind, action and destination: a recovery goes to
+-- each destination that was notified.
+CREATE UNIQUE INDEX outbox_intent ON outbox(occurrence_id, kind, action, destination)
     WHERE occurrence_id IS NOT NULL;
 CREATE INDEX outbox_open ON outbox(destination, due_at, id)
     WHERE state IN ('pending', 'in_flight');

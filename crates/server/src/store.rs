@@ -133,9 +133,27 @@ pub(crate) struct Batch {
     pub ids: Vec<i64>,
     pub lines: Vec<String>,
     pub ping: bool,
-    pub mention_allowed: bool,
+    /// Set when this batch may mention recipients; the cooldown is already consumed.
+    pub mention: Option<MentionClaim>,
     pub possibly_duplicate: bool,
     pub max_failures: u32,
+}
+
+impl Batch {
+    pub(crate) fn mention_allowed(&self) -> bool {
+        self.mention.is_some()
+    }
+}
+
+/// A mention cooldown consumed when the batch was claimed.
+///
+/// The claim records the mention before sending, so an ambiguous attempt or a
+/// crash mid-send still holds back further pings. A definite non-delivery hands
+/// the cooldown back by restoring `previous`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MentionClaim {
+    pub at: i64,
+    pub previous: i64,
 }
 
 #[derive(Debug)]
@@ -159,7 +177,6 @@ pub(crate) enum Completion {
     Sent {
         remote_id: Option<String>,
         status: u16,
-        mentioned: bool,
     },
     RateLimited {
         retry_at: i64,
@@ -391,6 +408,7 @@ impl Store {
         &self,
         destination: String,
         ids: Vec<i64>,
+        mention: Option<MentionClaim>,
         completion: Completion,
         max_attempts: u32,
     ) -> Result<(), StoreError> {
@@ -401,6 +419,7 @@ impl Store {
                 &transaction,
                 &destination,
                 &ids,
+                mention,
                 &completion,
                 max_attempts,
                 now,
@@ -554,6 +573,18 @@ impl Store {
     ) -> Result<Retention, StoreError> {
         self.write(move |connection| {
             let transaction = connection.transaction()?;
+            // A pending assessment of a long-closed occurrence would only be skipped by
+            // the worker; closing it here keeps a disabled worker from pinning the
+            // occurrence forever. Its new completion time restarts the window.
+            transaction.execute(
+                "UPDATE assessments SET state = 'done', outcome = 'skipped_closed',
+                    completed_at = ?3
+                 WHERE id IN (SELECT a.id FROM assessments a
+                    JOIN occurrences o ON o.id = a.occurrence_id
+                    WHERE a.state IN ('pending', 'in_flight') AND a.state = 'pending'
+                    AND o.closed_at < ?1 LIMIT ?2)",
+                params![cutoff, batch, crate::now_ms()],
+            )?;
             // Decisions go first so deleting their events cascades to nothing,
             // keeping every statement within `batch` rows.
             let decisions = transaction.execute(
@@ -571,11 +602,16 @@ impl Store {
                              ORDER BY e.received_at LIMIT ?2)",
                     params![cutoff, batch],
                 )?,
+                // Deleting an occurrence cascades to its children, so every child must
+                // itself be finished and older than the cutoff.
                 occurrences: transaction.execute(
                     "DELETE FROM occurrences WHERE id IN
-                        (SELECT o.id FROM occurrences o WHERE o.closed_at < ?1
+                        (SELECT o.id FROM occurrences o
+                         WHERE o.closed_at < ?1 AND o.last_seen_at < ?1
                          AND NOT EXISTS (SELECT 1 FROM outbox b WHERE b.occurrence_id = o.id
-                            AND b.state IN ('pending', 'in_flight'))
+                            AND (b.state IN ('pending', 'in_flight') OR b.completed_at >= ?1))
+                         AND NOT EXISTS (SELECT 1 FROM assessments a WHERE a.occurrence_id = o.id
+                            AND (a.state != 'done' OR a.completed_at >= ?1))
                          ORDER BY o.closed_at LIMIT ?2)",
                     params![cutoff, batch],
                 )?,
@@ -840,25 +876,27 @@ fn process_alert(
     } = *context;
     let observed = upsert_occurrence(transaction, context, alert)?;
     let id = observed.id;
-    let recovery_destination: Option<String> = if alert.status == Status::Resolved
+    // Every destination that was, or may have been, told about the occurrence gets
+    // its own recovery; destinations whose sends never happened get none.
+    let recovery_destinations: Vec<String> = if alert.status == Status::Resolved
         && matches!(observed.prior, Prior::New | Prior::Firing(_))
     {
         transaction
             .prepare_cached(
-                "SELECT destination FROM outbox WHERE occurrence_id = ?1 AND mode = 'live'
-                 AND kind = 'notify'
+                "SELECT DISTINCT destination FROM outbox WHERE occurrence_id = ?1
+                 AND mode = 'live' AND kind = 'notify'
                  AND (state IN ('sent', 'ambiguous', 'in_flight') OR possibly_delivered = 1)
-                 ORDER BY id DESC LIMIT 1",
+                 ORDER BY destination",
             )?
-            .query_row([id], |row| row.get(0))
-            .optional()?
+            .query_map([id], |row| row.get(0))?
+            .collect::<Result<_, _>>()?
     } else {
-        None
+        Vec::new()
     };
-    let notified = if recovery_destination.is_some() {
-        Notified::Possibly
-    } else {
+    let notified = if recovery_destinations.is_empty() {
         Notified::No
+    } else {
+        Notified::Possibly
     };
     let proposal = config
         .policy
@@ -902,28 +940,36 @@ fn process_alert(
         severity: alert.severity(),
         summary: &observed.summary,
     };
-    let intent = match transition.intent {
+    let intent_id = match transition.intent {
         None => None,
-        Some(Intent::Notify(action)) => Some(NewIntent {
-            occurrence: Some(id),
-            source: source_id,
-            destination,
-            kind: "notify",
-            action,
-            content: render::firing(&subject),
-        }),
-        Some(Intent::Recovery) => Some(NewIntent {
-            occurrence: Some(id),
-            source: source_id,
-            destination: recovery_destination.as_deref().unwrap_or(destination),
-            kind: "recovery",
-            action: Action::QuietPost,
-            content: render::resolved(&subject),
-        }),
-    };
-    let intent_id = match intent {
-        Some(intent) => insert_intent(transaction, config.mode, &intent, now)?,
-        None => None,
+        Some(Intent::Notify(action)) => {
+            let intent = NewIntent {
+                occurrence: Some(id),
+                source: source_id,
+                destination,
+                kind: "notify",
+                action,
+                content: render::firing(&subject),
+            };
+            insert_intent(transaction, config.mode, &intent, now)?
+        }
+        Some(Intent::Recovery) => {
+            let content = render::resolved(&subject);
+            let mut first = None;
+            for recovery_destination in &recovery_destinations {
+                let intent = NewIntent {
+                    occurrence: Some(id),
+                    source: source_id,
+                    destination: recovery_destination,
+                    kind: "recovery",
+                    action: Action::QuietPost,
+                    content: content.clone(),
+                };
+                let inserted = insert_intent(transaction, config.mode, &intent, now)?;
+                first = first.or(inserted);
+            }
+            first
+        }
     };
     if !matches!(
         transition.reason,
@@ -1178,6 +1224,19 @@ fn insert_intent(
     Ok((inserted > 0).then(|| transaction.last_insert_rowid()))
 }
 
+/// SQL condition on outbox row `b`: no earlier intent in the same lifecycle is still
+/// pending or in flight. Occurrence intents follow their occurrence; coverage
+/// intents, which have no occurrence, follow their source.
+macro_rules! no_open_predecessor {
+    () => {
+        "AND NOT EXISTS (SELECT 1 FROM outbox e WHERE e.occurrence_id = b.occurrence_id
+            AND e.id < b.id AND e.state IN ('pending', 'in_flight'))
+         AND NOT (b.kind = 'coverage' AND EXISTS (SELECT 1 FROM outbox e
+            WHERE e.kind = 'coverage' AND e.source = b.source
+            AND e.id < b.id AND e.state IN ('pending', 'in_flight')))"
+    };
+}
+
 fn claim_transaction(
     transaction: &Transaction<'_>,
     destination: &str,
@@ -1204,19 +1263,18 @@ fn claim_transaction(
         possibly_delivered: bool,
         occurrence: Option<i64>,
     }
-    // An occurrence's intents are delivered in creation order: a row waits while an
-    // earlier row of the same occurrence is pending or in flight.
+    // Intents are delivered in creation order within their lifecycle; see
+    // `no_open_predecessor!`.
     let candidates = transaction
-        .prepare_cached(
+        .prepare_cached(concat!(
             "SELECT b.id, b.kind, b.action, b.content, b.attempts - b.throttled,
-                b.possibly_delivered, b.occurrence_id
-             FROM outbox b
-             WHERE b.destination = ?1 AND b.state IN ('pending', 'in_flight')
-             AND b.state = 'pending' AND b.due_at <= ?2
-             AND NOT EXISTS (SELECT 1 FROM outbox e WHERE e.occurrence_id = b.occurrence_id
-                AND e.id < b.id AND e.state IN ('pending', 'in_flight'))
-             ORDER BY b.due_at, b.id LIMIT ?3",
-        )?
+                    b.possibly_delivered, b.occurrence_id
+                 FROM outbox b
+                 WHERE b.destination = ?1 AND b.state IN ('pending', 'in_flight')
+                 AND b.state = 'pending' AND b.due_at <= ?2 ",
+            no_open_predecessor!(),
+            " ORDER BY b.due_at, b.id LIMIT ?3"
+        ))?
         .query_map(params![destination, now, limits.max_rows], |row| {
             Ok(Candidate {
                 id: row.get(0)?,
@@ -1233,7 +1291,7 @@ fn claim_transaction(
         ids: Vec::with_capacity(candidates.len()),
         lines: Vec::with_capacity(candidates.len()),
         ping: false,
-        mention_allowed: false,
+        mention: None,
         possibly_duplicate: false,
         max_failures: 0,
     };
@@ -1243,9 +1301,10 @@ fn claim_transaction(
             let delivered: bool = transaction
                 .prepare_cached(
                     "SELECT EXISTS(SELECT 1 FROM outbox WHERE occurrence_id = ?1 AND mode = 'live'
-                     AND kind = 'notify' AND (state IN ('sent', 'ambiguous') OR possibly_delivered = 1))",
+                     AND kind = 'notify' AND destination = ?2
+                     AND (state IN ('sent', 'ambiguous') OR possibly_delivered = 1))",
                 )?
-                .query_row([candidate.occurrence], |row| row.get(0))?;
+                .query_row(params![candidate.occurrence, destination], |row| row.get(0))?;
             if !delivered {
                 transaction.execute(
                     "UPDATE outbox SET state = 'superseded', completed_at = ?2,
@@ -1270,13 +1329,12 @@ fn claim_transaction(
         // Rows waiting behind an earlier send of their occurrence are not claimable,
         // so they must not set the next wake-up either.
         let next: Option<i64> = transaction
-            .prepare_cached(
+            .prepare_cached(concat!(
                 "SELECT min(b.due_at) FROM outbox b
-                 WHERE b.destination = ?1 AND b.state IN ('pending', 'in_flight')
-                 AND b.state = 'pending'
-                 AND NOT EXISTS (SELECT 1 FROM outbox e WHERE e.occurrence_id = b.occurrence_id
-                    AND e.id < b.id AND e.state IN ('pending', 'in_flight'))",
-            )?
+                     WHERE b.destination = ?1 AND b.state IN ('pending', 'in_flight')
+                     AND b.state = 'pending' ",
+                no_open_predecessor!()
+            ))?
             .query_row([destination], |row| row.get(0))?;
         return Ok(Claim::Wait(next));
     }
@@ -1285,7 +1343,17 @@ fn claim_transaction(
          WHERE id IN (SELECT value FROM json_each(?1))",
         [serde_json::to_string(&batch.ids)?],
     )?;
-    batch.mention_allowed = batch.ping && now - last_mention >= limits.mention_cooldown_ms;
+    if batch.ping && now - last_mention >= limits.mention_cooldown_ms {
+        transaction.execute(
+            "INSERT INTO destination_state(destination, last_mention_at) VALUES (?1, ?2)
+             ON CONFLICT(destination) DO UPDATE SET last_mention_at = excluded.last_mention_at",
+            params![destination, now],
+        )?;
+        batch.mention = Some(MentionClaim {
+            at: now,
+            previous: last_mention,
+        });
+    }
     Ok(Claim::Batch(batch))
 }
 
@@ -1293,10 +1361,31 @@ fn complete_transaction(
     transaction: &Transaction<'_>,
     destination: &str,
     ids: &[i64],
+    mention: Option<MentionClaim>,
     completion: &Completion,
     max_attempts: u32,
     now: i64,
 ) -> Result<(), StoreError> {
+    // Nothing reached the recipients, so the provisional mention is handed back
+    // unless a later claim has already replaced it.
+    let definitely_undelivered = matches!(
+        completion,
+        Completion::RateLimited { .. }
+            | Completion::Permanent { .. }
+            | Completion::Retry {
+                ambiguous: false,
+                ..
+            }
+    );
+    if let Some(claim) = mention
+        && definitely_undelivered
+    {
+        transaction.execute(
+            "UPDATE destination_state SET last_mention_at = ?3
+             WHERE destination = ?1 AND last_mention_at = ?2",
+            params![destination, claim.at, claim.previous],
+        )?;
+    }
     let ids = serde_json::to_string(ids)?;
     let set_destination = |column: &str, value: i64| {
         transaction.execute(
@@ -1308,20 +1397,13 @@ fn complete_transaction(
         )
     };
     match completion {
-        Completion::Sent {
-            remote_id,
-            status,
-            mentioned,
-        } => {
+        Completion::Sent { remote_id, status } => {
             transaction.execute(
                 "UPDATE outbox SET state = 'sent', remote_id = ?2, last_status = ?3,
                     last_error = NULL, completed_at = ?4
                  WHERE id IN (SELECT value FROM json_each(?1)) AND state = 'in_flight'",
                 params![ids, remote_id, status, now],
             )?;
-            if *mentioned {
-                set_destination("last_mention_at", now)?;
-            }
         }
         Completion::RateLimited { retry_at, status } => {
             // Throttling is bounded separately so a persistent 429 cannot retry forever.

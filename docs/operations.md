@@ -109,23 +109,37 @@ the firing alerts in Alertmanager when you switch.
   retries run out it ends as `ambiguous`, not `failed`. Expect occasional
   duplicate messages; Criers prefers a duplicate to a silent loss.
 - **Ordering.** Messages for one occurrence go out in order. A recovery waits
-  until every earlier send for that occurrence has finished.
+  until every earlier send for that occurrence has finished. Coverage messages
+  for one source go out in order too, so a recovery never overtakes a delayed
+  stale notice.
 - **Recovery.** A resolution produces a recovery message only if a firing
-  message was delivered or may have been. If the alert resolves before its first
-  send was attempted, the pending send is cancelled and nothing is posted; the
-  decision history keeps `resolution_without_notification`.
+  message was delivered or may have been, and it goes to each destination that
+  received one (for example the quiet post's channel and, after an escalation
+  through another receiver, the ping's channel). If the alert resolves before
+  its first send was attempted, the pending send is cancelled and nothing is
+  posted; the decision history keeps `resolution_without_notification`.
 - **Storms.** Due rows for a destination are batched into one message (up to
   `delivery.batch_max` lines within Discord's 2000-character limit). A batch
   mentions recipients at most once, and within `mention_cooldown` of the last
   mention a ping is posted with a "mention coalesced" note instead. Every alert
-  is still posted.
+  is still posted. The cooldown starts when a mention is attempted: an ambiguous
+  attempt or a crash mid-send counts as a possible mention, while a definite
+  non-delivery (connection refused, 429, 503 or another rejected request) hands
+  the cooldown back.
 
 ## Assessment
 
-`[assessment]` enables Cloudflare Clef or Clef-flash through the Workers AI
-REST endpoint. It runs only in shadow mode: results are recorded, notifications
-never change, and provider failure never delays routing because assessment
-starts after the webhook commit.
+`[assessment]` is an explicit opt-in for Cloudflare Clef or Clef-flash through
+the Workers AI REST endpoint. Its own `mode = "shadow"`, the only supported
+value, means results are recorded and never change actions, intents or
+recipients. That is separate from the top-level delivery `mode`: assessment
+behaves the same whether deliveries are shadow or live. In a live deployment it
+therefore sends the allowlisted fields of production alerts to Cloudflare and
+uses provider quota; `check` and startup print a warning for that combination.
+Leave the section out to keep alert data local. Provider failure never delays
+routing, because assessment starts after the webhook commit and critical-floor
+alerts are never sent. Learned thresholds that could act on results are not
+implemented.
 
 Only the labels and annotations listed in the configuration are sent, each
 truncated to `max_value_chars`. Results store the impact probability, urgency
@@ -146,7 +160,9 @@ Sources may not share a token. Criers rereads the files every
 3. Replace the old file's content with the new token, or remove it and roll out.
 
 If a file becomes unreadable or invalid, Criers keeps that file's last valid
-token and increments `criers_credential_reload_failures_total`. Configuration
+token and increments `criers_credential_reload_failures_total`. All sources are
+reloaded together: an update that would make one token valid for two sources,
+including a source still holding its last valid token, is rejected the same way. Configuration
 changes otherwise need an ordinary restart.
 
 ## Storage and retention
@@ -159,10 +175,14 @@ Retention runs every `retention_interval`. Each transaction deletes at most
 `retention_batch` decisions, webhook records, closed occurrences, finished
 deliveries and finished assessments; deleting a closed occurrence also removes
 its own few remaining child rows. It removes webhook metadata and decisions
-older than `retention`, resolved or superseded occurrences closed before then,
-and finished deliveries and assessments. It keeps unresolved occurrences, any
-occurrence with a pending or in-flight delivery, and the delivery records of
-alerts that are still firing, because their recovery depends on them.
+older than `retention`, and finished deliveries and assessments older than that.
+A resolved or superseded occurrence is removed only once it was closed and last
+seen before the cutoff and every delivery and assessment it owns is finished and
+older too, so recent delivery evidence is never cascaded away. It keeps
+unresolved occurrences and the delivery records of alerts that are still firing,
+because their recovery depends on them. A pending assessment of an occurrence
+closed before the cutoff is marked `skipped_closed`, which restarts that
+occurrence's window instead of pinning it forever.
 
 The replay horizon equals `retention`: a webhook replaying a resolved occurrence
 older than that is treated as new. Keep `retention` well above Alertmanager's

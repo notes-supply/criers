@@ -137,7 +137,7 @@ impl Discord {
 
     /// Renders a batch. Mentions are explicit IDs only; `parse` is always empty.
     fn message(&self, batch: &Batch) -> (String, bool) {
-        let mention = batch.ping && batch.mention_allowed && !self.mention_prefix.is_empty();
+        let mention = batch.ping && batch.mention_allowed() && !self.mention_prefix.is_empty();
         let mut content = String::with_capacity(DISCORD_CONTENT_CHARS);
         if mention {
             content.push_str(&self.mention_prefix);
@@ -358,11 +358,7 @@ impl Worker {
         let now = crate::now_ms();
         let settings = &self.settings;
         let completion = match outcome {
-            Outcome::Sent { remote_id, status } => Completion::Sent {
-                remote_id,
-                status,
-                mentioned: mention,
-            },
+            Outcome::Sent { remote_id, status } => Completion::Sent { remote_id, status },
             Outcome::RateLimited {
                 retry_after,
                 status,
@@ -411,6 +407,7 @@ impl Worker {
                 .complete_deliveries(
                     self.destination.clone(),
                     batch.ids.clone(),
+                    batch.mention,
                     completion.clone(),
                     settings.max_attempts,
                 )

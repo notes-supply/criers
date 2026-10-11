@@ -201,3 +201,50 @@ async fn full_assessment_queue_skips_instead_of_growing() {
         .await;
     assert_eq!((skipped, pending), (2, 1));
 }
+
+#[tokio::test]
+async fn assessment_in_live_delivery_never_changes_deterministic_routing() {
+    let clef = MockProvider::start(Vec::new(), answer(0.99)).await;
+    let harness = Harness::live(
+        "http://127.0.0.1:9/api/webhooks/123456789012345678/x",
+        &format!(
+            "[assessment]\naccount_id = \"{ACCOUNT}\"\napi_token_file = \"clef.token\"\n\
+             base_url = \"http://{}/client/v4\"\ntimeout = \"1s\"\nmax_attempts = 1\n",
+            clef.address
+        ),
+    )
+    .await;
+    let mut batch = warning();
+    let info = with(
+        with(fixture(), "/alerts/0/labels/severity", json!("info")),
+        "/alerts/0/fingerprint",
+        json!("fedcba9876543210"),
+    );
+    batch["alerts"]
+        .as_array_mut()
+        .unwrap()
+        .push(info["alerts"][0].clone());
+    harness.ingest(batch).await;
+    let before: String = harness
+        .query("SELECT group_concat(kind || ':' || action || ':' || state) FROM outbox")
+        .await;
+    let cancel = spawn(&harness);
+    let mut assessed = 0;
+    for _ in 0..200 {
+        assessed = harness
+            .query("SELECT count(*) FROM assessments WHERE outcome = 'assessed'")
+            .await;
+        if assessed == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    cancel.cancel();
+    let after: String = harness
+        .query("SELECT group_concat(kind || ':' || action || ':' || state) FROM outbox")
+        .await;
+    assert_eq!(
+        (assessed, before.as_str(), after.as_str()),
+        (2, "notify:quiet_post:pending", "notify:quiet_post:pending")
+    );
+}

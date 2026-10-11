@@ -2,14 +2,14 @@
 //!
 //! Each task performs one bounded transaction per tick and stops on cancellation.
 
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     config::Config,
-    credentials::CredentialSet,
+    credentials::Credentials,
     metrics::{CoverageLabels, DestinationLabels, Metrics, SourceLabels, TableLabels},
     store::{Stats, Store},
 };
@@ -185,19 +185,14 @@ pub(crate) async fn coverage(
 
 /// Polls credential files so rotations apply without rereading secrets per request.
 pub(crate) async fn credentials(
-    credentials: Arc<BTreeMap<String, CredentialSet>>,
+    credentials: Arc<Credentials>,
     metrics: Arc<Metrics>,
     period: Duration,
     cancel: CancellationToken,
 ) {
     while tick(&cancel, period).await {
-        let sets = Arc::clone(&credentials);
-        let reports = tokio::task::spawn_blocking(move || {
-            sets.iter()
-                .map(|(source, set)| (source.clone(), set.reload()))
-                .collect::<Vec<_>>()
-        })
-        .await;
+        let credentials = Arc::clone(&credentials);
+        let reports = tokio::task::spawn_blocking(move || credentials.reload()).await;
         let Ok(reports) = reports else {
             tracing::error!("credential reload worker failed");
             continue;

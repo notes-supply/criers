@@ -243,6 +243,25 @@ fn probability(value: Option<&Value>, name: &str) -> Result<f64, AssessError> {
         .ok_or_else(|| AssessError::Malformed(format!("{name} must be a probability")))
 }
 
+/// Allowed rounding error when checking that a distribution sums to 1.
+const DISTRIBUTION_TOLERANCE: f64 = 0.01;
+
+/// The documented score answer has one probability per requested level, keyed by
+/// the zero-based level index as a string, and the values sum to 1.
+fn complete_distribution(levels: &serde_json::Map<String, Value>) -> bool {
+    if levels.len() != URGENCY_LEVELS.len() {
+        return false;
+    }
+    let mut total = 0.0;
+    for index in 0..URGENCY_LEVELS.len() {
+        match levels.get(&index.to_string()).and_then(Value::as_f64) {
+            Some(probability) if (0.0..=1.0).contains(&probability) => total += probability,
+            _ => return false,
+        }
+    }
+    (total - 1.0).abs() <= DISTRIBUTION_TOLERANCE
+}
+
 fn parse(bytes: &[u8], latency_ms: i64) -> Result<Answers, AssessError> {
     let malformed = |reason: &str| AssessError::Malformed(reason.to_owned());
     let envelope: Envelope =
@@ -276,13 +295,12 @@ fn parse(bytes: &[u8], latency_ms: i64) -> Result<Answers, AssessError> {
     let probabilities = urgency
         .get("probabilities")
         .and_then(Value::as_object)
-        .filter(|levels| {
-            levels.len() <= URGENCY_LEVELS.len()
-                && levels
-                    .values()
-                    .all(|p| p.as_f64().is_some_and(|p| (0.0..=1.0).contains(&p)))
-        })
-        .ok_or_else(|| malformed("urgency.probabilities must map levels to probabilities"))?;
+        .filter(|levels| complete_distribution(levels))
+        .ok_or_else(|| {
+            malformed(
+                "urgency.probabilities must give every requested level a probability, summing to 1",
+            )
+        })?;
     if output.model.is_empty() || output.model.len() > 128 {
         return Err(malformed("model must be 1 to 128 bytes"));
     }
@@ -417,7 +435,8 @@ mod tests {
     fn documented_answer_shapes_parse_into_separate_probabilities() {
         let bytes = response(json!({
             "impact": {"type": "noul", "noul": 0.82},
-            "urgency": {"type": "score", "score": 2.4, "legend": {"0": "x"},
+            "urgency": {"type": "score", "score": 2.4,
+                "legend": {"0": "a", "1": "b", "2": "c", "3": "d"},
                 "probabilities": {"0": 0.05, "1": 0.1, "2": 0.25, "3": 0.6}, "confidence": 0.7}
         }));
         let answers = parse(&bytes, 12).unwrap();
@@ -429,6 +448,41 @@ mod tests {
             ),
             (0.82, 2.4, Some(90))
         );
+    }
+
+    fn urgency(probabilities: Value) -> Vec<u8> {
+        response(json!({
+            "impact": {"type": "noul", "noul": 0.5},
+            "urgency": {"type": "score", "score": 1.0,
+                "legend": {"0": "a", "1": "b", "2": "c", "3": "d"},
+                "probabilities": probabilities, "confidence": 0.5}
+        }))
+    }
+
+    #[test]
+    fn empty_urgency_distribution_is_malformed() {
+        assert!(matches!(
+            parse(&urgency(json!({})), 1),
+            Err(AssessError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn partial_urgency_distribution_is_malformed() {
+        let bytes = urgency(json!({"0": 0.5, "3": 0.5}));
+        assert!(matches!(parse(&bytes, 1), Err(AssessError::Malformed(_))));
+    }
+
+    #[test]
+    fn urgency_distribution_with_unknown_levels_is_malformed() {
+        let bytes = urgency(json!({"a": 0.25, "b": 0.25, "c": 0.25, "d": 0.25}));
+        assert!(matches!(parse(&bytes, 1), Err(AssessError::Malformed(_))));
+    }
+
+    #[test]
+    fn urgency_distribution_that_does_not_sum_to_one_is_malformed() {
+        let bytes = urgency(json!({"0": 0.1, "1": 0.1, "2": 0.1, "3": 0.1}));
+        assert!(matches!(parse(&bytes, 1), Err(AssessError::Malformed(_))));
     }
 
     #[test]

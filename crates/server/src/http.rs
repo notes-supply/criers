@@ -1,7 +1,6 @@
 //! Authenticated per-source ingestion and a separate unauthenticated ops listener.
 
 use std::{
-    collections::BTreeMap,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -25,7 +24,7 @@ use tower_http::{timeout::TimeoutLayer, trace::TraceLayer};
 
 use crate::{
     config::Config,
-    credentials::CredentialSet,
+    credentials::Credentials,
     metrics::{DecisionLabels, Metrics, SourceLabels, SourceOutcome, SourceStatus},
     store::{Receipt, Snapshot, Store, StoreError},
 };
@@ -34,7 +33,7 @@ use crate::{
 #[derive(Clone)]
 pub(crate) struct AppState {
     pub config: Arc<Config>,
-    pub credentials: Arc<BTreeMap<String, CredentialSet>>,
+    pub credentials: Arc<Credentials>,
     pub store: Store,
     pub admission: Arc<Admission>,
     pub metrics: Arc<Metrics>,
@@ -172,16 +171,13 @@ async fn authorize(
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "));
-    let credentials = state.credentials.get(&source);
     // Unknown sources and wrong tokens are indistinguishable to the caller.
-    let authenticated = match (credentials, presented) {
-        (Some(set), Some(token)) => set.verify(token.as_bytes()),
-        _ => false,
-    };
+    let authenticated =
+        presented.is_some_and(|token| state.credentials.verify(&source, token.as_bytes()));
     if authenticated {
         return next.run(request).await;
     }
-    let label = if credentials.is_some() {
+    let label = if state.credentials.knows(&source) {
         source
     } else {
         "unknown".to_owned()

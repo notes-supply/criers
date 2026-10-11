@@ -341,9 +341,17 @@ const LIMITS: ClaimLimits = ClaimLimits {
 };
 
 async fn claim_and_complete(harness: &Harness, completion: super::Completion) {
+    claim_and_complete_at(harness, "ops", completion).await;
+}
+
+async fn claim_and_complete_at(
+    harness: &Harness,
+    destination: &str,
+    completion: super::Completion,
+) {
     let Claim::Batch(batch) = harness
         .store
-        .claim_deliveries("ops".into(), crate::now_ms(), LIMITS)
+        .claim_deliveries(destination.into(), crate::now_ms(), LIMITS)
         .await
         .unwrap()
     else {
@@ -351,7 +359,7 @@ async fn claim_and_complete(harness: &Harness, completion: super::Completion) {
     };
     harness
         .store
-        .complete_deliveries("ops".into(), batch.ids, completion, 3)
+        .complete_deliveries(destination.into(), batch.ids, batch.mention, completion, 3)
         .await
         .unwrap();
 }
@@ -418,7 +426,6 @@ async fn retention_keeps_the_delivery_record_of_a_still_firing_alert() {
         super::Completion::Sent {
             remote_id: Some("1".into()),
             status: 200,
-            mentioned: true,
         },
     )
     .await;
@@ -452,4 +459,267 @@ async fn open_deliveries_for_removed_destinations_are_ended() {
         .unwrap();
     let state: String = harness.query("SELECT state FROM outbox").await;
     assert_eq!((abandoned, state.as_str()), (1, "failed"));
+}
+
+fn sent() -> super::Completion {
+    super::Completion::Sent {
+        remote_id: Some("1".into()),
+        status: 200,
+    }
+}
+
+#[tokio::test]
+async fn recovery_reaches_every_destination_that_was_notified() {
+    let harness = Harness::live(DEAD_DISCORD, "").await;
+    let warning = with(fixture(), "/alerts/0/labels/severity", json!("warning"));
+    harness
+        .ingest(with(warning, "/receiver", json!("quiet")))
+        .await;
+    claim_and_complete_at(&harness, "quiet", sent()).await;
+    harness.ingest(fixture()).await;
+    claim_and_complete_at(&harness, "ops", sent()).await;
+    harness
+        .ingest(with(fixture(), "/alerts/0/status", json!("resolved")))
+        .await;
+    let destinations: String = harness
+        .query(
+            "SELECT group_concat(destination) FROM (SELECT destination FROM outbox
+             WHERE kind = 'recovery' ORDER BY destination)",
+        )
+        .await;
+    assert_eq!(destinations, "ops,quiet");
+}
+
+#[tokio::test]
+async fn retention_keeps_an_old_occurrence_whose_delivery_completed_recently() {
+    let harness = Harness::live(DEAD_DISCORD, "").await;
+    harness.ingest(fixture()).await;
+    claim_and_complete(&harness, sent()).await;
+    harness
+        .ingest(with(fixture(), "/alerts/0/status", json!("resolved")))
+        .await;
+    claim_and_complete(&harness, sent()).await;
+    let old = crate::now_ms() - 2 * HOUR;
+    harness
+        .store
+        .with_connection(move |connection| {
+            connection.execute(
+                "UPDATE occurrences SET closed_at = ?1, last_seen_at = ?1",
+                [old],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let deleted = harness
+        .store
+        .retention_step(crate::now_ms() - HOUR, 1000)
+        .await
+        .unwrap();
+    let deliveries: i64 = harness.query("SELECT count(*) FROM outbox").await;
+    assert_eq!((deleted.occurrences, deliveries), (0, 2));
+}
+
+#[tokio::test]
+async fn retention_keeps_an_old_occurrence_with_a_pending_assessment() {
+    let harness = Harness::shadow(
+        "[assessment]\naccount_id = \"0123456789abcdef0123456789abcdef\"\n\
+         api_token_file = \"clef.token\"\nbase_url = \"http://127.0.0.1:9/client/v4\"\n",
+    )
+    .await;
+    let warning = with(fixture(), "/alerts/0/labels/severity", json!("warning"));
+    harness.ingest(warning.clone()).await;
+    harness
+        .ingest(with(warning, "/alerts/0/status", json!("resolved")))
+        .await;
+    let old = crate::now_ms() - 2 * HOUR;
+    harness
+        .store
+        .with_connection(move |connection| {
+            connection.execute(
+                "UPDATE occurrences SET closed_at = ?1, last_seen_at = ?1",
+                [old],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    harness
+        .store
+        .retention_step(crate::now_ms() - HOUR, 1000)
+        .await
+        .unwrap();
+    let assessments: i64 = harness.query("SELECT count(*) FROM assessments").await;
+    assert_eq!(assessments, 1);
+}
+
+fn pager_extra() -> String {
+    format!(
+        "[destinations.pager]\nkind = \"discord\"\nwebhook_url_file = \"ops.url\"\n\
+         mention_users = [\"{}\"]\nmention_cooldown = \"10m\"\n\
+         [sources.paged]\ncredential_files = [\"third.token\"]\ndefault_destination = \"pager\"\n",
+        crate::tests::USER_ID
+    )
+}
+
+const PAGER_LIMITS: ClaimLimits = ClaimLimits {
+    max_rows: 10,
+    budget_chars: 1900,
+    mention_cooldown_ms: 600_000,
+};
+
+async fn claim_pager(store: &Store) -> super::Batch {
+    match store
+        .claim_deliveries("pager".into(), crate::now_ms(), PAGER_LIMITS)
+        .await
+        .unwrap()
+    {
+        Claim::Batch(batch) => batch,
+        Claim::Wait(until) => panic!("expected a batch, got Wait({until:?})"),
+    }
+}
+
+fn critical(fingerprint: &str) -> serde_json::Value {
+    with(fixture(), "/alerts/0/fingerprint", json!(fingerprint))
+}
+
+#[tokio::test]
+async fn ambiguous_ping_consumes_the_mention_cooldown() {
+    let harness = Harness::live(DEAD_DISCORD, &pager_extra()).await;
+    harness
+        .ingest_as("paged", critical("0000000000000001"))
+        .await;
+    let first = claim_pager(&harness.store).await;
+    harness
+        .store
+        .complete_deliveries(
+            "pager".into(),
+            first.ids.clone(),
+            first.mention,
+            super::Completion::Retry {
+                retry_at: crate::now_ms(),
+                status: Some(504),
+                error: "HTTP 504".into(),
+                ambiguous: true,
+            },
+            3,
+        )
+        .await
+        .unwrap();
+    harness
+        .ingest_as("paged", critical("0000000000000002"))
+        .await;
+    let second = claim_pager(&harness.store).await;
+    assert_eq!(
+        (
+            first.mention_allowed(),
+            second.ping,
+            second.mention_allowed()
+        ),
+        (true, true, false)
+    );
+}
+
+#[tokio::test]
+async fn definitely_undelivered_ping_keeps_the_mention_available() {
+    let harness = Harness::live(DEAD_DISCORD, &pager_extra()).await;
+    harness
+        .ingest_as("paged", critical("0000000000000001"))
+        .await;
+    let first = claim_pager(&harness.store).await;
+    harness
+        .store
+        .complete_deliveries(
+            "pager".into(),
+            first.ids.clone(),
+            first.mention,
+            super::Completion::Retry {
+                retry_at: crate::now_ms(),
+                status: None,
+                error: "connection refused".into(),
+                ambiguous: false,
+            },
+            3,
+        )
+        .await
+        .unwrap();
+    let retry = claim_pager(&harness.store).await;
+    assert_eq!(
+        (first.mention_allowed(), retry.mention_allowed()),
+        (true, true)
+    );
+}
+
+#[tokio::test]
+async fn ping_interrupted_by_a_crash_consumes_the_mention_cooldown() {
+    let harness = Harness::live(DEAD_DISCORD, &pager_extra()).await;
+    harness
+        .ingest_as("paged", critical("0000000000000001"))
+        .await;
+    let first = claim_pager(&harness.store).await;
+    let crate::tests::Harness {
+        directory: _directory,
+        path,
+        config,
+        store,
+        state,
+    } = harness;
+    drop(state);
+    drop(store);
+    let reopened = Store::open(path, config.storage.max_bytes).await.unwrap();
+    let retry = claim_pager(&reopened).await;
+    assert_eq!(
+        (first.mention_allowed(), retry.mention_allowed()),
+        (true, false)
+    );
+}
+
+#[tokio::test]
+async fn coverage_recovery_waits_for_a_delayed_stale_notification() {
+    let harness = Harness::live(
+        DEAD_DISCORD,
+        "[sources.example.heartbeat]\nstale_after = \"1m\"\n",
+    )
+    .await;
+    let config = Arc::clone(&harness.config);
+    let now = crate::now_ms();
+    let never = harness
+        .store
+        .coverage_tick(Arc::clone(&config), now, now - 61_000)
+        .await
+        .unwrap();
+    let retry_at = crate::now_ms() + HOUR;
+    claim_and_complete(
+        &harness,
+        super::Completion::Retry {
+            retry_at,
+            status: Some(503),
+            error: "HTTP 503".into(),
+            ambiguous: false,
+        },
+    )
+    .await;
+    harness
+        .ingest(with(
+            fixture(),
+            "/alerts/0/labels/alertname",
+            json!("Watchdog"),
+        ))
+        .await;
+    let recovered = harness
+        .store
+        .coverage_tick(Arc::clone(&config), crate::now_ms(), now - 61_000)
+        .await
+        .unwrap();
+    let claim = harness
+        .store
+        .claim_deliveries("ops".into(), crate::now_ms(), LIMITS)
+        .await
+        .unwrap();
+    assert!(
+        never.len() == 1
+            && recovered.len() == 1
+            && matches!(claim, Claim::Wait(Some(at)) if at >= retry_at),
+        "never={never:?} recovered={recovered:?} claim={claim:?}"
+    );
 }

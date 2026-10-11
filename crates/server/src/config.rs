@@ -506,6 +506,13 @@ fn validate(raw: RawConfig, base: &Path) -> Result<Config> {
         .assessment
         .map(|assessment| validate_assessment(assessment, base).map(Arc::new))
         .transpose()?;
+    if raw.mode == Mode::Live && assessment.is_some() {
+        warnings.push(
+            "assessment is enabled with live delivery: allowlisted fields of production alerts \
+             are sent to Cloudflare; results are recorded and never change notifications"
+                .to_owned(),
+        );
+    }
     Ok(Config {
         mode: raw.mode,
         server,

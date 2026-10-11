@@ -152,11 +152,11 @@ pub fn apply(prior: Prior, status: Status, proposal: Proposal, notified: Notifie
             }
         }
         (Status::Firing, Prior::New | Prior::Firing(_)) => {
-            let highest = match prior {
-                Prior::Firing(highest) => highest,
-                Prior::New | Prior::Resolved | Prior::Superseded => Action::Record,
-            };
-            if proposal.action.rank() <= highest.rank() {
+            // A new occurrence always gets its policy decision, even a record-only one;
+            // only an already-firing occurrence can repeat or fall below its highest action.
+            if let Prior::Firing(highest) = prior
+                && proposal.action.rank() <= highest.rank()
+            {
                 return Transition::record(Reason::UnchangedOrLowerPriority);
             }
             let intent = match proposal.action {
@@ -182,6 +182,24 @@ mod tests {
 
     fn proposal(severity: &str) -> Proposal {
         Policy::default().propose(Some(severity), true)
+    }
+
+    #[test]
+    fn first_record_only_observation_keeps_its_policy_decision() {
+        let first = apply(Prior::New, Status::Firing, proposal("info"), Notified::No);
+        let repeat = apply(
+            Prior::Firing(Action::Record),
+            Status::Firing,
+            proposal("info"),
+            Notified::No,
+        );
+        assert_eq!(
+            (first.reason, repeat.reason),
+            (
+                Reason::Policy(crate::PolicyReason::ConfiguredSeverity),
+                Reason::UnchangedOrLowerPriority
+            )
+        );
     }
 
     #[test]

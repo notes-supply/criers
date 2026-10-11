@@ -2,8 +2,8 @@
 
 A Rust alert router for Alertmanager. Criers authenticates webhooks per source,
 records every decision in SQLite before acknowledging, and delivers Discord
-notifications through a durable outbox. It can also ask Cloudflare Clef for
-impact probabilities in shadow mode, without changing who gets notified.
+notifications through a durable outbox. It can also record Cloudflare Clef
+impact probabilities, which never change who gets notified.
 
 Alertmanager keeps grouping, silences and inhibition. Criers decides between
 recording, a quiet post and a ping, and keeps the delivery history.
