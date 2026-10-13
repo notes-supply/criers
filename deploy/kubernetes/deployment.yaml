@@ -25,7 +25,7 @@ spec:
       containers:
         - name: criers
           # Build and push your own image; this reference is a placeholder.
-          image: registry.example.invalid/criers:0.2.0
+          image: registry.example.invalid/criers:0.2.1
           args: ["serve", "--config", "/etc/criers/criers.toml"]
           ports:
             - name: ingest
@@ -74,6 +74,10 @@ spec:
               readOnly: true
             - name: data
               mountPath: /var/lib/criers
+            # SQLite spills statement journals and large sorts here; the root
+            # filesystem is read-only. About the database size at most.
+            - name: tmp
+              mountPath: /tmp
       volumes:
         - name: config
           configMap:
@@ -89,3 +93,6 @@ spec:
         - name: data
           persistentVolumeClaim:
             claimName: criers-data
+        - name: tmp
+          emptyDir:
+            sizeLimit: 1Gi

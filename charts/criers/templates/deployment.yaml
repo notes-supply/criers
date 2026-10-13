@@ -98,6 +98,9 @@ spec:
               readOnly: true
             - name: data
               mountPath: /var/lib/criers
+            # SQLite's temporary files; the root filesystem is read-only.
+            - name: tmp
+              mountPath: /tmp
       volumes:
         - name: config
           configMap:
@@ -117,6 +120,9 @@ spec:
         - name: data
           persistentVolumeClaim:
             claimName: {{ include "criers.claimName" . }}
+        - name: tmp
+          emptyDir:
+            sizeLimit: {{ .Values.tmp.sizeLimit }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

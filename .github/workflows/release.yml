@@ -73,7 +73,7 @@ jobs:
           EOF
           chmod -R a+rX "${smoke}"
           docker run -d --name criers-smoke --network host --read-only --cap-drop ALL \
-            --security-opt no-new-privileges \
+            --security-opt no-new-privileges --mount type=tmpfs,dst=/tmp \
             -v "${smoke}/etc:/etc/criers:ro" -v "${smoke}/secrets:/run/secrets/criers:ro" \
             -v criers-smoke-data:/var/lib/criers "${IMAGE}:${VERSION}"
           for _ in $(seq 1 100); do

@@ -2,8 +2,8 @@ apiVersion: v2
 name: criers
 description: Durable Alertmanager receiver with explicit notification policy and a Discord outbox
 type: application
-version: 0.2.0
-appVersion: "0.2.0"
+version: 0.2.1
+appVersion: "0.2.1"
 # ReadWriteOncePod, the default access mode, is stable since Kubernetes 1.29.
 kubeVersion: ">=1.29.0-0"
 home: https://github.com/notes-supply/criers
