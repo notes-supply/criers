@@ -130,7 +130,9 @@ CREATE TABLE source_status (
         CHECK (coverage IN ('unknown', 'healthy', 'stale', 'never_seen')),
     coverage_changed_at INTEGER,
     -- The configured heartbeat alertname that last_heartbeat_at and coverage refer to.
-    heartbeat_alertname TEXT
+    heartbeat_alertname TEXT,
+    -- When monitoring of that heartbeat began, until its first heartbeat arrives.
+    unobserved_since INTEGER
 ) STRICT;
 
 -- Periods without heartbeats, recorded by the heartbeat that ends each one.

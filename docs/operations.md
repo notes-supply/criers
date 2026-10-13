@@ -164,7 +164,9 @@ Criers' own stored history, not from Alertmanager or Prometheus:
   Alertmanager omitted (`truncatedAlerts`), and live notifications that failed
   or may not have arrived. A gap runs from `stale_after` past one heartbeat to
   the next, so time Criers itself was down counts as a gap; a source with no
-  heartbeat recorded is never shown as healthy. Whether a gap was still open at
+  heartbeat recorded is never shown as healthy. Before the first heartbeat of
+  the configured alertname, the gap starts `stale_after` after monitoring began,
+  however late Criers next evaluates it. Whether a gap was still open at
   the window end comes from the latest heartbeat. Up to 10,000 gaps are counted
   per source; beyond that the report says "at least".
 

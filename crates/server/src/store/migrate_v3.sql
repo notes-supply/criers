@@ -61,3 +61,8 @@ CREATE TABLE summaries (
     created_at INTEGER NOT NULL,
     outbox_id INTEGER REFERENCES outbox(id) ON DELETE SET NULL
 ) STRICT;
+
+-- When monitoring of the configured heartbeat began, until its first heartbeat
+-- arrives. Upgraded sources have no record: one still waiting for its first
+-- heartbeat is reported unobserved for whole windows until it arrives.
+ALTER TABLE source_status ADD COLUMN unobserved_since INTEGER;

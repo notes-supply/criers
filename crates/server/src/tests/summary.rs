@@ -905,6 +905,96 @@ async fn restart_after_the_boundary_before_a_fresh_heartbeat_reports_the_outage(
 }
 
 #[tokio::test]
+async fn first_heartbeat_after_downtime_does_not_erase_unobserved_summary_window() {
+    let harness = Harness::shadow(&format!(
+        "{}[sources.example.heartbeat]\nstale_after = \"10m\"\n",
+        summary_section()
+    ))
+    .await;
+    let end = start(&harness).await;
+    let started = end - DAY_MS;
+    harness
+        .store
+        .with_connection(move |connection| {
+            connection.execute("UPDATE summaries SET window_end = ?1", [started])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    // The daemon stopped during startup grace, before its first heartbeat.
+    harness
+        .store
+        .coverage_tick(Arc::clone(&harness.config), started, started)
+        .await
+        .unwrap();
+    // Its first heartbeat arrives after the unobserved reporting window ended.
+    harness
+        .ingest(alert("Watchdog", "none", "4000000000000001", "firing"))
+        .await;
+    tick(&harness, crate::now_ms()).await;
+    let text = summaries(&harness).await.pop().unwrap().1;
+    // The gap began when the startup grace ran out and was open at the window end.
+    let onset = chrono::DateTime::from_timestamp_millis(started + 10 * 60_000)
+        .unwrap()
+        .format("%m-%d %H:%M")
+        .to_string();
+    assert!(
+        !text.contains("**Coverage gaps:** none")
+            && text.contains("example")
+            && text.contains(&format!(
+                "- example: no heartbeat recorded since {onset}, ongoing at window end"
+            )),
+        "the entire window lacked heartbeat evidence:\n{text}"
+    );
+}
+
+#[tokio::test]
+async fn late_never_seen_evaluation_does_not_erase_the_unobserved_summary_window() {
+    let harness = Harness::shadow(&format!(
+        "{}[sources.example.heartbeat]\nstale_after = \"10m\"\n",
+        summary_section()
+    ))
+    .await;
+    let end = start(&harness).await;
+    let started = end - DAY_MS;
+    harness
+        .store
+        .with_connection(move |connection| {
+            connection.execute("UPDATE summaries SET window_end = ?1", [started])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let config = Arc::clone(&harness.config);
+    // Monitoring began at the window start; the daemon stopped during grace.
+    harness
+        .store
+        .coverage_tick(Arc::clone(&config), started, started)
+        .await
+        .unwrap();
+    // After the missed boundary a restarted daemon's own grace runs out first.
+    let late = end + 20 * 60_000;
+    let changes = harness
+        .store
+        .coverage_tick(Arc::clone(&config), late, late - 11 * 60_000)
+        .await
+        .unwrap();
+    tick(&harness, late).await;
+    let text = summaries(&harness).await.pop().unwrap().1;
+    let onset = chrono::DateTime::from_timestamp_millis(started + 10 * 60_000)
+        .unwrap()
+        .format("%m-%d %H:%M")
+        .to_string();
+    assert!(
+        changes.iter().any(|change| change.state == "never_seen")
+            && text.contains(&format!(
+                "- example: no heartbeat recorded since {onset}, ongoing at window end"
+            )),
+        "{changes:?}\n{text}"
+    );
+}
+
+#[tokio::test]
 async fn restart_after_the_boundary_after_a_fresh_heartbeat_reports_the_closed_outage() {
     let (harness, end, last) = restarted_after_heartbeat_loss().await;
     // The first thing after the restart is a fresh heartbeat, before any evaluation.
@@ -1033,4 +1123,35 @@ async fn thousands_of_alert_names_report_true_totals_from_a_bounded_read() {
             && text.contains(&format!("- +{} more alert names", 5002 - listed)),
         "listed={listed}\n{text}"
     );
+}
+
+#[tokio::test]
+async fn a_first_heartbeat_within_startup_grace_records_no_gap() {
+    let harness = Harness::shadow(&format!(
+        "{}[sources.example.heartbeat]\nstale_after = \"10m\"\n",
+        summary_section()
+    ))
+    .await;
+    let began = crate::now_ms() - 5 * 60_000;
+    harness
+        .store
+        .coverage_tick(Arc::clone(&harness.config), began, began)
+        .await
+        .unwrap();
+    harness
+        .ingest(alert("Watchdog", "none", "4000000000000001", "firing"))
+        .await;
+    let (gaps, unobserved): (i64, Option<i64>) = harness
+        .store
+        .with_connection(|connection| {
+            Ok(connection.query_row(
+                "SELECT (SELECT count(*) FROM heartbeat_gaps),
+                    (SELECT unobserved_since FROM source_status WHERE source = 'example')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!((gaps, unobserved), (0, None));
 }

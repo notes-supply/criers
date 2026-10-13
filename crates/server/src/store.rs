@@ -1032,6 +1032,8 @@ fn ingest_transaction(
             last_event_at = coalesce(excluded.last_event_at, last_event_at),
             truncated_alerts = excluded.truncated_alerts,
             last_heartbeat_at = coalesce(excluded.last_heartbeat_at, last_heartbeat_at),
+            unobserved_since = CASE WHEN excluded.last_heartbeat_at IS NULL
+                THEN unobserved_since END,
             heartbeat_alertname = coalesce(excluded.heartbeat_alertname, heartbeat_alertname)",
         params![
             source_id,
@@ -1795,9 +1797,10 @@ fn coverage_transaction(
         if identity.as_deref() != Some(heartbeat.alertname.as_str()) {
             transaction.execute(
                 "INSERT INTO source_status(source, coverage, coverage_changed_at,
-                    heartbeat_alertname) VALUES (?1, 'unknown', ?2, ?3)
+                    heartbeat_alertname, unobserved_since) VALUES (?1, 'unknown', ?2, ?3, ?2)
                  ON CONFLICT(source) DO UPDATE SET last_heartbeat_at = NULL,
                     coverage = 'unknown', heartbeat_alertname = excluded.heartbeat_alertname,
+                    unobserved_since = excluded.unobserved_since,
                     coverage_changed_at = CASE WHEN coverage = 'unknown'
                         THEN coverage_changed_at ELSE excluded.coverage_changed_at END",
                 params![source_id, now, heartbeat.alertname],
@@ -1863,27 +1866,27 @@ fn coverage_transaction(
     Ok(changes)
 }
 
-/// A source's stored heartbeat freshness and coverage.
+/// A source's stored heartbeat freshness.
 struct HeartbeatStatus {
     last_heartbeat_at: Option<i64>,
     alertname: Option<String>,
-    coverage: String,
-    changed_at: Option<i64>,
+    /// When monitoring of the configured heartbeat began, while none of it has
+    /// been received yet. Later coverage evaluations never move it.
+    unobserved_since: Option<i64>,
 }
 
 impl HeartbeatStatus {
     fn read(transaction: &Transaction<'_>, source: &str) -> Result<Option<Self>, StoreError> {
         Ok(transaction
             .prepare_cached(
-                "SELECT last_heartbeat_at, heartbeat_alertname, coverage, coverage_changed_at
+                "SELECT last_heartbeat_at, heartbeat_alertname, unobserved_since
                  FROM source_status WHERE source = ?1",
             )?
             .query_row([source], |row| {
                 Ok(Self {
                     last_heartbeat_at: row.get(0)?,
                     alertname: row.get(1)?,
-                    coverage: row.get(2)?,
-                    changed_at: row.get(3)?,
+                    unobserved_since: row.get(2)?,
                 })
             })
             .optional()?)
@@ -1891,8 +1894,19 @@ impl HeartbeatStatus {
 
     /// The latest heartbeat, if it belongs to the configured alertname.
     fn last_for(&self, heartbeat: &Heartbeat) -> Option<i64> {
-        self.last_heartbeat_at
-            .filter(|_| self.alertname.as_deref() == Some(heartbeat.alertname.as_str()))
+        self.last_heartbeat_at.filter(|_| self.watches(heartbeat))
+    }
+
+    /// When the configured heartbeat became overdue without ever arriving: its
+    /// startup grace after monitoring began.
+    fn first_due_for(&self, heartbeat: &Heartbeat, stale_after: i64) -> Option<i64> {
+        self.unobserved_since
+            .filter(|_| self.watches(heartbeat) && self.last_heartbeat_at.is_none())
+            .map(|since| since + stale_after)
+    }
+
+    fn watches(&self, heartbeat: &Heartbeat) -> bool {
+        self.alertname.as_deref() == Some(heartbeat.alertname.as_str())
     }
 }
 
@@ -1900,8 +1914,8 @@ impl HeartbeatStatus {
 ///
 /// Gaps are derived from heartbeat arrival times, so a gap is recorded even when
 /// Criers was down for all of it and never evaluated coverage meanwhile. Only a
-/// previous heartbeat of the configured alertname counts; without one, a gap is
-/// recorded only once the startup grace had already run out (`never_seen`).
+/// previous heartbeat of the configured alertname counts; for the first one, the
+/// gap starts when the startup grace after monitoring began ran out.
 fn record_heartbeat_gap(
     transaction: &Transaction<'_>,
     source: &str,
@@ -1909,14 +1923,14 @@ fn record_heartbeat_gap(
     now: i64,
 ) -> Result<(), StoreError> {
     let stale_after = i64::try_from(heartbeat.stale_after.as_millis()).unwrap_or(i64::MAX);
-    let started = match HeartbeatStatus::read(transaction, source)? {
-        Some(status) => match status.last_for(heartbeat) {
+    let started = HeartbeatStatus::read(transaction, source)?.and_then(|status| {
+        match status.last_for(heartbeat) {
             Some(last) => (now - last > stale_after).then(|| last + stale_after),
-            None if status.coverage == "never_seen" => status.changed_at,
-            None => None,
-        },
-        None => None,
-    };
+            None => status
+                .first_due_for(heartbeat, stale_after)
+                .filter(|due| now > *due),
+        }
+    });
     if let Some(started) = started {
         transaction
             .prepare_cached(

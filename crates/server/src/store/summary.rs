@@ -316,20 +316,26 @@ fn coverage(
     let last = status
         .as_ref()
         .and_then(|status| status.last_for(heartbeat));
+    let first_due = status
+        .as_ref()
+        .and_then(|status| status.first_due_for(heartbeat, stale_after));
     let ongoing = match (closed_later, last) {
+        // Whether a heartbeat preceded this gap is not recorded, so say only
+        // that none arrived.
         (Some(since), _) => Some(Ongoing {
             since,
-            recorded: true,
+            recorded: false,
         }),
         (None, Some(last)) => (last < end && end - last > stale_after).then_some(Ongoing {
             since: last + stale_after,
             recorded: true,
         }),
+        // No heartbeat of the configured alertname yet: overdue once the startup
+        // grace after monitoring began ran out, or unobserved for the whole
+        // window if monitoring never began.
         (None, None) => {
-            let since = status
-                .and_then(|status| status.changed_at)
-                .map_or(start, |changed| changed.max(start));
-            (end - since > stale_after).then_some(Ongoing {
+            let since = first_due.unwrap_or(start);
+            (since < end).then_some(Ongoing {
                 since,
                 recorded: false,
             })

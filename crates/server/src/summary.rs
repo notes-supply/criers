@@ -106,7 +106,8 @@ pub(crate) struct Coverage {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Ongoing {
     pub since: i64,
-    /// Whether any heartbeat of the configured alertname was ever received.
+    /// Whether the gap is known to follow a received heartbeat. Otherwise the
+    /// report says only that no heartbeat was recorded since.
     pub recorded: bool,
 }
 
