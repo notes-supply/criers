@@ -273,3 +273,60 @@ fn helm_default_configuration_is_valid_with_mounted_paths() {
         (Mode::Shadow, "Watchdog")
     );
 }
+
+#[test]
+fn digest_without_a_summary_is_rejected() {
+    let message = error(&format!(
+        "{MINIMAL}\n[policy.severity]\ncritical = \"ping\"\nwarning = \"digest\"\n"
+    ));
+    assert!(message.contains("needs a [summary] section"), "{message}");
+}
+
+#[test]
+fn summary_defaults_to_six_in_the_morning_utc() {
+    let directory = tempfile::tempdir().unwrap();
+    let body = format!(
+        "{MINIMAL}\n[summary]\ndestination = \"ops\"\n[policy.severity]\ncritical = \"ping\"\n\
+         warning = \"digest\"\n"
+    );
+    let config = Config::load(&write(directory.path(), &body)).unwrap();
+    let summary = config.summary.unwrap();
+    assert_eq!(
+        (summary.destination.as_str(), summary.at.as_secs()),
+        ("ops", 6 * 3600)
+    );
+}
+
+#[test]
+fn summary_time_must_be_hours_and_minutes() {
+    let message = error(&format!(
+        "{MINIMAL}\n[summary]\ndestination = \"ops\"\nat = \"6am\"\n"
+    ));
+    assert!(message.contains("summary.at \"6am\""), "{message}");
+}
+
+#[test]
+fn summary_destination_must_exist() {
+    let message = error(&format!("{MINIMAL}\n[summary]\ndestination = \"daily\"\n"));
+    assert!(
+        message.contains("summary.destination \"daily\" is not a configured destination"),
+        "{message}"
+    );
+}
+
+#[test]
+fn summary_needs_retention_covering_a_delayed_window() {
+    let message = error(&format!(
+        "{MINIMAL}\n[summary]\ndestination = \"ops\"\n[storage]\nretention = \"1d\"\n"
+    ));
+    assert!(message.contains("at least 2d"), "{message}");
+}
+
+#[test]
+fn coverage_notices_cannot_wait_for_the_summary() {
+    let message = error(&format!(
+        "{MINIMAL}\n[summary]\ndestination = \"ops\"\n[sources.prod.heartbeat]\n\
+         stale_after = \"10m\"\naction = \"digest\"\n"
+    ));
+    assert!(message.contains("must be quiet_post or ping"), "{message}");
+}

@@ -70,11 +70,19 @@ the same credential. It shares ingestion's admission limit.
 
 ## Policy
 
-`[policy.severity]` maps trusted severity labels to `record`, `quiet_post` or
-`ping`. Missing or unmapped severities use `unknown_severity`, which defaults to
-`ping`. Severities in `critical_floor` create a delivery intent immediately and
-are never sent to assessment. A source with `trust_severity = false` always gets
+`[policy.severity]` maps trusted severity labels to `record`, `digest`,
+`quiet_post` or `ping`. Missing or unmapped severities use `unknown_severity`,
+which defaults to `ping`. Severities in `critical_floor` create a delivery intent
+immediately, must map to `quiet_post` or `ping`, and are never sent to
+assessment. A source with `trust_severity = false` always gets
 `unknown_severity` and never reaches the floor.
+
+`digest` records the decision and lists the occurrence in the next
+[daily summary](#daily-summary) instead of posting it now. It needs a
+`[summary]` section. A digested alert that escalates (for example warning to
+critical) notifies immediately like any other escalation, and a digested alert
+that resolves gets no recovery message: nothing was posted, and the summary
+shows the resolution.
 
 Within one occurrence (source, fingerprint, `startsAt`) escalation only goes up
 at each destination: warning then critical sends again, critical then warning
@@ -133,6 +141,83 @@ the firing alerts in Alertmanager when you switch.
   attempt or a crash mid-send counts as a possible mention, while a definite
   non-delivery (connection refused, 429, 503 or another rejected request) hands
   the cooldown back.
+
+## Daily summary
+
+`[summary]` posts one report per day to a destination, without mentions:
+
+```toml
+[summary]
+destination = "ops"
+at = "06:00"   # UTC; each window ends at this time
+```
+
+The report covers the window since the previous summary and is built from
+Criers' own stored history, not from Alertmanager or Prometheus:
+
+- **Open**: occurrences firing at the window end, grouped by alert name and
+  severity, with how many started inside the window.
+- **Resolved**: occurrences that resolved inside the window. A recovery is
+  never counted as open, and an occurrence replaced by a newer start is not a
+  resolution.
+- **Coverage gaps**: periods without heartbeats inside the window, alerts
+  Alertmanager omitted (`truncatedAlerts`), and live notifications that failed
+  or may not have arrived. A gap runs from `stale_after` past one heartbeat to
+  the next, so time Criers itself was down counts as a gap; a source with no
+  heartbeat recorded is never shown as healthy. Before the first heartbeat of
+  the configured alertname, the gap starts `stale_after` after monitoring began,
+  however late Criers next evaluates it. A source upgraded from schema 3 that
+  never received its heartbeat, and whose start of monitoring schema 3 did not
+  keep, is reported as never having had a recorded heartbeat, without a start
+  time. Whether a gap was still open at
+  the window end comes from the latest heartbeat. Up to 10,000 gaps are counted
+  per source; beyond that the report says "at least".
+
+It lists occurrences whose highest action was `digest`, `quiet_post` or `ping`;
+`record` occurrences and heartbeats are not listed. Each section's count equals
+its lines plus a final "+N more" line, and the whole report fits one Discord
+message (at most 1500 characters): when space runs out, coverage detail is
+folded into one line per source and then into totals, while omitted alerts and
+failed or uncertain notifications are always shown. Alert text is escaped like
+any other post. Omitted alerts are kept even when a webhook carried only the
+heartbeat.
+
+Warnings and the summary interact through policy only: with
+`warning = "quiet_post"` warnings post at once and also appear in the summary;
+with `warning = "digest"` they appear only in the summary. Critical-floor
+alerts never wait for it.
+
+Scheduling and delivery:
+
+- **Start.** The first run after `[summary]` is added records the latest
+  window end and posts nothing; the first report covers the next full window.
+- **Durable cursor.** Generation, the outbox intent and the new window end
+  commit in one transaction. A crash cannot lose a window or queue it twice.
+- **Catch-up.** After downtime, one report covers everything since the previous
+  summary, marked as delayed, rather than one report per missed day. Which
+  occurrences were open or resolved is decided at the window end, but a delayed
+  report uses each one's current action, severity and labels: an alert that
+  escalated after the window ended is listed with its later state, even if it
+  was only recorded at the window end. It never
+  starts before the retention cutoff, so `storage.retention` must be at least
+  2 days.
+- **Delivery.** The summary is an ordinary quiet outbox row: retries, rate
+  limits, ambiguous sends and restart recovery behave as described above. It is
+  always sent as a message of its own, and summaries for one destination go out
+  in order. In shadow mode it is recorded as a shadow row and never sent later.
+- **Failure.** If generation fails (for example a full database), it is retried
+  with backoff and the window stays pending.
+
+Generation holds the database connection for its duration, which is how long it
+can delay a concurrent webhook commit. Measured with the release build: about
+80 ms for 20,000 notifying occurrences in one window and 270 ms for 100,000.
+`criers_summary_cursor_seconds` shows that the schedule advances,
+`criers_summary_window_end_seconds` that summaries are generated, and
+`criers_summary_delivered_window_end_seconds` shows that one actually reached
+Discord. A revoked webhook or blocked egress leaves the generated window fresh
+and the delivered one stale, and shows up in `criers_deliveries_finished_total{state="failed"}`
+and `criers_delivery_oldest_pending_age_seconds`. Alert on those from outside
+the instance: an alert routed through the broken destination cannot arrive.
 
 ## Assessment
 
@@ -197,10 +282,14 @@ every source.
 
 Schema upgrades run automatically at startup in one transaction, keeping
 existing rows: the original scaffold and every earlier schema version reach the
-current schema (3). Downgrades are not supported. Schema 3 records which
+current schema (4). Downgrades are not supported, so keep a copy of the
+database before upgrading if you may need to roll back. Schema 3 records which
 heartbeat alertname a source's freshness belongs to; databases upgraded from
 earlier versions have no record, so their heartbeat coverage returns to the
-startup grace once and recovers on the next heartbeat.
+startup grace once and recovers on the next heartbeat. Schema 4 rebuilds the
+outbox table with every row and ID kept, renumbers stored action ranks for
+`digest`, and adds heartbeat gaps and summary windows; gaps that closed
+before the upgrade are not recorded.
 
 SQLite runs in WAL mode with full synchronous commits. `storage.max_size_mib`
 caps the main database file; the WAL is truncated to 64 MiB after checkpoints,
@@ -210,7 +299,8 @@ Retention runs every `retention_interval`. Each transaction deletes at most
 `retention_batch` decisions, webhook records, closed occurrences, finished
 deliveries and finished assessments; deleting a closed occurrence also removes
 its own few remaining child rows. It removes webhook metadata and decisions
-older than `retention`, and finished deliveries and assessments older than that.
+older than `retention`, and finished deliveries and assessments, heartbeat
+gaps and summary windows (except the latest) older than that.
 A resolved or superseded occurrence is removed only once it was closed and last
 seen before the cutoff, its decisions have been drained in bounded batches, and
 every delivery and assessment it owns is finished and older too, so recent
@@ -252,6 +342,10 @@ repair.
 | `criers_assessments_total{outcome}`, `criers_assessment_queue` | shadow assessment |
 | `criers_storage_used_bytes`, `criers_storage_limit_bytes` | storage headroom |
 | `criers_credential_files_valid`, `criers_credential_reload_failures_total` | rotation health |
+| `criers_deliveries_finished_total{destination,state}` | live deliveries that ended: sent, failed, ambiguous, including those ended because their destination was removed |
+| `criers_summary_cursor_seconds` | latest window end the summary schedule has reached, including where reporting started |
+| `criers_summary_window_end_seconds` | end of the latest generated summary window; 0 before the first |
+| `criers_summary_delivered_window_end_seconds` | end of the latest summary window whose message was sent; 0 until one is, and always 0 in shadow mode |
 
 Coverage changes create durable notifications to the heartbeat destination: no
 heartbeat within `stale_after` of startup (`never_seen`), heartbeats stopped

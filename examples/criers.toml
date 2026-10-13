@@ -33,8 +33,14 @@ critical_floor = ["critical"]
 
 [policy.severity]
 critical = "ping"
-warning = "quiet_post"
+warning = "quiet_post"  # "digest" lists warnings in the daily summary instead
 info = "record"
+
+# Optional daily summary of what is open, what resolved and coverage gaps,
+# posted without mentions. Required when any severity maps to "digest".
+# [summary]
+# destination = "ops"
+# at = "06:00"  # UTC
 
 # POST /v1/sources/local/alertmanager with "Authorization: Bearer <token>".
 [sources.local]

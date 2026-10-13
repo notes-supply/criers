@@ -59,7 +59,7 @@ check "no mount uses subPath" "$container | .volumeMounts[]" 'has("subPath") | n
 check "secret directory mounted where the config expects it" "$container | .volumeMounts[] | select(.name == \"secrets\")" '.mountPath == "/run/secrets/criers" and .readOnly == true' default
 check "probes use the ops port" "$container" '.startupProbe.httpGet.path == "/health/live" and .livenessProbe.httpGet.path == "/health/live" and .readinessProbe.httpGet.path == "/health/ready" and .startupProbe.httpGet.port == "ops" and .livenessProbe.httpGet.port == "ops" and .readinessProbe.httpGet.port == "ops"' default
 check "grace exceeds both 12s shutdown phases" "$pod" '.terminationGracePeriodSeconds >= 30' default
-check "image defaults to the chart appVersion" "$container" '.image == "ghcr.io/notes-supply/criers:0.1.0"' default
+check "image defaults to the chart appVersion" "$container" '.image == "ghcr.io/notes-supply/criers:0.2.0"' default
 check "created claim fences with ReadWriteOncePod and is kept" "$claim" '.spec.accessModes[0] == "ReadWriteOncePod" and (.spec.accessModes | length) == 1 and .metadata.annotations["helm.sh/resource-policy"] == "keep"' default
 check "data volume uses the created claim" "$pod | .volumes[] | select(.name == \"data\")" '.persistentVolumeClaim.claimName == "criers-data"' default
 check "ingest Service exposes the ingest port" "$ingest" '.spec.ports[0].targetPort == "ingest" and .spec.ports[0].port == 8080' default

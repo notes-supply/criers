@@ -13,7 +13,7 @@ use crate::{
     metrics::{
         CoverageLabels, DestinationLabels, Metrics, OutcomeLabels, SourceLabels, TableLabels,
     },
-    store::{Stats, Store},
+    store::{Stats, Store, SummaryTick},
 };
 
 const COVERAGE_STATES: [&str; 4] = ["unknown", "healthy", "stale", "never_seen"];
@@ -53,6 +53,14 @@ fn publish(config: &Config, metrics: &Metrics, stats: &Stats) {
     metrics.storage_used_bytes.set(stats.used_bytes);
     metrics.storage_limit_bytes.set(stats.limit_bytes);
     metrics.assessment_queue.set(stats.assessment_queue);
+    if let Some(end) = stats.summary_generated {
+        metrics.summary_window_end.set(end as f64 / 1000.0);
+    }
+    if let Some(end) = stats.summary_delivered {
+        metrics
+            .summary_delivered_window_end
+            .set(end as f64 / 1000.0);
+    }
     for destination in config.destinations.keys() {
         let labels = DestinationLabels {
             destination: destination.clone(),
@@ -141,6 +149,8 @@ pub(crate) async fn retention(
                 ("occurrences", deleted.occurrences),
                 ("outbox", deleted.deliveries),
                 ("assessments", deleted.assessments),
+                ("heartbeat_gaps", deleted.gaps),
+                ("summaries", deleted.summaries),
             ] {
                 if count > 0 {
                     metrics
@@ -156,6 +166,8 @@ pub(crate) async fn retention(
                 deleted.occurrences,
                 deleted.deliveries,
                 deleted.assessments,
+                deleted.gaps,
+                deleted.summaries,
             ]
             .iter()
             .any(|&count| count >= batch as usize);
@@ -217,6 +229,69 @@ pub(crate) async fn coverage(
         }
     }
 }
+
+/// Queues each scheduled summary once its reporting window ends.
+///
+/// The store owns the cursor; this task only decides when to ask. It sleeps in
+/// short steps so a wall-clock change is noticed, and retries a failed
+/// generation with backoff without advancing the cursor.
+pub(crate) async fn summary(
+    store: Store,
+    config: Arc<Config>,
+    metrics: Arc<Metrics>,
+    wake: Arc<Notify>,
+    cancel: CancellationToken,
+) {
+    let Some(schedule) = config
+        .summary
+        .as_ref()
+        .map(|summary| crate::summary::Schedule::new(summary.at))
+    else {
+        return;
+    };
+    let mut cursor: Option<i64> = None;
+    let mut failures = 0u32;
+    loop {
+        let now = crate::now_ms();
+        let due = cursor.is_none_or(|cursor| schedule.latest(now) > cursor);
+        let period = if due {
+            let started = std::time::Instant::now();
+            match store.summary_tick(Arc::clone(&config), now).await {
+                Ok(tick) => {
+                    failures = 0;
+                    if let Some(tick) = tick {
+                        if let SummaryTick::Queued(end) = tick {
+                            // Generation holds the database connection; its duration is
+                            // the most it can delay a concurrent webhook commit.
+                            tracing::info!(
+                                window_end = end,
+                                elapsed_ms = started.elapsed().as_millis(),
+                                "summary queued"
+                            );
+                            wake.notify_waiters();
+                        }
+                        cursor = Some(tick.cursor());
+                        metrics.summary_cursor.set(tick.cursor() as f64 / 1000.0);
+                    }
+                    SUMMARY_POLL
+                }
+                Err(error) => {
+                    failures = failures.saturating_add(1);
+                    tracing::error!(%error, "summary generation failed; retrying");
+                    crate::delivery::backoff(failures, Duration::from_secs(1), SUMMARY_POLL)
+                }
+            }
+        } else {
+            SUMMARY_POLL
+        };
+        if !tick(&cancel, period).await {
+            break;
+        }
+    }
+}
+
+/// How often the summary task rechecks the wall clock.
+const SUMMARY_POLL: Duration = Duration::from_secs(30);
 
 /// Polls credential files so rotations apply without rereading secrets per request.
 pub(crate) async fn credentials(

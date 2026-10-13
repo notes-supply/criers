@@ -22,7 +22,9 @@ configured, Discord messages.
 
 ## Decisions
 
-- **Action**: notification policy proposal: record, quiet post, or ping.
+- **Action**: notification policy proposal: record, digest, quiet post, or ping.
+- **Digest**: the action that defers an occurrence to the next summary instead
+  of notifying now. A later, higher action still notifies at once.
 - **Critical floor**: severities that always notify immediately and skip
   assessment.
 - **Assessment**: model-estimated impact and urgency probabilities for an
@@ -33,6 +35,13 @@ configured, Discord messages.
   message was or may have been delivered.
 - **Shadow**: records decisions and intents without external sends. Existing
   shadow intents cannot later be promoted into live delivery.
+
+## Summaries
+
+- **Summary**: a scheduled report of one reporting window, posted without
+  mentions: what is open, what resolved, and coverage gaps.
+- **Reporting window**: the period a summary covers, from the end of the
+  previous summary to the latest scheduled time.
 
 ## Delivery
 

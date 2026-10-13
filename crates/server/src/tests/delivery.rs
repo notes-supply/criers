@@ -15,7 +15,7 @@ use crate::{
     store::{Claim, ClaimLimits, Completion, Store},
 };
 
-fn worker(harness: &Harness, destination: &str, timeout: Duration) -> Worker {
+pub(super) fn worker(harness: &Harness, destination: &str, timeout: Duration) -> Worker {
     let config = &harness.config.destinations[destination];
     Worker {
         destination: destination.to_owned(),
@@ -28,13 +28,13 @@ fn worker(harness: &Harness, destination: &str, timeout: Duration) -> Worker {
     }
 }
 
-fn spawn(worker: Worker) -> CancellationToken {
+pub(super) fn spawn(worker: Worker) -> CancellationToken {
     let cancel = CancellationToken::new();
     tokio::spawn(worker.run(cancel.clone()));
     cancel
 }
 
-async fn wait_for_state(store: &Store, id: i64, expected: &'static str) -> String {
+pub(super) async fn wait_for_state(store: &Store, id: i64, expected: &'static str) -> String {
     let mut state = String::new();
     for _ in 0..200 {
         state =
@@ -56,7 +56,7 @@ async fn wait_for_state(store: &Store, id: i64, expected: &'static str) -> Strin
     state
 }
 
-fn content(request: &super::fixtures::Captured) -> &str {
+pub(super) fn content(request: &super::fixtures::Captured) -> &str {
     request.body["content"].as_str().unwrap()
 }
 

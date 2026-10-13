@@ -22,11 +22,17 @@ use tokio::sync::OwnedSemaphorePermit;
 
 use crate::{
     assessment::{self, Answers, QUESTIONS_VERSION},
-    config::{Config, Mode, Source},
+    config::{Config, Heartbeat, Mode, Source},
     render::{self, Subject},
 };
 
-const SCHEMA_VERSION: i64 = 3;
+mod summary;
+
+#[cfg(test)]
+pub(crate) use summary::MAX_GAPS;
+pub(crate) use summary::SummaryTick;
+
+const SCHEMA_VERSION: i64 = 4;
 const SUMMARY_CHARS: usize = 512;
 
 #[derive(Debug, Error)]
@@ -117,6 +123,16 @@ pub(crate) struct Receipt {
     /// Assessments recorded as `skipped_queue_full`; reported through metrics.
     #[serde(skip)]
     pub assessments_skipped: u64,
+    /// Live deliveries this webhook ended at once; reported through metrics.
+    #[serde(skip)]
+    pub ended: Vec<Ended>,
+}
+
+/// A live delivery that ended without a worker sending it.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct Ended {
+    pub destination: String,
+    pub state: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -244,6 +260,17 @@ pub(crate) struct Retention {
     pub occurrences: usize,
     pub deliveries: usize,
     pub assessments: usize,
+    pub gaps: usize,
+    pub summaries: usize,
+}
+
+/// Deliveries a completion ended, by terminal state. Rows that will be retried
+/// are not counted.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct Finished {
+    pub sent: u64,
+    pub failed: u64,
+    pub ambiguous: u64,
 }
 
 #[derive(Debug)]
@@ -266,6 +293,10 @@ pub(crate) struct SourceFreshness {
 pub(crate) struct Stats {
     pub used_bytes: i64,
     pub limit_bytes: i64,
+    /// End of the latest summary window that was generated and queued.
+    pub summary_generated: Option<i64>,
+    /// End of the latest summary window whose message was sent.
+    pub summary_delivered: Option<i64>,
     pub pending: Vec<PendingDeliveries>,
     pub assessment_queue: i64,
     pub sources: Vec<SourceFreshness>,
@@ -439,7 +470,8 @@ impl Store {
         .await
     }
 
-    /// Applies a send outcome to the in-flight rows of a batch.
+    /// Applies a send outcome to the in-flight rows of a batch and reports the
+    /// rows it ended.
     pub(crate) async fn complete_deliveries(
         &self,
         destination: String,
@@ -447,11 +479,11 @@ impl Store {
         mention: Option<MentionClaim>,
         completion: Completion,
         max_attempts: u32,
-    ) -> Result<(), StoreError> {
+    ) -> Result<Finished, StoreError> {
         self.write(move |connection| {
             let now = crate::now_ms();
             let transaction = connection.transaction()?;
-            complete_transaction(
+            let finished = complete_transaction(
                 &transaction,
                 &destination,
                 &ids,
@@ -461,7 +493,7 @@ impl Store {
                 now,
             )?;
             transaction.commit()?;
-            Ok(())
+            Ok(finished)
         })
         .await
     }
@@ -689,9 +721,42 @@ impl Store {
                          ORDER BY completed_at LIMIT ?2)",
                     params![cutoff, batch],
                 )?,
+                gaps: transaction.execute(
+                    "DELETE FROM heartbeat_gaps WHERE id IN
+                        (SELECT id FROM heartbeat_gaps WHERE ended_at < ?1
+                         ORDER BY ended_at LIMIT ?2)",
+                    params![cutoff, batch],
+                )?,
+                // The latest window end is the summary cursor and always stays.
+                summaries: transaction.execute(
+                    "DELETE FROM summaries WHERE window_end IN
+                        (SELECT window_end FROM summaries WHERE window_end < ?1
+                         AND window_end < (SELECT max(window_end) FROM summaries)
+                         ORDER BY window_end LIMIT ?2)",
+                    params![cutoff, batch],
+                )?,
             };
             transaction.commit()?;
             Ok(deleted)
+        })
+        .await
+    }
+
+    /// Queues the scheduled summary when a reporting window has ended.
+    ///
+    /// Returns `None` without a `[summary]` section. Generation, the outbox
+    /// intent and the new cursor commit together, so a crash can neither lose
+    /// a window nor queue it twice.
+    pub(crate) async fn summary_tick(
+        &self,
+        config: Arc<Config>,
+        now: i64,
+    ) -> Result<Option<SummaryTick>, StoreError> {
+        self.write(move |connection| {
+            let transaction = connection.transaction()?;
+            let tick = summary::tick(&transaction, &config, now)?;
+            transaction.commit()?;
+            Ok(tick)
         })
         .await
     }
@@ -703,15 +768,32 @@ impl Store {
     pub(crate) async fn abandon_unconfigured(
         &self,
         destinations: Vec<String>,
-    ) -> Result<usize, StoreError> {
+    ) -> Result<Vec<Ended>, StoreError> {
         self.write(move |connection| {
-            Ok(connection.execute(
+            let mut statement = connection.prepare(
                 "UPDATE outbox SET completed_at = ?2, last_error = 'destination_not_configured',
                     state = CASE WHEN possibly_delivered = 1 THEN 'ambiguous' ELSE 'failed' END
                  WHERE state IN ('pending', 'in_flight')
-                 AND destination NOT IN (SELECT value FROM json_each(?1))",
-                params![serde_json::to_string(&destinations)?, crate::now_ms()],
-            )?)
+                 AND destination NOT IN (SELECT value FROM json_each(?1))
+                 RETURNING destination, state",
+            )?;
+            let ended = statement
+                .query_map(
+                    params![serde_json::to_string(&destinations)?, crate::now_ms()],
+                    |row| {
+                        let state: String = row.get(1)?;
+                        Ok(Ended {
+                            destination: row.get(0)?,
+                            state: if state == "ambiguous" {
+                                "ambiguous"
+                            } else {
+                                "failed"
+                            },
+                        })
+                    },
+                )?
+                .collect::<Result<_, _>>()?;
+            Ok(ended)
         })
         .await
     }
@@ -856,7 +938,10 @@ fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
         if version < 2 {
             transaction.execute_batch(include_str!("store/migrate_v1.sql"))?;
         }
-        transaction.execute_batch(include_str!("store/migrate_v2.sql"))?;
+        if version < 3 {
+            transaction.execute_batch(include_str!("store/migrate_v2.sql"))?;
+        }
+        transaction.execute_batch(include_str!("store/migrate_v3.sql"))?;
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.commit()?;
         return Ok(());
@@ -937,7 +1022,10 @@ fn ingest_transaction(
         .count();
     let mut decisions = Vec::with_capacity(observed);
     let mut budget = AssessmentBudget::default();
-    let event_id = if observed > 0 {
+    let mut ended = Vec::new();
+    // Webhook metadata is history for alerts and for omissions: a heartbeat-only
+    // webhook is stored only when Alertmanager reported omitted alerts.
+    let event_id = if observed > 0 || webhook.truncated_alerts > 0 {
         transaction.execute(
             "INSERT INTO events(source, received_at, receiver, group_key, alerts, truncated_alerts)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -959,12 +1047,21 @@ fn ingest_transaction(
             now,
         };
         for alert in webhook.alerts.iter().filter(|alert| !is_heartbeat(alert)) {
-            decisions.push(process_alert(transaction, &context, alert, &mut budget)?);
+            decisions.push(process_alert(
+                transaction,
+                &context,
+                alert,
+                &mut budget,
+                &mut ended,
+            )?);
         }
         Some(context.event_id)
     } else {
         None
     };
+    if heartbeat_seen && let Some(settings) = &source.heartbeat {
+        record_heartbeat_gap(transaction, source_id, settings, now)?;
+    }
     transaction.execute(
         "INSERT INTO source_status(source, last_event_at, truncated_alerts, last_heartbeat_at,
             heartbeat_alertname)
@@ -973,10 +1070,12 @@ fn ingest_transaction(
             last_event_at = coalesce(excluded.last_event_at, last_event_at),
             truncated_alerts = excluded.truncated_alerts,
             last_heartbeat_at = coalesce(excluded.last_heartbeat_at, last_heartbeat_at),
+            unobserved_since = CASE WHEN excluded.last_heartbeat_at IS NULL
+                THEN unobserved_since END,
             heartbeat_alertname = coalesce(excluded.heartbeat_alertname, heartbeat_alertname)",
         params![
             source_id,
-            event_id.map(|_| now),
+            (observed > 0).then_some(now),
             webhook.truncated_alerts,
             heartbeat_seen.then_some(now),
             heartbeat_seen.then_some(heartbeat).flatten()
@@ -989,6 +1088,7 @@ fn ingest_transaction(
         heartbeat: heartbeat_seen,
         decisions,
         assessments_skipped: budget.skipped,
+        ended,
     })
 }
 
@@ -997,6 +1097,7 @@ fn process_alert(
     context: &AlertContext<'_>,
     alert: &Alert,
     budget: &mut AssessmentBudget,
+    ended: &mut Vec<Ended>,
 ) -> Result<Decision, StoreError> {
     let AlertContext {
         config,
@@ -1008,8 +1109,11 @@ fn process_alert(
     } = *context;
     let mut observed = upsert_occurrence(transaction, context, alert)?;
     let id = observed.id;
-    if let Prior::Firing(_) = observed.prior {
-        observed.prior = Prior::Firing(announced_at(transaction, id, destination)?);
+    if let Prior::Firing(highest) = observed.prior {
+        // Immediate notifications are tracked per destination; a digest has no
+        // intent and applies to the occurrence as a whole.
+        let digested = highest.min(Action::Digest);
+        observed.prior = Prior::Firing(announced_at(transaction, id, destination)?.max(digested));
     }
     // Every destination that was, or may have been, told about the occurrence gets
     // its own recovery; destinations whose sends never happened get none.
@@ -1060,7 +1164,7 @@ fn process_alert(
             transition.escalate_to.map_or(0, Action::rank)
         ])?;
     match transition.cancel {
-        Cancel::Nothing | Cancel::Below(Action::Record | Action::QuietPost) => {}
+        Cancel::Nothing | Cancel::Below(Action::Record | Action::Digest | Action::QuietPost) => {}
         // Escalation replaces a lower post only at the destination it escalates.
         Cancel::Below(Action::Ping) => supersede_unattempted(
             transaction,
@@ -1122,6 +1226,10 @@ fn process_alert(
                                 last_error = 'destination_not_configured' WHERE id = ?1",
                         )?
                         .execute(params![row, now])?;
+                    ended.push(Ended {
+                        destination: recovery_destination.clone(),
+                        state: "failed",
+                    });
                 }
                 first = first.or(inserted);
             }
@@ -1358,11 +1466,19 @@ fn announced_at(
 ) -> Result<Action, StoreError> {
     let rank: Option<u8> = transaction
         .prepare_cached(
-            "SELECT max(CASE action WHEN 'ping' THEN 2 WHEN 'quiet_post' THEN 1 END)
+            "SELECT max(CASE action WHEN 'ping' THEN ?3 WHEN 'quiet_post' THEN ?4 END)
              FROM outbox WHERE occurrence_id = ?1 AND kind = 'notify'
              AND destination IN (?2, '')",
         )?
-        .query_row(params![occurrence, destination], |row| row.get(0))?;
+        .query_row(
+            params![
+                occurrence,
+                destination,
+                Action::Ping.rank(),
+                Action::QuietPost.rank()
+            ],
+            |row| row.get(0),
+        )?;
     Ok(rank.and_then(Action::from_rank).unwrap_or(Action::Record))
 }
 
@@ -1410,16 +1526,16 @@ fn insert_intent(
 
 /// SQL condition on outbox row `b`: no earlier intent of the same lifecycle is still
 /// pending or in flight at the same destination. Occurrence intents follow their
-/// occurrence; coverage intents, which have no occurrence, follow their source.
-/// Ordering is per destination, so an unavailable channel never holds back
-/// another destination's escalation or recovery.
+/// occurrence; coverage intents, which have no occurrence, follow their source, and
+/// summaries follow earlier summaries. Ordering is per destination, so an
+/// unavailable channel never holds back another destination's escalation or recovery.
 macro_rules! no_open_predecessor {
     () => {
         "AND NOT EXISTS (SELECT 1 FROM outbox e WHERE e.occurrence_id = b.occurrence_id
             AND e.destination = b.destination
             AND e.id < b.id AND e.state IN ('pending', 'in_flight'))
-         AND NOT (b.kind = 'coverage' AND EXISTS (SELECT 1 FROM outbox e
-            WHERE e.kind = 'coverage' AND e.source = b.source
+         AND NOT (b.kind IN ('coverage', 'summary') AND EXISTS (SELECT 1 FROM outbox e
+            WHERE e.kind = b.kind AND e.source = b.source
             AND e.destination = b.destination
             AND e.id < b.id AND e.state IN ('pending', 'in_flight')))"
     };
@@ -1509,8 +1625,10 @@ fn claim_transaction(
                 continue;
             }
         }
+        // A summary is a complete message of its own, never mixed with alert lines.
+        let alone = candidate.kind == "summary";
         let length = candidate.content.chars().count() + 1;
-        if !batch.ids.is_empty() && used + length > limits.budget_chars {
+        if !batch.ids.is_empty() && (alone || used + length > limits.budget_chars) {
             break;
         }
         used += length;
@@ -1519,6 +1637,9 @@ fn claim_transaction(
         batch.max_failures = batch.max_failures.max(candidate.failures);
         batch.ids.push(candidate.id);
         batch.lines.push(candidate.content);
+        if alone {
+            break;
+        }
     }
     if batch.ids.is_empty() {
         // Rows waiting behind an earlier send of their occurrence are not claimable,
@@ -1560,7 +1681,7 @@ fn complete_transaction(
     completion: &Completion,
     max_attempts: u32,
     now: i64,
-) -> Result<(), StoreError> {
+) -> Result<Finished, StoreError> {
     // Nothing reached the recipients, so the provisional mention is handed back
     // unless a later claim has already replaced it.
     let definitely_undelivered = matches!(
@@ -1582,6 +1703,21 @@ fn complete_transaction(
         )?;
     }
     let ids = serde_json::to_string(ids)?;
+    let mut finished = Finished::default();
+    // Applies an update ending in `RETURNING state` and counts the rows it ended.
+    let mut update = |sql: &str, values: &[&dyn rusqlite::ToSql]| -> Result<(), StoreError> {
+        let mut statement = transaction.prepare_cached(sql)?;
+        let mut rows = statement.query(values)?;
+        while let Some(row) = rows.next()? {
+            match row.get::<_, String>(0)?.as_str() {
+                "sent" => finished.sent += 1,
+                "failed" => finished.failed += 1,
+                "ambiguous" => finished.ambiguous += 1,
+                _ => {}
+            }
+        }
+        Ok(())
+    };
     let set_destination = |column: &str, value: i64| {
         transaction.execute(
             &format!(
@@ -1593,10 +1729,11 @@ fn complete_transaction(
     };
     match completion {
         Completion::Sent { remote_id, status } => {
-            transaction.execute(
+            update(
                 "UPDATE outbox SET state = 'sent', remote_id = ?2, last_status = ?3,
                     last_error = NULL, completed_at = ?4
-                 WHERE id IN (SELECT value FROM json_each(?1)) AND state = 'in_flight'",
+                 WHERE id IN (SELECT value FROM json_each(?1)) AND state = 'in_flight'
+                 RETURNING state",
                 params![ids, remote_id, status, now],
             )?;
         }
@@ -1606,14 +1743,15 @@ fn complete_transaction(
             global,
         } => {
             // Throttling is bounded separately so a persistent 429 cannot retry forever.
-            transaction.execute(
+            update(
                 "UPDATE outbox SET throttled = throttled + 1, last_status = ?2,
                     last_error = 'rate_limited', due_at = ?3,
                     state = CASE WHEN attempts >= ?4 * 10
                         THEN CASE WHEN possibly_delivered = 1 THEN 'ambiguous' ELSE 'failed' END
                         ELSE 'pending' END,
                     completed_at = CASE WHEN attempts >= ?4 * 10 THEN ?5 END
-                 WHERE id IN (SELECT value FROM json_each(?1)) AND state = 'in_flight'",
+                 WHERE id IN (SELECT value FROM json_each(?1)) AND state = 'in_flight'
+                 RETURNING state",
                 params![ids, status, retry_at, max_attempts, now],
             )?;
             if *global {
@@ -1635,27 +1773,29 @@ fn complete_transaction(
             error,
             ambiguous,
         } => {
-            transaction.execute(
+            update(
                 "UPDATE outbox SET possibly_delivered = possibly_delivered | ?5,
                     last_status = ?2, last_error = ?3, due_at = ?4,
                     state = CASE WHEN attempts - throttled >= ?6
                         THEN CASE WHEN possibly_delivered | ?5 THEN 'ambiguous' ELSE 'failed' END
                         ELSE 'pending' END,
                     completed_at = CASE WHEN attempts - throttled >= ?6 THEN ?7 END
-                 WHERE id IN (SELECT value FROM json_each(?1)) AND state = 'in_flight'",
+                 WHERE id IN (SELECT value FROM json_each(?1)) AND state = 'in_flight'
+                 RETURNING state",
                 params![ids, status, error, retry_at, ambiguous, max_attempts, now],
             )?;
         }
         Completion::Permanent { status, error } => {
-            transaction.execute(
+            update(
                 "UPDATE outbox SET last_status = ?2, last_error = ?3, completed_at = ?4,
                     state = CASE WHEN possibly_delivered = 1 THEN 'ambiguous' ELSE 'failed' END
-                 WHERE id IN (SELECT value FROM json_each(?1)) AND state = 'in_flight'",
+                 WHERE id IN (SELECT value FROM json_each(?1)) AND state = 'in_flight'
+                 RETURNING state",
                 params![ids, status, error, now],
             )?;
         }
     }
-    Ok(())
+    Ok(finished)
 }
 
 fn coverage_transaction(
@@ -1671,7 +1811,7 @@ fn coverage_transaction(
             // configuration so nothing keeps advertising them. No notice is sent.
             let cleared = transaction.execute(
                 "UPDATE source_status SET last_heartbeat_at = NULL, heartbeat_alertname = NULL,
-                    coverage = 'unknown', coverage_changed_at = ?2
+                    unobserved_since = NULL, coverage = 'unknown', coverage_changed_at = ?2
                  WHERE source = ?1 AND (last_heartbeat_at IS NOT NULL
                     OR heartbeat_alertname IS NOT NULL OR coverage != 'unknown')",
                 params![source_id, now],
@@ -1686,28 +1826,15 @@ fn coverage_transaction(
             continue;
         };
         let stale_after = i64::try_from(heartbeat.stale_after.as_millis()).unwrap_or(i64::MAX);
-        let (mut last, mut previous, identity): (Option<i64>, String, Option<String>) = transaction
+        let (mut last, mut previous): (Option<i64>, String) = transaction
             .query_row(
-                "SELECT last_heartbeat_at, coverage, heartbeat_alertname
-                     FROM source_status WHERE source = ?1",
+                "SELECT last_heartbeat_at, coverage FROM source_status WHERE source = ?1",
                 [source_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?
-            .unwrap_or((None, "unknown".to_owned(), None));
-        // Freshness and coverage recorded for another (or an unrecorded) heartbeat
-        // alertname say nothing about the configured one: discard them and start
-        // the configured heartbeat's startup grace.
-        if identity.as_deref() != Some(heartbeat.alertname.as_str()) {
-            transaction.execute(
-                "INSERT INTO source_status(source, coverage, coverage_changed_at,
-                    heartbeat_alertname) VALUES (?1, 'unknown', ?2, ?3)
-                 ON CONFLICT(source) DO UPDATE SET last_heartbeat_at = NULL,
-                    coverage = 'unknown', heartbeat_alertname = excluded.heartbeat_alertname,
-                    coverage_changed_at = CASE WHEN coverage = 'unknown'
-                        THEN coverage_changed_at ELSE excluded.coverage_changed_at END",
-                params![source_id, now, heartbeat.alertname],
-            )?;
+            .unwrap_or((None, "unknown".to_owned()));
+        if watch_heartbeat(transaction, source_id, heartbeat, now)? {
             if previous != "unknown" {
                 changes.push(CoverageChange {
                     source: source_id.clone(),
@@ -1769,6 +1896,127 @@ fn coverage_transaction(
     Ok(changes)
 }
 
+/// When a heartbeat that has never been received became overdue.
+enum FirstDue {
+    At(i64),
+    /// Watched since before Criers recorded when; only a database upgraded from
+    /// schema 3 that never received the heartbeat lacks the start of monitoring.
+    Unknown,
+}
+
+/// Starts watching the configured heartbeat unless its alertname is already the
+/// one watched. Freshness and coverage recorded for another (or no) alertname say
+/// nothing about it, so they are discarded and its startup grace begins at `now`.
+///
+/// The coverage tick and summary generation both call this before reading
+/// heartbeat state, so the first of them to run after a configuration change
+/// starts the watch and their order never changes what either reports.
+fn watch_heartbeat(
+    transaction: &Transaction<'_>,
+    source: &str,
+    heartbeat: &Heartbeat,
+    now: i64,
+) -> Result<bool, StoreError> {
+    let identity: Option<String> = transaction
+        .prepare_cached("SELECT heartbeat_alertname FROM source_status WHERE source = ?1")?
+        .query_row([source], |row| row.get(0))
+        .optional()?
+        .flatten();
+    if identity.as_deref() == Some(heartbeat.alertname.as_str()) {
+        return Ok(false);
+    }
+    transaction
+        .prepare_cached(
+            "INSERT INTO source_status(source, coverage, coverage_changed_at,
+                heartbeat_alertname, unobserved_since) VALUES (?1, 'unknown', ?2, ?3, ?2)
+             ON CONFLICT(source) DO UPDATE SET last_heartbeat_at = NULL,
+                coverage = 'unknown', heartbeat_alertname = excluded.heartbeat_alertname,
+                unobserved_since = excluded.unobserved_since,
+                coverage_changed_at = CASE WHEN coverage = 'unknown'
+                    THEN coverage_changed_at ELSE excluded.coverage_changed_at END",
+        )?
+        .execute(params![source, now, heartbeat.alertname])?;
+    Ok(true)
+}
+
+/// A source's stored heartbeat freshness.
+struct HeartbeatStatus {
+    last_heartbeat_at: Option<i64>,
+    alertname: Option<String>,
+    /// When monitoring of the configured heartbeat began, while none of it has
+    /// been received yet. Later coverage evaluations never move it.
+    unobserved_since: Option<i64>,
+}
+
+impl HeartbeatStatus {
+    fn read(transaction: &Transaction<'_>, source: &str) -> Result<Option<Self>, StoreError> {
+        Ok(transaction
+            .prepare_cached(
+                "SELECT last_heartbeat_at, heartbeat_alertname, unobserved_since
+                 FROM source_status WHERE source = ?1",
+            )?
+            .query_row([source], |row| {
+                Ok(Self {
+                    last_heartbeat_at: row.get(0)?,
+                    alertname: row.get(1)?,
+                    unobserved_since: row.get(2)?,
+                })
+            })
+            .optional()?)
+    }
+
+    /// The latest heartbeat, if it belongs to the configured alertname.
+    fn last_for(&self, heartbeat: &Heartbeat) -> Option<i64> {
+        self.last_heartbeat_at.filter(|_| self.watches(heartbeat))
+    }
+
+    /// When the configured heartbeat became overdue without ever arriving: the
+    /// end of its startup grace after monitoring began, if that is known.
+    fn first_due_for(&self, heartbeat: &Heartbeat, stale_after: i64) -> Option<FirstDue> {
+        (self.watches(heartbeat) && self.last_heartbeat_at.is_none()).then(|| {
+            self.unobserved_since
+                .map_or(FirstDue::Unknown, |since| FirstDue::At(since + stale_after))
+        })
+    }
+
+    fn watches(&self, heartbeat: &Heartbeat) -> bool {
+        self.alertname.as_deref() == Some(heartbeat.alertname.as_str())
+    }
+}
+
+/// Records the period without heartbeats that a heartbeat arriving at `now` ends.
+///
+/// Gaps are derived from heartbeat arrival times, so a gap is recorded even when
+/// Criers was down for all of it and never evaluated coverage meanwhile. Only a
+/// previous heartbeat of the configured alertname counts; for the first one, the
+/// gap starts when the startup grace after monitoring began ran out, or has no
+/// known start (stored as NULL) when that was never recorded.
+fn record_heartbeat_gap(
+    transaction: &Transaction<'_>,
+    source: &str,
+    heartbeat: &Heartbeat,
+    now: i64,
+) -> Result<(), StoreError> {
+    let stale_after = i64::try_from(heartbeat.stale_after.as_millis()).unwrap_or(i64::MAX);
+    let gap = HeartbeatStatus::read(transaction, source)?.and_then(|status| {
+        match status.last_for(heartbeat) {
+            Some(last) => (now - last > stale_after).then_some(Some(last + stale_after)),
+            None => match status.first_due_for(heartbeat, stale_after)? {
+                FirstDue::At(due) => (now > due).then_some(Some(due)),
+                FirstDue::Unknown => Some(None),
+            },
+        }
+    });
+    if let Some(started) = gap {
+        transaction
+            .prepare_cached(
+                "INSERT INTO heartbeat_gaps(source, started_at, ended_at) VALUES (?1, ?2, ?3)",
+            )?
+            .execute(params![source, started, now])?;
+    }
+    Ok(())
+}
+
 fn stats(connection: &Connection, page_size: i64, max_pages: i64) -> Result<Stats, StoreError> {
     let (pages, free): (i64, i64) = connection.query_row(
         "SELECT (SELECT page_count FROM pragma_page_count()),
@@ -1807,9 +2055,21 @@ fn stats(connection: &Connection, page_size: i64, max_pages: i64) -> Result<Stat
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
+    // Rows without an outbox intent only mark where reporting started.
+    let summary_generated = connection
+        .prepare_cached("SELECT max(window_end) FROM summaries WHERE outbox_id IS NOT NULL")?
+        .query_row([], |row| row.get(0))?;
+    let summary_delivered = connection
+        .prepare_cached(
+            "SELECT max(s.window_end) FROM summaries s JOIN outbox o ON o.id = s.outbox_id
+             WHERE o.state = 'sent'",
+        )?
+        .query_row([], |row| row.get(0))?;
     Ok(Stats {
         used_bytes: (pages - free) * page_size,
         limit_bytes: max_pages * page_size,
+        summary_generated,
+        summary_delivered,
         pending,
         assessment_queue,
         sources,

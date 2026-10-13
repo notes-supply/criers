@@ -55,8 +55,8 @@ pub enum PolicyError {
     /// A floor names a severity without a mapping.
     #[error("critical floor severity {0:?} has no [policy.severity] mapping")]
     UnmappedFloor(String),
-    /// A floor would record without notifying.
-    #[error("critical floor severity {0:?} must map to quiet_post or ping, not record")]
+    /// A floor would record or wait for a summary instead of notifying now.
+    #[error("critical floor severity {0:?} must map to quiet_post or ping, not record or digest")]
     SilentFloor(String),
 }
 
@@ -114,8 +114,10 @@ impl Policy {
         for floor in &floors {
             match severities.get(floor) {
                 None => return Err(PolicyError::UnmappedFloor(floor.clone())),
-                Some(Action::Record) => return Err(PolicyError::SilentFloor(floor.clone())),
-                Some(Action::QuietPost | Action::Ping) => {}
+                Some(action) if !action.is_immediate() => {
+                    return Err(PolicyError::SilentFloor(floor.clone()));
+                }
+                Some(_) => {}
             }
         }
         Ok(Self {
@@ -157,7 +159,16 @@ impl Policy {
 
     /// Whether any outcome of this policy can request a mention.
     pub fn can_ping(&self) -> bool {
-        self.unknown == Action::Ping || self.severities.values().any(|&a| a == Action::Ping)
+        self.can_propose(Action::Ping)
+    }
+
+    /// Whether any outcome of this policy defers to the scheduled summary.
+    pub fn can_digest(&self) -> bool {
+        self.can_propose(Action::Digest)
+    }
+
+    fn can_propose(&self, action: Action) -> bool {
+        self.unknown == action || self.severities.values().any(|&a| a == action)
     }
 
     /// Canonical text form used to fingerprint the policy for decision provenance.
@@ -221,6 +232,17 @@ mod tests {
         )
         .unwrap();
         assert_ne!(joined.canonical(), split.canonical());
+    }
+
+    #[test]
+    fn a_floor_cannot_wait_for_the_summary() {
+        let error = Policy::new(
+            BTreeMap::from([("critical".to_owned(), Action::Digest)]),
+            Action::Ping,
+            BTreeSet::from(["critical".to_owned()]),
+        )
+        .unwrap_err();
+        assert_eq!(error, PolicyError::SilentFloor("critical".to_owned()));
     }
 
     #[test]

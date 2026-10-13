@@ -459,7 +459,16 @@ async fn open_deliveries_for_removed_destinations_are_ended() {
         .await
         .unwrap();
     let state: String = harness.query("SELECT state FROM outbox").await;
-    assert_eq!((abandoned, state.as_str()), (1, "failed"));
+    assert_eq!(
+        (abandoned, state.as_str()),
+        (
+            vec![super::Ended {
+                destination: "quiet".to_owned(),
+                state: "failed"
+            }],
+            "failed"
+        )
+    );
 }
 
 fn sent() -> super::Completion {
@@ -891,12 +900,12 @@ async fn recovery_for_a_removed_destination_is_terminal_and_does_not_pin_retenti
         .await
         .unwrap();
     assert!(
-        abandoned == 0
+        abandoned.is_empty()
             && recovery == "quiet:failed:destination_not_configured"
             && matches!(claim, Claim::Wait(None))
             && early.occurrences == 0
             && later.occurrences == 1,
-        "abandoned={abandoned} recovery={recovery} claim={claim:?} early={early:?} later={later:?}"
+        "abandoned={abandoned:?} recovery={recovery} claim={claim:?} early={early:?} later={later:?}"
     );
 }
 
@@ -1666,4 +1675,129 @@ async fn reconciled_heartbeat_removes_the_exported_heartbeat_age() {
         .lines()
         .any(|line| line == r#"criers_source_coverage{source="example",state="unknown"} 1"#);
     assert_eq!((before, after, coverage_unknown), (true, false, true));
+}
+
+#[tokio::test]
+async fn schema_3_upgrade_keeps_history_deliveries_and_assessments_and_accepts_summaries() {
+    let directory = tempfile::tempdir().unwrap();
+    let old = directory.path().join("v3.sqlite");
+    let now = crate::now_ms();
+    {
+        let connection = rusqlite::Connection::open(&old).unwrap();
+        connection
+            .execute_batch(include_str!("schema_v3.sql"))
+            .unwrap();
+        // Released ranks: 0 record, 1 quiet_post, 2 ping.
+        connection
+            .execute_batch(&format!(
+                "PRAGMA user_version = 3;
+                 INSERT INTO events(id, source, received_at, receiver, group_key, alerts,
+                    truncated_alerts) VALUES (1, 'example', {now}, 'router', 'g', 3, 0);
+                 INSERT INTO occurrences(id, source, fingerprint, starts_at, status, highest_action,
+                    alertname, severity, labels, summary, first_seen_at, last_seen_at,
+                    observations, closed_at)
+                 VALUES (1, 'example', '1000000000000001', '2026-10-12T10:00:00.000000000Z',
+                        'firing', 2, 'Paged', 'critical', '{{}}', '', {now}, {now}, 1, NULL),
+                    (2, 'example', '1000000000000002', '2026-10-12T10:00:00.000000000Z',
+                        'resolved', 1, 'Posted', 'warning', '{{}}', '', {now}, {now}, 2, {now}),
+                    (3, 'example', '1000000000000003', '2026-10-12T10:00:00.000000000Z',
+                        'firing', 0, 'Recorded', 'info', '{{}}', '', {now}, {now}, 1, NULL);
+                 INSERT INTO decisions(event_id, occurrence_id, action, reason, policy_version,
+                    intent_id)
+                 VALUES (1, 1, 'ping', 'trusted_critical_floor', 'policy-old', 1),
+                    (1, 2, 'quiet_post', 'configured_severity', 'policy-old', 2),
+                    (1, 3, 'record', 'configured_severity', 'policy-old', NULL);
+                 INSERT INTO outbox(id, occurrence_id, source, destination, kind, action, mode,
+                    state, content, created_at, due_at, attempts, possibly_delivered, completed_at)
+                 VALUES (1, 1, 'example', 'ops', 'notify', 'ping', 'live', 'pending', 'page',
+                        {now}, {now}, 1, 1, NULL),
+                    (2, 2, 'example', 'ops', 'notify', 'quiet_post', 'live', 'sent', 'post',
+                        {now}, {now}, 1, 0, {now}),
+                    (3, NULL, 'example', 'ops', 'coverage', 'quiet_post', 'shadow', 'shadow',
+                        'coverage', {now}, {now}, 0, 0, {now});
+                 INSERT INTO assessments(occurrence_id, state, context, context_sha256,
+                    context_fields, policy_version, requested_model, due_at, created_at)
+                 VALUES (1, 'pending', '{{}}', 'sha', '[]', 'v', 'clef-flash', {now}, {now});
+                 INSERT INTO source_status(source, last_event_at, truncated_alerts, coverage,
+                    heartbeat_alertname) VALUES ('example', {now}, 0, 'unknown', NULL);"
+            ))
+            .unwrap();
+    }
+    let harness = Harness::live(DEAD_DISCORD, &summary_at_noon()).await;
+    let crate::tests::Harness {
+        directory: _harness_directory,
+        path,
+        config,
+        store,
+        state,
+    } = harness;
+    drop(state);
+    drop(store);
+    std::fs::copy(&old, &path).unwrap();
+    let store = Store::open(path, config.storage.max_bytes).await.unwrap();
+    let kept: (i64, String, String, String, i64) = store
+        .with_connection(|connection| {
+            Ok(connection.query_row(
+                "SELECT (SELECT user_version FROM pragma_user_version()),
+                    (SELECT group_concat(highest_action, ',') FROM
+                        (SELECT highest_action FROM occurrences ORDER BY id)),
+                    (SELECT group_concat(id || ':' || state || ':' || possibly_delivered, ',') FROM
+                        (SELECT id, state, possibly_delivered FROM outbox ORDER BY id)),
+                    (SELECT group_concat(action, ',') FROM
+                        (SELECT action FROM decisions ORDER BY id)),
+                    (SELECT count(*) FROM assessments WHERE state = 'pending')",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )?)
+        })
+        .await
+        .unwrap();
+    let claim = store
+        .claim_deliveries("ops".into(), crate::now_ms(), LIMITS)
+        .await
+        .unwrap();
+    // The rebuilt outbox accepts summary rows; the released one rejected the kind.
+    store
+        .summary_tick(Arc::clone(&config), crate::now_ms())
+        .await
+        .unwrap();
+    let queued = store
+        .summary_tick(Arc::clone(&config), crate::now_ms() + 86_400_000)
+        .await
+        .unwrap();
+    let Claim::Batch(batch) = claim else {
+        panic!("the pending page was not claimable after the upgrade: {claim:?}");
+    };
+    assert_eq!(
+        (
+            kept,
+            batch.ids,
+            batch.possibly_duplicate,
+            matches!(queued, Some(super::SummaryTick::Queued(_)))
+        ),
+        (
+            (
+                super::SCHEMA_VERSION,
+                "3,2,0".to_owned(),
+                "1:pending:1,2:sent:0,3:shadow:0".to_owned(),
+                "ping,quiet_post,record".to_owned(),
+                1
+            ),
+            vec![1],
+            true,
+            true
+        )
+    );
+}
+
+fn summary_at_noon() -> String {
+    "[summary]\ndestination = \"ops\"\nat = \"12:00\"\n".to_owned()
 }

@@ -21,6 +21,7 @@ mod http_body;
 mod metrics;
 mod render;
 mod store;
+mod summary;
 mod tasks;
 
 #[cfg(test)]
@@ -124,6 +125,13 @@ fn check(path: &Path) -> Result<()> {
                 ))
         );
     }
+    if let Some(summary) = &config.summary {
+        println!(
+            "  summary: daily at {} UTC to destination {}",
+            summary::time_of_day(summary.at),
+            summary.destination
+        );
+    }
     for warning in &config.warnings {
         println!("warning: {warning}");
     }
@@ -179,9 +187,12 @@ async fn serve(path: &Path) -> Result<()> {
             .abandon_unconfigured(config.destinations.keys().cloned().collect())
             .await
             .context("cannot reconcile deliveries for removed destinations")?;
-        if abandoned > 0 {
+        for ended in &abandoned {
+            metrics.delivery_ended(&ended.destination, ended.state, 1);
+        }
+        if !abandoned.is_empty() {
             tracing::warn!(
-                abandoned,
+                abandoned = abandoned.len(),
                 "ended open deliveries for destinations no longer configured"
             );
         }
@@ -232,6 +243,13 @@ async fn serve(path: &Path) -> Result<()> {
         Arc::clone(&credentials),
         Arc::clone(&metrics),
         config.server.credential_reload_interval,
+        cancel.child_token(),
+    ));
+    workers.spawn(tasks::summary(
+        store.clone(),
+        Arc::clone(&config),
+        Arc::clone(&metrics),
+        Arc::clone(&wake),
         cancel.child_token(),
     ));
     for worker in delivery_workers {

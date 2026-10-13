@@ -536,3 +536,234 @@ async fn a_second_process_through_a_symlinked_database_path_is_refused() {
         "second={second_status:?} output={output}"
     );
 }
+
+fn warning(fingerprint: &str) -> Value {
+    let mut value = critical(fingerprint);
+    value["alerts"][0]["labels"] = json!({
+        "alertname": "SyntheticDiskFilling",
+        "severity": "warning",
+        "namespace": "media",
+        "pod": "sonarr-0",
+    });
+    value
+}
+
+async fn wait_for_posts(discord: &MockDiscord, count: usize) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while discord.count() < count && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn digested_warnings_wait_for_the_summary_that_a_restart_catches_up() {
+    let (discord, address) = MockDiscord::start().await;
+    // The current window began about twelve hours ago.
+    let at = (chrono::Utc::now() - chrono::Duration::hours(12)).format("%H:%M");
+    let deployment = Deployment::new(
+        "live",
+        Some(address),
+        &format!(
+            "[summary]\ndestination = \"ops\"\nat = \"{at}\"\n[policy.severity]\n\
+             critical = \"ping\"\nwarning = \"digest\"\ninfo = \"record\"\n"
+        ),
+    );
+    let client = reqwest::Client::new();
+    let mut child = deployment.spawn();
+    deployment.wait_ready(&client).await;
+    let (warning_status, _) = deployment
+        .post(&client, TOKEN, &warning("1000000000000001"))
+        .await;
+    let (critical_status, _) = deployment
+        .post(&client, TOKEN, &critical("2000000000000002"))
+        .await;
+    wait_for_posts(&discord, 1).await;
+    // Wait for a storage probe after the first summary tick.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let posts_before_restart = discord.count();
+    let started_metrics = metrics_text(&client, &deployment).await;
+    let first_exit = terminate(&mut child);
+
+    // Move the recorded history one day back, as if these alerts arrived a day
+    // ago and the window then ended while the process was down. The restarted
+    // process must catch that window up exactly once.
+    rusqlite::Connection::open(deployment.database())
+        .unwrap()
+        .execute_batch(
+            "UPDATE summaries SET window_end = window_end - 86400000,
+                window_start = window_start - 86400000;
+             UPDATE occurrences SET first_seen_at = first_seen_at - 86400000,
+                last_seen_at = last_seen_at - 86400000;
+             UPDATE events SET received_at = received_at - 86400000;",
+        )
+        .unwrap();
+    let mut restarted = deployment.spawn();
+    deployment.wait_ready(&client).await;
+    wait_for_posts(&discord, 2).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let metrics = client
+        .get(format!("http://{}/metrics", deployment.ops))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let second_exit = terminate(&mut restarted);
+    let summaries = count(
+        &deployment.database(),
+        "SELECT count(*) FROM outbox WHERE kind = 'summary' AND state = 'sent'",
+    );
+    let bodies = discord.bodies.lock().unwrap().clone();
+    let page = bodies[0]["content"].as_str().unwrap_or_default();
+    let summary = bodies
+        .get(1)
+        .and_then(|body| body["content"].as_str())
+        .unwrap_or_default();
+    assert!(
+        warning_status == 202
+            && critical_status == 202
+            && posts_before_restart == 1
+            && page.contains("**FIRING** ExampleStorageFailure")
+            && bodies[0]["allowed_mentions"]["users"] == json!(["123456789012345678"])
+            && summary.starts_with("**Summary**")
+            && summary.contains("**Open: 2** (2 new)")
+            && summary.contains("- SyntheticDiskFilling [warning], new: media/sonarr-0")
+            && bodies[1]["allowed_mentions"]["users"] == json!([])
+            && started_metrics.contains("criers_summary_window_end_seconds 0.0")
+            && !started_metrics.contains("criers_summary_cursor_seconds 0.0")
+            && gauge(&metrics, "criers_summary_window_end_seconds") > 0.0
+            && first_exit.success()
+            && second_exit.success()
+            && summaries == 1
+            && discord.count() == 2,
+        "posts={} before={posts_before_restart} summaries={summaries}\n{bodies:#?}\n{}",
+        discord.count(),
+        deployment.log()
+    );
+}
+
+/// Writes a live configuration with the given destinations, each named after
+/// its secret file in `secrets/`.
+fn routed_config(deployment: &Deployment, default: &str, receivers: &str, destinations: &[&str]) {
+    let mut text = format!(
+        r#"mode = "live"
+[server]
+listen = "{}"
+ops_listen = "{}"
+shutdown_grace = "5s"
+[storage]
+path = "data/criers.sqlite"
+health_interval = "1s"
+[delivery]
+backoff_base = "30s"
+backoff_max = "60s"
+[sources.prod]
+credential_files = ["secrets/token"]
+default_destination = "{default}"
+receivers = {{ {receivers} }}
+"#,
+        deployment.ingest, deployment.ops
+    );
+    for destination in destinations {
+        text.push_str(&format!(
+            "[destinations.{destination}]\nkind = \"discord\"\nwebhook_url_file = \"secrets/{destination}\"\n"
+        ));
+    }
+    std::fs::write(&deployment.config, text).unwrap();
+}
+
+async fn metrics_text(client: &reqwest::Client, deployment: &Deployment) -> String {
+    client
+        .get(format!("http://{}/metrics", deployment.ops))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn deliveries_ended_by_removing_a_destination_are_counted_once() {
+    let (discord, address) = MockDiscord::start().await;
+    let deployment = Deployment::new("live", Some(address), "");
+    let secrets = deployment.directory.path().join("secrets");
+    let mock = format!("http://{address}/api/webhooks/123456789012345678/mock");
+    std::fs::write(secrets.join("page"), &mock).unwrap();
+    std::fs::write(secrets.join("current"), &mock).unwrap();
+    // Nothing listens on this port, so its sends stay pending and retrying.
+    std::fs::write(
+        secrets.join("dead"),
+        format!(
+            "http://127.0.0.1:{}/api/webhooks/123456789012345678/x",
+            free_port()
+        ),
+    )
+    .unwrap();
+    let client = reqwest::Client::new();
+
+    // Run 1: X pages through `page` and is sent; Y waits on the unreachable `dead`.
+    routed_config(&deployment, "dead", r#"page = "page""#, &["dead", "page"]);
+    let mut first = deployment.spawn();
+    deployment.wait_ready(&client).await;
+    let mut paged = critical("1000000000000001");
+    paged["receiver"] = json!("page");
+    deployment.post(&client, TOKEN, &paged).await;
+    deployment
+        .post(&client, TOKEN, &critical("2000000000000002"))
+        .await;
+    wait_for_posts(&discord, 1).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let first_exit = terminate(&mut first);
+
+    // Run 2: both destinations were removed. Startup ends Y; resolving X ends its
+    // recovery to `page` at once.
+    routed_config(&deployment, "current", "", &["current"]);
+    let mut second = deployment.spawn();
+    deployment.wait_ready(&client).await;
+    let mut resolved = paged.clone();
+    resolved["alerts"][0]["status"] = json!("resolved");
+    let (resolved_status, _) = deployment.post(&client, TOKEN, &resolved).await;
+    let second_metrics = metrics_text(&client, &deployment).await;
+    let second_exit = terminate(&mut second);
+
+    // Run 3: the same configuration again ends nothing new.
+    let mut third = deployment.spawn();
+    deployment.wait_ready(&client).await;
+    let third_metrics = metrics_text(&client, &deployment).await;
+    let third_exit = terminate(&mut third);
+
+    let failed = |metrics: &str, destination: &str| {
+        metrics.contains(&format!(
+            r#"criers_deliveries_finished_total{{destination="{destination}",state="failed"}} 1"#
+        ))
+    };
+    let terminal = count(
+        &deployment.database(),
+        "SELECT count(*) FROM outbox WHERE state = 'failed'
+         AND last_error = 'destination_not_configured'",
+    );
+    assert!(
+        first_exit.success()
+            && second_exit.success()
+            && third_exit.success()
+            && resolved_status == 202
+            && failed(&second_metrics, "dead")
+            && failed(&second_metrics, "page")
+            && !third_metrics.contains("criers_deliveries_finished_total{")
+            && terminal == 2
+            && discord.count() == 1,
+        "terminal={terminal} posts={}\n{second_metrics}\n{}",
+        discord.count(),
+        deployment.log()
+    );
+}
+
+fn gauge(metrics: &str, name: &str) -> f64 {
+    metrics
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("{name} ")))
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(f64::NAN)
+}
