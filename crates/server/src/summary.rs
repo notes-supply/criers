@@ -19,9 +19,11 @@ pub(crate) const DAY_MS: i64 = 86_400_000;
 /// prefix is reserved, so a summary is never split or rejected for length.
 pub(crate) const MAX_CHARS: usize = 1500;
 
-/// Group lines shown per section before the rest is folded into one line.
-const MAX_GROUP_LINES: usize = 12;
-/// Coverage gap and truncation lines shown before the rest is folded.
+/// Groups listed per section; the store reads no more than this many.
+pub(crate) const MAX_GROUP_LINES: usize = 12;
+/// Closed heartbeat gaps listed per source before they are summarized.
+pub(crate) const MAX_GAP_LINES: usize = 3;
+/// Coverage lines for sources and truncation shown before the rest is folded.
 const MAX_COVERAGE_LINES: usize = 5;
 /// A report generated this long after its window ended is marked delayed.
 const DELAYED_AFTER_MS: i64 = 15 * 60_000;
@@ -63,30 +65,52 @@ pub(crate) struct Group {
     pub source: String,
     pub alertname: String,
     pub severity: Option<String>,
-    /// Highest action rank among the group's occurrences; orders the section.
-    pub rank: u8,
     pub count: u64,
     /// Occurrences that started inside the window.
     pub new: u64,
-    /// Distinct example resources, newest first.
+    /// Up to two distinct example resources.
     pub contexts: Vec<String>,
     /// The summary annotation, shown only for a single occurrence.
     pub summary: Option<String>,
 }
 
-/// A period without fresh heartbeats, clipped to the window.
-#[derive(Debug, Eq, PartialEq)]
-pub(crate) struct Gap {
-    pub source: String,
-    /// `stale` or `never_seen`.
-    pub state: String,
-    pub from: i64,
-    /// `None` while the gap was still open at the window end.
-    pub until: Option<i64>,
+/// One section's totals and its most important groups.
+///
+/// Totals cover every occurrence and group in the section; `groups` holds at
+/// most [`MAX_GROUP_LINES`], already in display order. The rest is folded into
+/// one counted line, so totals always equal what the lines account for.
+#[derive(Debug, Default, Eq, PartialEq)]
+pub(crate) struct Section {
+    pub total: u64,
+    pub new: u64,
+    pub group_count: u64,
+    pub groups: Vec<Group>,
 }
 
-/// Everything one summary reports. Section totals are derived from the groups,
-/// so a header can never disagree with the lines beneath it.
+/// Heartbeat coverage of one source inside the window.
+#[derive(Debug, Default, Eq, PartialEq)]
+pub(crate) struct Coverage {
+    pub source: String,
+    /// The earliest closed gaps, as start and end, at most [`MAX_GAP_LINES`].
+    pub gaps: Vec<(i64, i64)>,
+    /// Closed gaps counted; if `capped`, there are more than this.
+    pub gap_count: u64,
+    pub capped: bool,
+    /// Time without heartbeats inside the window across the counted gaps.
+    pub gap_ms: i64,
+    /// A gap still open at the window end.
+    pub ongoing: Option<Ongoing>,
+}
+
+/// A heartbeat gap open at the window end.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Ongoing {
+    pub since: i64,
+    /// Whether any heartbeat of the configured alertname was ever received.
+    pub recorded: bool,
+}
+
+/// Everything one summary reports.
 #[derive(Debug, Default)]
 pub(crate) struct Report {
     pub start: i64,
@@ -95,10 +119,11 @@ pub(crate) struct Report {
     /// Whether to name sources; unnecessary with a single configured source.
     pub show_source: bool,
     /// Firing at the window end, including occurrences resolved later.
-    pub open: Vec<Group>,
+    pub open: Section,
     /// Resolved inside the window. Superseded occurrences are not resolutions.
-    pub resolved: Vec<Group>,
-    pub gaps: Vec<Gap>,
+    pub resolved: Section,
+    /// Sources with a heartbeat gap in the window; healthy sources are omitted.
+    pub coverage: Vec<Coverage>,
     /// Alerts Alertmanager reported as omitted, per source.
     pub truncated: Vec<(String, u64)>,
     /// Live notifications that ended failed inside the window.
@@ -169,35 +194,46 @@ impl Report {
     }
 
     fn coverage_lines(&self) -> Vec<String> {
-        let mut lines: Vec<String> = self
-            .gaps
-            .iter()
-            .take(MAX_COVERAGE_LINES)
-            .map(|gap| {
-                let what = if gap.state == "never_seen" {
-                    "no heartbeat since startup"
-                } else {
+        let mut lines = Vec::new();
+        for coverage in self.coverage.iter().take(MAX_COVERAGE_LINES) {
+            let source = &coverage.source;
+            if coverage.capped || coverage.gap_count > MAX_GAP_LINES as u64 {
+                let at_least = if coverage.capped { "at least " } else { "" };
+                let first = coverage.gaps.first().map_or_else(String::new, |(from, _)| {
+                    format!(", first {}", timestamp(*from, "%m-%d %H:%M"))
+                });
+                lines.push(format!(
+                    "- {source}: {at_least}{} heartbeat gaps, {at_least}{} without \
+                     heartbeats{first}",
+                    coverage.gap_count,
+                    minutes(coverage.gap_ms)
+                ));
+            } else {
+                lines.extend(coverage.gaps.iter().map(|(from, until)| {
+                    format!(
+                        "- {source}: no heartbeat {} to {} ({})",
+                        timestamp(*from, "%m-%d %H:%M"),
+                        timestamp(*until, "%H:%M"),
+                        minutes(until - from)
+                    )
+                }));
+            }
+            if let Some(ongoing) = coverage.ongoing {
+                let what = if ongoing.recorded {
                     "heartbeat stale"
+                } else {
+                    "no heartbeat recorded"
                 };
-                let span = match gap.until {
-                    Some(until) => format!(
-                        "{} to {} ({})",
-                        timestamp(gap.from, "%m-%d %H:%M"),
-                        timestamp(until, "%H:%M"),
-                        minutes(until - gap.from)
-                    ),
-                    None => format!(
-                        "since {}, ongoing at window end",
-                        timestamp(gap.from, "%m-%d %H:%M")
-                    ),
-                };
-                format!("- {}: {what} {span}", gap.source)
-            })
-            .collect();
-        if self.gaps.len() > MAX_COVERAGE_LINES {
+                lines.push(format!(
+                    "- {source}: {what} since {}, ongoing at window end",
+                    timestamp(ongoing.since, "%m-%d %H:%M")
+                ));
+            }
+        }
+        if self.coverage.len() > MAX_COVERAGE_LINES {
             lines.push(format!(
-                "- +{} more heartbeat gaps",
-                self.gaps.len() - MAX_COVERAGE_LINES
+                "- +{} more sources with heartbeat gaps",
+                self.coverage.len() - MAX_COVERAGE_LINES
             ));
         }
         lines.extend(
@@ -227,36 +263,28 @@ impl Report {
 fn section(
     lines: &mut Vec<String>,
     title: &str,
-    groups: &[Group],
+    section: &Section,
     limit: usize,
     mark_new: bool,
     show_source: bool,
 ) {
-    let total: u64 = groups.iter().map(|group| group.count).sum();
-    let new: u64 = groups.iter().map(|group| group.new).sum();
-    lines.push(if mark_new && new > 0 {
-        format!("**{title}: {total}** ({new} new)")
+    lines.push(if mark_new && section.new > 0 {
+        format!("**{title}: {}** ({} new)", section.total, section.new)
     } else {
-        format!("**{title}: {total}**")
+        format!("**{title}: {}**", section.total)
     });
-    let mut ordered: Vec<&Group> = groups.iter().collect();
-    ordered.sort_by(|a, b| {
-        (b.rank, b.count).cmp(&(a.rank, a.count)).then_with(|| {
-            (&a.alertname, &a.severity, &a.source).cmp(&(&b.alertname, &b.severity, &b.source))
-        })
-    });
+    let shown = &section.groups[..limit.min(section.groups.len())];
     lines.extend(
-        ordered
+        shown
             .iter()
-            .take(limit)
             .map(|group| group_line(group, mark_new, show_source)),
     );
-    if ordered.len() > limit {
-        let rest = &ordered[limit..];
-        let alerts: u64 = rest.iter().map(|group| group.count).sum();
+    let more_groups = section.group_count.saturating_sub(shown.len() as u64);
+    if more_groups > 0 {
+        let shown_alerts: u64 = shown.iter().map(|group| group.count).sum();
         lines.push(format!(
-            "- +{} more alert names ({alerts} alerts)",
-            rest.len()
+            "- +{more_groups} more alert names ({} alerts)",
+            section.total.saturating_sub(shown_alerts)
         ));
     }
 }
@@ -325,7 +353,6 @@ mod tests {
             source: "apollo".to_owned(),
             alertname: alertname.to_owned(),
             severity: Some("warning".to_owned()),
-            rank: 1,
             count,
             new,
             contexts: vec!["media/sonarr".to_owned()],
@@ -361,35 +388,20 @@ mod tests {
     }
 
     #[test]
-    fn section_totals_match_the_lines_and_the_folded_remainder() {
+    fn listed_groups_and_the_folded_line_add_up_to_the_section_totals() {
         let mut report = report();
-        report.open = (0..40)
-            .map(|index| group(&format!("Alert{index:02}"), 3, 1))
-            .collect();
+        report.open = Section {
+            total: 4_998,
+            new: 40,
+            group_count: 4_000,
+            groups: (0..MAX_GROUP_LINES)
+                .map(|index| group(&format!("Alert{index:02}"), 3, 1))
+                .collect(),
+        };
         let text = report.render();
-        let shown: u64 = text
-            .lines()
-            .filter(|line| line.starts_with("- Alert"))
-            .map(|line| {
-                line.split(" x")
-                    .nth(1)
-                    .and_then(|rest| rest.split(',').next())
-                    .unwrap()
-                    .parse::<u64>()
-                    .unwrap()
-            })
-            .sum();
-        let folded: u64 = text
-            .lines()
-            .find_map(|line| line.strip_prefix("- +"))
-            .and_then(|line| line.split('(').nth(1))
-            .and_then(|count| count.split(' ').next())
-            .unwrap()
-            .parse()
-            .unwrap();
-        assert_eq!(
-            (text.contains("**Open: 120** (40 new)"), shown + folded),
-            (true, 120),
+        assert!(
+            text.contains("**Open: 4998** (40 new)")
+                && text.contains("- +3988 more alert names (4962 alerts)"),
             "{text}"
         );
     }
@@ -398,18 +410,34 @@ mod tests {
     fn huge_reports_fit_one_message() {
         let mut report = report();
         let long = "N".repeat(500);
-        report.open = (0..5000)
-            .map(|index| group(&format!("{long}{index}"), 1, 1))
-            .collect();
-        report.resolved = (0..5000)
-            .map(|index| group(&format!("{long}{index}"), 2, 0))
-            .collect();
-        report.gaps = (0..100)
-            .map(|index| Gap {
-                source: "apollo".to_owned(),
-                state: "stale".to_owned(),
-                from: SIX - DAY_MS + index * 60_000,
-                until: Some(SIX - DAY_MS + index * 60_000 + 30_000),
+        let groups = |count| {
+            (0..MAX_GROUP_LINES)
+                .map(|index| group(&format!("{long}{index}"), count, 1))
+                .collect()
+        };
+        report.open = Section {
+            total: 5000,
+            new: 5000,
+            group_count: 5000,
+            groups: groups(1),
+        };
+        report.resolved = Section {
+            total: 10_000,
+            new: 0,
+            group_count: 5000,
+            groups: groups(2),
+        };
+        report.coverage = (0..100)
+            .map(|index| Coverage {
+                source: format!("source{index}"),
+                gaps: vec![(SIX - DAY_MS, SIX - DAY_MS + 60_000); MAX_GAP_LINES],
+                gap_count: 10_000,
+                capped: true,
+                gap_ms: 20 * HOUR,
+                ongoing: Some(Ongoing {
+                    since: SIX - HOUR,
+                    recorded: true,
+                }),
             })
             .collect();
         report.truncated = (0..50).map(|index| (format!("source{index}"), 7)).collect();
@@ -428,7 +456,12 @@ mod tests {
         let mut hostile = group("@everyone", 1, 1);
         hostile.contexts = vec!["<@123456789012345678>".to_owned()];
         hostile.summary = Some("[click](https://example.invalid) @here".to_owned());
-        report.open = vec![hostile];
+        report.open = Section {
+            total: 1,
+            new: 1,
+            group_count: 1,
+            groups: vec![hostile],
+        };
         let text = report.render();
         assert!(
             !text.contains("@everyone")
@@ -442,7 +475,12 @@ mod tests {
     #[test]
     fn resolved_occurrences_are_never_counted_as_open() {
         let mut report = report();
-        report.resolved = vec![group("DiskFull", 2, 2)];
+        report.resolved = Section {
+            total: 2,
+            new: 2,
+            group_count: 1,
+            groups: vec![group("DiskFull", 2, 2)],
+        };
         let text = report.render();
         assert!(
             text.contains("**Open: 0**") && text.contains("**Resolved: 2**"),
@@ -462,20 +500,22 @@ mod tests {
     }
 
     #[test]
-    fn an_ongoing_gap_is_reported_as_ongoing() {
+    fn capped_gap_counts_say_at_least() {
         let mut report = report();
-        report.gaps = vec![Gap {
+        report.coverage = vec![Coverage {
             source: "apollo".to_owned(),
-            state: "stale".to_owned(),
-            from: SIX - 2 * HOUR,
-            until: None,
+            gaps: vec![(SIX - 20 * HOUR, SIX - 20 * HOUR + 60_000)],
+            gap_count: 10_000,
+            capped: true,
+            gap_ms: 10 * HOUR,
+            ongoing: None,
         }];
+        let text = report.render();
         assert!(
-            report
-                .render()
-                .contains("- apollo: heartbeat stale since 10-13 04:00, ongoing at window end"),
-            "{}",
-            report.render()
+            text.contains(
+                "- apollo: at least 10000 heartbeat gaps, at least 10h without heartbeats"
+            ) && !text.contains("ongoing"),
+            "{text}"
         );
     }
 }

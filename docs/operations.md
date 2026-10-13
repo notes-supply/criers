@@ -160,9 +160,13 @@ Criers' own stored history, not from Alertmanager or Prometheus:
 - **Resolved**: occurrences that resolved inside the window. A recovery is
   never counted as open, and an occurrence replaced by a newer start is not a
   resolution.
-- **Coverage gaps**: heartbeat gaps inside the window, alerts Alertmanager
-  omitted (`truncatedAlerts`), and live notifications that failed or may not
-  have arrived.
+- **Coverage gaps**: periods without heartbeats inside the window, alerts
+  Alertmanager omitted (`truncatedAlerts`), and live notifications that failed
+  or may not have arrived. A gap runs from `stale_after` past one heartbeat to
+  the next, so time Criers itself was down counts as a gap; a source with no
+  heartbeat recorded is never shown as healthy. Whether a gap was still open at
+  the window end comes from the latest heartbeat. Up to 10,000 gaps are counted
+  per source; beyond that the report says "at least".
 
 It lists occurrences whose highest action was `digest`, `quiet_post` or `ping`;
 `record` occurrences and heartbeats are not listed. Each section's count equals
@@ -270,8 +274,8 @@ heartbeat alertname a source's freshness belongs to; databases upgraded from
 earlier versions have no record, so their heartbeat coverage returns to the
 startup grace once and recovers on the next heartbeat. Schema 4 rebuilds the
 outbox table with every row and ID kept, renumbers stored action ranks for
-`digest`, and adds coverage history and summary windows; coverage gaps from
-before the upgrade are not in that history.
+`digest`, and adds heartbeat gaps and summary windows; gaps that closed
+before the upgrade are not recorded.
 
 SQLite runs in WAL mode with full synchronous commits. `storage.max_size_mib`
 caps the main database file; the WAL is truncated to 64 MiB after checkpoints,
@@ -281,8 +285,8 @@ Retention runs every `retention_interval`. Each transaction deletes at most
 `retention_batch` decisions, webhook records, closed occurrences, finished
 deliveries and finished assessments; deleting a closed occurrence also removes
 its own few remaining child rows. It removes webhook metadata and decisions
-older than `retention`, and finished deliveries and assessments, coverage
-transitions and summary windows (except the latest) older than that.
+older than `retention`, and finished deliveries and assessments, heartbeat
+gaps and summary windows (except the latest) older than that.
 A resolved or superseded occurrence is removed only once it was closed and last
 seen before the cutoff, its decisions have been drained in bounded batches, and
 every delivery and assessment it owns is finished and older too, so recent

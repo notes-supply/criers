@@ -202,49 +202,37 @@ async fn heartbeats_are_coverage_evidence_not_alerts() {
 }
 
 #[tokio::test]
-async fn heartbeat_gaps_inside_the_window_are_reported_with_their_span() {
+async fn a_heartbeat_ending_a_gap_records_its_span() {
     let harness = Harness::shadow(&format!(
         "{}[sources.example.heartbeat]\nstale_after = \"1m\"\n",
         summary_section()
     ))
     .await;
     let end = start(&harness).await;
-    let now = crate::now_ms();
     harness
         .ingest(alert("Watchdog", "none", "4000000000000001", "firing"))
         .await;
-    let config = Arc::clone(&harness.config);
-    // Healthy now, stale two hours later, healthy again an hour after that.
-    harness
-        .store
-        .coverage_tick(Arc::clone(&config), now, now)
-        .await
-        .unwrap();
-    harness
-        .store
-        .coverage_tick(Arc::clone(&config), now + 2 * HOUR, now)
-        .await
-        .unwrap();
+    // The previous heartbeat arrived two hours ago; this one ends the gap.
+    let before = crate::now_ms() - 2 * HOUR;
     harness
         .store
         .with_connection(move |connection| {
-            connection.execute(
-                "UPDATE source_status SET last_heartbeat_at = ?1",
-                [now + 3 * HOUR],
-            )?;
+            connection.execute("UPDATE source_status SET last_heartbeat_at = ?1", [before])?;
             Ok(())
         })
         .await
         .unwrap();
     harness
-        .store
-        .coverage_tick(Arc::clone(&config), now + 3 * HOUR, now)
-        .await
-        .unwrap();
+        .ingest(alert("Watchdog", "none", "4000000000000001", "firing"))
+        .await;
+    heartbeats_until(&harness, end + DAY_MS - 30_000).await;
     tick(&harness, end + DAY_MS).await;
     let text = summaries(&harness).await.remove(0).1;
+    // Gap durations round up, so 1h 59m and some milliseconds reads 2h.
     assert!(
-        text.contains("- example: heartbeat stale ") && text.contains("(1h)"),
+        text.contains("- example: no heartbeat ")
+            && text.contains("(2h)")
+            && !text.contains("ongoing"),
         "{text}"
     );
 }
@@ -765,28 +753,8 @@ async fn the_largest_mention_prefix_still_leaves_room_for_a_summary() {
 }
 
 #[tokio::test]
-async fn an_ongoing_gap_outlives_retention_of_the_transition_that_began_it() {
-    let harness = Harness::shadow(&format!(
-        "{}[sources.example.heartbeat]\nstale_after = \"1m\"\n",
-        summary_section()
-    ))
-    .await;
-    let end = start(&harness).await;
-    let now = crate::now_ms();
-    harness
-        .ingest(alert("Watchdog", "none", "4000000000000001", "firing"))
-        .await;
-    let config = Arc::clone(&harness.config);
-    harness
-        .store
-        .coverage_tick(Arc::clone(&config), now, now)
-        .await
-        .unwrap();
-    harness
-        .store
-        .coverage_tick(Arc::clone(&config), now + 2 * HOUR, now)
-        .await
-        .unwrap();
+async fn an_ongoing_gap_is_reported_from_heartbeat_freshness_after_retention() {
+    let (harness, end, last) = restarted_after_heartbeat_loss().await;
     tick(&harness, end + DAY_MS).await;
     let removed = harness
         .store
@@ -794,12 +762,14 @@ async fn an_ongoing_gap_outlives_retention_of_the_transition_that_began_it() {
         .await
         .unwrap();
     tick(&harness, end + 2 * DAY_MS).await;
-    // Retention also removed the first, already completed shadow summary.
     let later = summaries(&harness).await.pop().unwrap().1;
+    let onset = chrono::DateTime::from_timestamp_millis(last + 10 * 60_000)
+        .unwrap()
+        .format("%m-%d %H:%M")
+        .to_string();
     assert!(
-        removed.coverage == 2
-            && later.contains("heartbeat stale since")
-            && later.contains("ongoing"),
+        removed.summaries == 1
+            && later.contains(&format!("heartbeat stale since {onset}, ongoing")),
         "removed={removed:?}\n{later}"
     );
 }
@@ -844,5 +814,223 @@ async fn a_sent_summary_is_reported_as_delivered() {
                 .contains(r#"criers_deliveries_finished_total{destination="ops",state="sent"} 1"#),
         "state={state} delivered={:?}\n{metrics}",
         stats.summary_delivered
+    );
+}
+
+/// Stands in for heartbeats continuing every minute until `last`.
+async fn heartbeats_until(harness: &Harness, last: i64) {
+    harness
+        .store
+        .with_connection(move |connection| {
+            connection.execute("UPDATE source_status SET last_heartbeat_at = ?1", [last])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+}
+
+/// A harness whose `example` heartbeat was last received three hours ago, just
+/// before the daemon stopped, then reopened as if it restarted.
+async fn restarted_after_heartbeat_loss() -> (Harness, i64, i64) {
+    let harness = Harness::shadow(&format!(
+        "{}[sources.example.heartbeat]\nstale_after = \"10m\"\n",
+        summary_section()
+    ))
+    .await;
+    let end = start(&harness).await;
+    harness
+        .ingest(alert("Watchdog", "none", "4000000000000001", "firing"))
+        .await;
+    let config = Arc::clone(&harness.config);
+    let now = crate::now_ms();
+    harness
+        .store
+        .coverage_tick(Arc::clone(&config), now, now)
+        .await
+        .unwrap();
+    let last = now - 3 * HOUR;
+    harness
+        .store
+        .with_connection(move |connection| {
+            connection.execute("UPDATE source_status SET last_heartbeat_at = ?1", [last])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let Harness {
+        directory,
+        path,
+        config,
+        store,
+        state,
+    } = harness;
+    drop(state);
+    drop(store);
+    let store = Store::open(path.clone(), config.storage.max_bytes)
+        .await
+        .unwrap();
+    let mut harness = Harness::shadow(&format!(
+        "{}[sources.example.heartbeat]\nstale_after = \"10m\"\n",
+        summary_section()
+    ))
+    .await;
+    harness.directory = directory;
+    harness.path = path;
+    harness.config = config;
+    harness.state.store = store.clone();
+    harness.store = store;
+    (harness, end, last)
+}
+
+#[tokio::test]
+async fn restart_after_the_boundary_before_a_fresh_heartbeat_reports_the_outage() {
+    let (harness, end, last) = restarted_after_heartbeat_loss().await;
+    let after_boundary = end + DAY_MS + 60_000;
+    // First evaluation after the restart happens after the missed window end.
+    harness
+        .store
+        .coverage_tick(Arc::clone(&harness.config), after_boundary, after_boundary)
+        .await
+        .unwrap();
+    tick(&harness, after_boundary).await;
+    let text = summaries(&harness).await.pop().unwrap().1;
+    let onset = chrono::DateTime::from_timestamp_millis(last + 10 * 60_000)
+        .unwrap()
+        .format("%m-%d %H:%M")
+        .to_string();
+    assert!(
+        text.contains(&format!("since {onset}, ongoing at window end")),
+        "expected an outage from {onset}:\n{text}"
+    );
+}
+
+#[tokio::test]
+async fn restart_after_the_boundary_after_a_fresh_heartbeat_reports_the_closed_outage() {
+    let (harness, end, last) = restarted_after_heartbeat_loss().await;
+    // The first thing after the restart is a fresh heartbeat, before any evaluation.
+    harness
+        .ingest(alert("Watchdog", "none", "4000000000000001", "firing"))
+        .await;
+    let now = crate::now_ms();
+    harness
+        .store
+        .coverage_tick(Arc::clone(&harness.config), now, now)
+        .await
+        .unwrap();
+    heartbeats_until(&harness, end + DAY_MS - 30_000).await;
+    tick(&harness, end + DAY_MS + 60_000).await;
+    let text = summaries(&harness).await.pop().unwrap().1;
+    let onset = chrono::DateTime::from_timestamp_millis(last + 10 * 60_000)
+        .unwrap()
+        .format("%m-%d %H:%M")
+        .to_string();
+    assert!(
+        text.contains(&format!("no heartbeat {onset} to ")) && !text.contains("ongoing"),
+        "expected a closed outage from {onset}:\n{text}"
+    );
+}
+
+#[tokio::test]
+async fn counting_stops_at_the_cap_without_hiding_other_sources_or_the_end_state() {
+    let harness = Harness::shadow(&format!(
+        "{}[sources.example.heartbeat]\nstale_after = \"1m\"\n\
+         [sources.other.heartbeat]\nstale_after = \"1m\"\n",
+        summary_section()
+    ))
+    .await;
+    let end = start(&harness).await;
+    harness
+        .ingest(alert("Watchdog", "none", "4000000000000001", "firing"))
+        .await;
+    harness
+        .ingest_as(
+            "other",
+            alert("Watchdog", "none", "4000000000000002", "firing"),
+        )
+        .await;
+    let base = end + HOUR;
+    let cap = crate::store::MAX_GAPS;
+    // One more closed gap for `example` than is counted, all before `other`'s gap.
+    harness
+        .store
+        .with_connection(move |connection| {
+            connection.execute(
+                "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < ?2)
+                 INSERT INTO heartbeat_gaps(source, started_at, ended_at)
+                 SELECT 'example', ?1 + i * 2, ?1 + i * 2 + 1 FROM n",
+                [base, cap],
+            )?;
+            connection.execute(
+                "INSERT INTO heartbeat_gaps(source, started_at, ended_at)
+                 VALUES ('other', ?1, ?1 + 1800000)",
+                [base + 4 * HOUR],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    // Both sources heartbeat again before the window end, so neither gap is open.
+    let fresh = end + DAY_MS - 30_000;
+    harness
+        .store
+        .with_connection(move |connection| {
+            connection.execute("UPDATE source_status SET last_heartbeat_at = ?1", [fresh])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    tick(&harness, end + DAY_MS).await;
+    let text = summaries(&harness).await.remove(0).1;
+    assert!(
+        text.contains(&format!("- example: at least {cap} heartbeat gaps"))
+            && text.contains("- other: no heartbeat ")
+            && text.contains("(30m)")
+            && !text.contains("ongoing"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn thousands_of_alert_names_report_true_totals_from_a_bounded_read() {
+    let harness = Harness::shadow(&summary_section()).await;
+    let end = start(&harness).await;
+    let first_seen = end + HOUR;
+    // 5,000 distinct names over two sources, plus one name with 30 occurrences.
+    harness
+        .store
+        .with_connection(move |connection| {
+            connection.execute(
+                "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < 5029)
+                 INSERT INTO occurrences(source, fingerprint, starts_at, status, highest_action,
+                    alertname, severity, labels, summary, first_seen_at, last_seen_at,
+                    observations, closed_at)
+                 SELECT CASE WHEN i % 2 = 0 THEN 'example' ELSE 'other' END,
+                    printf('%016x', i), '2026-10-12T00:00:00.000000000Z', 'firing',
+                    CASE WHEN i >= 5000 THEN 3 ELSE 1 END,
+                    CASE WHEN i >= 5000 THEN 'Storm' ELSE 'Name' || i END,
+                    'warning', json_object('namespace', 'ns', 'pod', 'pod-' || i), '',
+                    ?1, ?1, 1, NULL
+                 FROM n",
+                [first_seen],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    tick(&harness, end + DAY_MS).await;
+    let text = summaries(&harness).await.remove(0).1;
+    let listed = text
+        .lines()
+        .filter(|line| line.starts_with("- example:") || line.starts_with("- other:"))
+        .count();
+    assert!(
+        text.contains("**Open: 5030** (5030 new)")
+            && text
+                .lines()
+                .nth(2)
+                .is_some_and(|line| line.contains("Storm") && line.contains("x15"))
+            && listed <= crate::summary::MAX_GROUP_LINES
+            && text.contains(&format!("- +{} more alert names", 5002 - listed)),
+        "listed={listed}\n{text}"
     );
 }

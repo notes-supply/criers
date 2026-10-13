@@ -22,12 +22,14 @@ use tokio::sync::OwnedSemaphorePermit;
 
 use crate::{
     assessment::{self, Answers, QUESTIONS_VERSION},
-    config::{Config, Mode, Source},
+    config::{Config, Heartbeat, Mode, Source},
     render::{self, Subject},
 };
 
 mod summary;
 
+#[cfg(test)]
+pub(crate) use summary::MAX_GAPS;
 pub(crate) use summary::SummaryTick;
 
 const SCHEMA_VERSION: i64 = 4;
@@ -248,7 +250,7 @@ pub(crate) struct Retention {
     pub occurrences: usize,
     pub deliveries: usize,
     pub assessments: usize,
-    pub coverage: usize,
+    pub gaps: usize,
     pub summaries: usize,
 }
 
@@ -707,9 +709,10 @@ impl Store {
                          ORDER BY completed_at LIMIT ?2)",
                     params![cutoff, batch],
                 )?,
-                coverage: transaction.execute(
-                    "DELETE FROM coverage_history WHERE id IN
-                        (SELECT id FROM coverage_history WHERE at < ?1 ORDER BY at LIMIT ?2)",
+                gaps: transaction.execute(
+                    "DELETE FROM heartbeat_gaps WHERE id IN
+                        (SELECT id FROM heartbeat_gaps WHERE ended_at < ?1
+                         ORDER BY ended_at LIMIT ?2)",
                     params![cutoff, batch],
                 )?,
                 // The latest window end is the summary cursor and always stays.
@@ -1018,6 +1021,9 @@ fn ingest_transaction(
     } else {
         None
     };
+    if heartbeat_seen && let Some(settings) = &source.heartbeat {
+        record_heartbeat_gap(transaction, source_id, settings, now)?;
+    }
     transaction.execute(
         "INSERT INTO source_status(source, last_event_at, truncated_alerts, last_heartbeat_at,
             heartbeat_alertname)
@@ -1757,13 +1763,6 @@ fn coverage_transaction(
         let Some(heartbeat) = &source.heartbeat else {
             // Monitoring is off: drop freshness and coverage left by an earlier
             // configuration so nothing keeps advertising them. No notice is sent.
-            let previous: Option<String> = transaction
-                .query_row(
-                    "SELECT coverage FROM source_status WHERE source = ?1",
-                    [source_id],
-                    |row| row.get(0),
-                )
-                .optional()?;
             let cleared = transaction.execute(
                 "UPDATE source_status SET last_heartbeat_at = NULL, heartbeat_alertname = NULL,
                     coverage = 'unknown', coverage_changed_at = ?2
@@ -1771,9 +1770,6 @@ fn coverage_transaction(
                     OR heartbeat_alertname IS NOT NULL OR coverage != 'unknown')",
                 params![source_id, now],
             )?;
-            if let Some(previous) = previous.filter(|previous| previous != "unknown") {
-                record_coverage(transaction, source_id, &previous, "unknown", now)?;
-            }
             if cleared > 0 {
                 changes.push(CoverageChange {
                     source: source_id.clone(),
@@ -1807,7 +1803,6 @@ fn coverage_transaction(
                 params![source_id, now, heartbeat.alertname],
             )?;
             if previous != "unknown" {
-                record_coverage(transaction, source_id, &previous, "unknown", now)?;
                 changes.push(CoverageChange {
                     source: source_id.clone(),
                     state: "unknown",
@@ -1832,7 +1827,6 @@ fn coverage_transaction(
                 coverage_changed_at = excluded.coverage_changed_at",
             params![source_id, state, now],
         )?;
-        record_coverage(transaction, source_id, &previous, state, now)?;
         let message = match (previous.as_str(), state) {
             ("stale" | "never_seen", "healthy") => Some(render::coverage_recovered(source_id)),
             (_, "stale") => Some(render::coverage_stale(
@@ -1869,19 +1863,67 @@ fn coverage_transaction(
     Ok(changes)
 }
 
-/// Keeps a coverage transition for summaries of the window it falls in.
-fn record_coverage(
+/// A source's stored heartbeat freshness and coverage.
+struct HeartbeatStatus {
+    last_heartbeat_at: Option<i64>,
+    alertname: Option<String>,
+    coverage: String,
+    changed_at: Option<i64>,
+}
+
+impl HeartbeatStatus {
+    fn read(transaction: &Transaction<'_>, source: &str) -> Result<Option<Self>, StoreError> {
+        Ok(transaction
+            .prepare_cached(
+                "SELECT last_heartbeat_at, heartbeat_alertname, coverage, coverage_changed_at
+                 FROM source_status WHERE source = ?1",
+            )?
+            .query_row([source], |row| {
+                Ok(Self {
+                    last_heartbeat_at: row.get(0)?,
+                    alertname: row.get(1)?,
+                    coverage: row.get(2)?,
+                    changed_at: row.get(3)?,
+                })
+            })
+            .optional()?)
+    }
+
+    /// The latest heartbeat, if it belongs to the configured alertname.
+    fn last_for(&self, heartbeat: &Heartbeat) -> Option<i64> {
+        self.last_heartbeat_at
+            .filter(|_| self.alertname.as_deref() == Some(heartbeat.alertname.as_str()))
+    }
+}
+
+/// Records the period without heartbeats that a heartbeat arriving at `now` ends.
+///
+/// Gaps are derived from heartbeat arrival times, so a gap is recorded even when
+/// Criers was down for all of it and never evaluated coverage meanwhile. Only a
+/// previous heartbeat of the configured alertname counts; without one, a gap is
+/// recorded only once the startup grace had already run out (`never_seen`).
+fn record_heartbeat_gap(
     transaction: &Transaction<'_>,
     source: &str,
-    previous: &str,
-    state: &str,
-    at: i64,
+    heartbeat: &Heartbeat,
+    now: i64,
 ) -> Result<(), StoreError> {
-    transaction
-        .prepare_cached(
-            "INSERT INTO coverage_history(source, previous, state, at) VALUES (?1, ?2, ?3, ?4)",
-        )?
-        .execute(params![source, previous, state, at])?;
+    let stale_after = i64::try_from(heartbeat.stale_after.as_millis()).unwrap_or(i64::MAX);
+    let started = match HeartbeatStatus::read(transaction, source)? {
+        Some(status) => match status.last_for(heartbeat) {
+            Some(last) => (now - last > stale_after).then(|| last + stale_after),
+            None if status.coverage == "never_seen" => status.changed_at,
+            None => None,
+        },
+        None => None,
+    };
+    if let Some(started) = started {
+        transaction
+            .prepare_cached(
+                "INSERT INTO heartbeat_gaps(source, started_at, ended_at) VALUES (?1, ?2, ?3)",
+            )?
+            .execute(params![source, started, now])?;
+    }
     Ok(())
 }
 

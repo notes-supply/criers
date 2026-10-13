@@ -146,7 +146,7 @@ pub(crate) async fn retention(
                 ("occurrences", deleted.occurrences),
                 ("outbox", deleted.deliveries),
                 ("assessments", deleted.assessments),
-                ("coverage_history", deleted.coverage),
+                ("heartbeat_gaps", deleted.gaps),
                 ("summaries", deleted.summaries),
             ] {
                 if count > 0 {
@@ -163,7 +163,7 @@ pub(crate) async fn retention(
                 deleted.occurrences,
                 deleted.deliveries,
                 deleted.assessments,
-                deleted.coverage,
+                deleted.gaps,
                 deleted.summaries,
             ]
             .iter()

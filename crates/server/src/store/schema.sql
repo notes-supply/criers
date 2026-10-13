@@ -133,15 +133,15 @@ CREATE TABLE source_status (
     heartbeat_alertname TEXT
 ) STRICT;
 
--- Coverage transitions, so a summary can report gaps inside its window.
-CREATE TABLE coverage_history (
+-- Periods without heartbeats, recorded by the heartbeat that ends each one.
+CREATE TABLE heartbeat_gaps (
     id INTEGER PRIMARY KEY,
     source TEXT NOT NULL,
-    previous TEXT NOT NULL,
-    state TEXT NOT NULL,
-    at INTEGER NOT NULL
+    started_at INTEGER NOT NULL,
+    ended_at INTEGER NOT NULL
 ) STRICT;
-CREATE INDEX coverage_history_at ON coverage_history(at);
+CREATE INDEX heartbeat_gaps_source ON heartbeat_gaps(source, ended_at);
+CREATE INDEX heartbeat_gaps_ended ON heartbeat_gaps(ended_at);
 
 -- One row per reporting window; the latest window_end is the summary cursor.
 -- A row without an outbox intent marks where reporting started.
