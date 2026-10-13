@@ -515,6 +515,25 @@ mod tests {
     }
 
     #[test]
+    fn gap_durations_round_up_to_whole_minutes() {
+        let render = |span: i64| {
+            let mut report = report();
+            report.coverage = vec![Coverage {
+                source: "apollo".to_owned(),
+                gaps: vec![(Some(SIX - 3 * HOUR), SIX - 3 * HOUR + span)],
+                gap_count: 1,
+                ..Coverage::default()
+            }];
+            report.render()
+        };
+        let (exact, longer) = (render(119 * 60_000), render(119 * 60_000 + 1));
+        assert!(
+            exact.contains("(1h 59m)") && longer.contains("(2h)"),
+            "{exact}\n{longer}"
+        );
+    }
+
+    #[test]
     fn capped_gap_counts_say_at_least() {
         let mut report = report();
         report.coverage = vec![Coverage {

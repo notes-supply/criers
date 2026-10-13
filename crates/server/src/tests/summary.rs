@@ -212,8 +212,10 @@ async fn a_heartbeat_ending_a_gap_records_its_span() {
     harness
         .ingest(alert("Watchdog", "none", "4000000000000001", "firing"))
         .await;
-    // The previous heartbeat arrived two hours ago; this one ends the gap.
-    let before = crate::now_ms() - 2 * HOUR;
+    // The previous heartbeat arrived 1h 59m 30s ago; this one ends the gap. The gap
+    // starts one minute after it, so it spans 1h 58m 30s plus however long this
+    // ingest takes, which rounds up to 1h 59m for any delay from 0 ms up to 30 s.
+    let before = crate::now_ms() - 2 * HOUR + 30_000;
     harness
         .store
         .with_connection(move |connection| {
@@ -228,10 +230,9 @@ async fn a_heartbeat_ending_a_gap_records_its_span() {
     heartbeats_until(&harness, end + DAY_MS - 30_000).await;
     tick(&harness, end + DAY_MS).await;
     let text = summaries(&harness).await.remove(0).1;
-    // Gap durations round up, so 1h 59m and some milliseconds reads 2h.
     assert!(
         text.contains("- example: no heartbeat ")
-            && text.contains("(2h)")
+            && text.contains("(1h 59m)")
             && !text.contains("ongoing"),
         "{text}"
     );
