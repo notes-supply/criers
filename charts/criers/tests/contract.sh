@@ -59,7 +59,7 @@ check "no mount uses subPath" "$container | .volumeMounts[]" 'has("subPath") | n
 check "secret directory mounted where the config expects it" "$container | .volumeMounts[] | select(.name == \"secrets\")" '.mountPath == "/run/secrets/criers" and .readOnly == true' default
 check "probes use the ops port" "$container" '.startupProbe.httpGet.path == "/health/live" and .livenessProbe.httpGet.path == "/health/live" and .readinessProbe.httpGet.path == "/health/ready" and .startupProbe.httpGet.port == "ops" and .livenessProbe.httpGet.port == "ops" and .readinessProbe.httpGet.port == "ops"' default
 check "grace exceeds both 12s shutdown phases" "$pod" '.terminationGracePeriodSeconds >= 30' default
-check "image defaults to the chart appVersion" "$container" '.image == "ghcr.io/notes-supply/criers:0.2.0"' default
+check "image defaults to the chart appVersion" "$container" '.image == "ghcr.io/notes-supply/criers:0.2.1"' default
 check "created claim fences with ReadWriteOncePod and is kept" "$claim" '.spec.accessModes[0] == "ReadWriteOncePod" and (.spec.accessModes | length) == 1 and .metadata.annotations["helm.sh/resource-policy"] == "keep"' default
 # SQLite needs a writable temporary directory beside the read-only root.
 check "/tmp is a bounded emptyDir for SQLite temporary files" "$pod | .volumes[] | select(.name == \"tmp\")" '.emptyDir.sizeLimit == "1Gi" and (.emptyDir | has("medium") | not)' default
