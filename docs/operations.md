@@ -194,8 +194,12 @@ Scheduling and delivery:
 Generation holds the database connection for its duration, which is how long it
 can delay a concurrent webhook commit. Measured with the release build: about
 80 ms for 20,000 notifying occurrences in one window and 270 ms for 100,000.
-`criers_summary_window_end_seconds` exposes the latest reported window end, so
-a missing summary can alert.
+`criers_summary_window_end_seconds` shows that summaries are generated;
+`criers_summary_delivered_window_end_seconds` shows that one actually reached
+Discord. A revoked webhook or blocked egress leaves the first fresh and the
+second stale, and shows up in `criers_deliveries_finished_total{state="failed"}`
+and `criers_delivery_oldest_pending_age_seconds`. Alert on those from outside
+the instance: an alert routed through the broken destination cannot arrive.
 
 ## Assessment
 
@@ -320,7 +324,9 @@ repair.
 | `criers_assessments_total{outcome}`, `criers_assessment_queue` | shadow assessment |
 | `criers_storage_used_bytes`, `criers_storage_limit_bytes` | storage headroom |
 | `criers_credential_files_valid`, `criers_credential_reload_failures_total` | rotation health |
-| `criers_summary_window_end_seconds` | end of the latest reported summary window |
+| `criers_deliveries_finished_total{destination,state}` | live deliveries that ended: sent, failed, ambiguous |
+| `criers_summary_window_end_seconds` | end of the latest generated summary window |
+| `criers_summary_delivered_window_end_seconds` | end of the latest summary window whose message was sent; absent until one is |
 
 Coverage changes create durable notifications to the heartbeat destination: no
 heartbeat within `stale_after` of startup (`never_seen`), heartbeats stopped

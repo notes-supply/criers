@@ -252,6 +252,15 @@ pub(crate) struct Retention {
     pub summaries: usize,
 }
 
+/// Deliveries a completion ended, by terminal state. Rows that will be retried
+/// are not counted.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct Finished {
+    pub sent: u64,
+    pub failed: u64,
+    pub ambiguous: u64,
+}
+
 #[derive(Debug)]
 pub(crate) struct PendingDeliveries {
     pub destination: String,
@@ -272,6 +281,8 @@ pub(crate) struct SourceFreshness {
 pub(crate) struct Stats {
     pub used_bytes: i64,
     pub limit_bytes: i64,
+    /// End of the latest summary window whose message was sent.
+    pub summary_delivered: Option<i64>,
     pub pending: Vec<PendingDeliveries>,
     pub assessment_queue: i64,
     pub sources: Vec<SourceFreshness>,
@@ -445,7 +456,8 @@ impl Store {
         .await
     }
 
-    /// Applies a send outcome to the in-flight rows of a batch.
+    /// Applies a send outcome to the in-flight rows of a batch and reports the
+    /// rows it ended.
     pub(crate) async fn complete_deliveries(
         &self,
         destination: String,
@@ -453,11 +465,11 @@ impl Store {
         mention: Option<MentionClaim>,
         completion: Completion,
         max_attempts: u32,
-    ) -> Result<(), StoreError> {
+    ) -> Result<Finished, StoreError> {
         self.write(move |connection| {
             let now = crate::now_ms();
             let transaction = connection.transaction()?;
-            complete_transaction(
+            let finished = complete_transaction(
                 &transaction,
                 &destination,
                 &ids,
@@ -467,7 +479,7 @@ impl Store {
                 now,
             )?;
             transaction.commit()?;
-            Ok(())
+            Ok(finished)
         })
         .await
     }
@@ -1617,7 +1629,7 @@ fn complete_transaction(
     completion: &Completion,
     max_attempts: u32,
     now: i64,
-) -> Result<(), StoreError> {
+) -> Result<Finished, StoreError> {
     // Nothing reached the recipients, so the provisional mention is handed back
     // unless a later claim has already replaced it.
     let definitely_undelivered = matches!(
@@ -1639,6 +1651,21 @@ fn complete_transaction(
         )?;
     }
     let ids = serde_json::to_string(ids)?;
+    let mut finished = Finished::default();
+    // Applies an update ending in `RETURNING state` and counts the rows it ended.
+    let mut update = |sql: &str, values: &[&dyn rusqlite::ToSql]| -> Result<(), StoreError> {
+        let mut statement = transaction.prepare_cached(sql)?;
+        let mut rows = statement.query(values)?;
+        while let Some(row) = rows.next()? {
+            match row.get::<_, String>(0)?.as_str() {
+                "sent" => finished.sent += 1,
+                "failed" => finished.failed += 1,
+                "ambiguous" => finished.ambiguous += 1,
+                _ => {}
+            }
+        }
+        Ok(())
+    };
     let set_destination = |column: &str, value: i64| {
         transaction.execute(
             &format!(
@@ -1650,10 +1677,11 @@ fn complete_transaction(
     };
     match completion {
         Completion::Sent { remote_id, status } => {
-            transaction.execute(
+            update(
                 "UPDATE outbox SET state = 'sent', remote_id = ?2, last_status = ?3,
                     last_error = NULL, completed_at = ?4
-                 WHERE id IN (SELECT value FROM json_each(?1)) AND state = 'in_flight'",
+                 WHERE id IN (SELECT value FROM json_each(?1)) AND state = 'in_flight'
+                 RETURNING state",
                 params![ids, remote_id, status, now],
             )?;
         }
@@ -1663,14 +1691,15 @@ fn complete_transaction(
             global,
         } => {
             // Throttling is bounded separately so a persistent 429 cannot retry forever.
-            transaction.execute(
+            update(
                 "UPDATE outbox SET throttled = throttled + 1, last_status = ?2,
                     last_error = 'rate_limited', due_at = ?3,
                     state = CASE WHEN attempts >= ?4 * 10
                         THEN CASE WHEN possibly_delivered = 1 THEN 'ambiguous' ELSE 'failed' END
                         ELSE 'pending' END,
                     completed_at = CASE WHEN attempts >= ?4 * 10 THEN ?5 END
-                 WHERE id IN (SELECT value FROM json_each(?1)) AND state = 'in_flight'",
+                 WHERE id IN (SELECT value FROM json_each(?1)) AND state = 'in_flight'
+                 RETURNING state",
                 params![ids, status, retry_at, max_attempts, now],
             )?;
             if *global {
@@ -1692,27 +1721,29 @@ fn complete_transaction(
             error,
             ambiguous,
         } => {
-            transaction.execute(
+            update(
                 "UPDATE outbox SET possibly_delivered = possibly_delivered | ?5,
                     last_status = ?2, last_error = ?3, due_at = ?4,
                     state = CASE WHEN attempts - throttled >= ?6
                         THEN CASE WHEN possibly_delivered | ?5 THEN 'ambiguous' ELSE 'failed' END
                         ELSE 'pending' END,
                     completed_at = CASE WHEN attempts - throttled >= ?6 THEN ?7 END
-                 WHERE id IN (SELECT value FROM json_each(?1)) AND state = 'in_flight'",
+                 WHERE id IN (SELECT value FROM json_each(?1)) AND state = 'in_flight'
+                 RETURNING state",
                 params![ids, status, error, retry_at, ambiguous, max_attempts, now],
             )?;
         }
         Completion::Permanent { status, error } => {
-            transaction.execute(
+            update(
                 "UPDATE outbox SET last_status = ?2, last_error = ?3, completed_at = ?4,
                     state = CASE WHEN possibly_delivered = 1 THEN 'ambiguous' ELSE 'failed' END
-                 WHERE id IN (SELECT value FROM json_each(?1)) AND state = 'in_flight'",
+                 WHERE id IN (SELECT value FROM json_each(?1)) AND state = 'in_flight'
+                 RETURNING state",
                 params![ids, status, error, now],
             )?;
         }
     }
-    Ok(())
+    Ok(finished)
 }
 
 fn coverage_transaction(
@@ -1892,9 +1923,16 @@ fn stats(connection: &Connection, page_size: i64, max_pages: i64) -> Result<Stat
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
+    let summary_delivered = connection
+        .prepare_cached(
+            "SELECT max(s.window_end) FROM summaries s JOIN outbox o ON o.id = s.outbox_id
+             WHERE o.state = 'sent'",
+        )?
+        .query_row([], |row| row.get(0))?;
     Ok(Stats {
         used_bytes: (pages - free) * page_size,
         limit_bytes: max_pages * page_size,
+        summary_delivered,
         pending,
         assessment_queue,
         sources,

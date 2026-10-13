@@ -33,6 +33,12 @@ pub(crate) struct DestinationOutcome {
 }
 
 #[derive(Clone, Debug, EncodeLabelSet, Eq, Hash, PartialEq)]
+pub(crate) struct DestinationState {
+    pub destination: String,
+    pub state: &'static str,
+}
+
+#[derive(Clone, Debug, EncodeLabelSet, Eq, Hash, PartialEq)]
 pub(crate) struct DestinationLabels {
     pub destination: String,
 }
@@ -72,6 +78,7 @@ pub(crate) struct Metrics {
     pub source_heartbeat_age: Family<SourceLabels, FloatGauge>,
     pub source_coverage: Family<CoverageLabels, Gauge>,
     pub delivery_attempts: Family<DestinationOutcome, Counter>,
+    pub deliveries_finished: Family<DestinationState, Counter>,
     pub delivery_pending: Family<DestinationLabels, Gauge>,
     pub delivery_oldest_pending_age: Family<DestinationLabels, FloatGauge>,
     pub assessments: Family<OutcomeLabels, Counter>,
@@ -82,6 +89,7 @@ pub(crate) struct Metrics {
     pub credential_files_valid: Family<SourceLabels, Gauge>,
     pub credential_reload_failures: Family<SourceLabels, Counter>,
     pub summary_window_end: FloatGauge,
+    pub summary_delivered_window_end: FloatGauge,
     pub ready: Gauge,
 }
 
@@ -100,6 +108,7 @@ impl Metrics {
             source_heartbeat_age: Family::default(),
             source_coverage: Family::default(),
             delivery_attempts: Family::default(),
+            deliveries_finished: Family::default(),
             delivery_pending: Family::default(),
             delivery_oldest_pending_age: Family::default(),
             assessments: Family::default(),
@@ -110,6 +119,7 @@ impl Metrics {
             credential_files_valid: Family::default(),
             credential_reload_failures: Family::default(),
             summary_window_end: FloatGauge::default(),
+            summary_delivered_window_end: FloatGauge::default(),
             ready: Gauge::default(),
             registry: Registry::default(),
         };
@@ -160,6 +170,11 @@ impl Metrics {
             m.delivery_attempts.clone(),
         );
         registry.register(
+            "deliveries_finished",
+            "Live deliveries that ended, by destination and state: sent, failed or ambiguous",
+            m.deliveries_finished.clone(),
+        );
+        registry.register(
             "delivery_pending",
             "Live deliveries waiting or in flight",
             m.delivery_pending.clone(),
@@ -206,8 +221,13 @@ impl Metrics {
         );
         registry.register(
             "summary_window_end_seconds",
-            "Unix time at which the latest reported summary window ended",
+            "Unix time at which the latest generated summary window ended",
             m.summary_window_end.clone(),
+        );
+        registry.register(
+            "summary_delivered_window_end_seconds",
+            "Unix time at which the latest summary window whose message was sent ended",
+            m.summary_delivered_window_end.clone(),
         );
         registry.register("ready", "1 when storage is writable", m.ready.clone());
         Self {

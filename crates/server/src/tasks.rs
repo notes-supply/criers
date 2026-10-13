@@ -53,6 +53,11 @@ fn publish(config: &Config, metrics: &Metrics, stats: &Stats) {
     metrics.storage_used_bytes.set(stats.used_bytes);
     metrics.storage_limit_bytes.set(stats.limit_bytes);
     metrics.assessment_queue.set(stats.assessment_queue);
+    if let Some(end) = stats.summary_delivered {
+        metrics
+            .summary_delivered_window_end
+            .set(end as f64 / 1000.0);
+    }
     for destination in config.destinations.keys() {
         let labels = DestinationLabels {
             destination: destination.clone(),

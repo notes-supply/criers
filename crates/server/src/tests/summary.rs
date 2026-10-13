@@ -803,3 +803,46 @@ async fn an_ongoing_gap_outlives_retention_of_the_transition_that_began_it() {
         "removed={removed:?}\n{later}"
     );
 }
+
+#[tokio::test]
+async fn a_revoked_webhook_fails_the_summary_without_marking_it_delivered() {
+    let discord =
+        MockProvider::start(Vec::new(), Scripted::json(404, json!({"code": 10015}))).await;
+    let harness = Harness::live(&discord.discord_url(), &summary_section()).await;
+    let id = queue_now(&harness).await;
+    let cancel = spawn(worker(&harness, "ops", Duration::from_secs(2)));
+    let state = wait_for_state(&harness.store, id, "failed").await;
+    cancel.cancel();
+    let stats = harness.store.probe().await.unwrap();
+    let metrics = harness.state.metrics.render().unwrap();
+    assert!(
+        state == "failed"
+            && stats.summary_delivered.is_none()
+            && metrics.contains(
+                r#"criers_deliveries_finished_total{destination="ops",state="failed"} 1"#
+            ),
+        "state={state} delivered={:?}\n{metrics}",
+        stats.summary_delivered
+    );
+}
+
+#[tokio::test]
+async fn a_sent_summary_is_reported_as_delivered() {
+    let discord = MockProvider::discord(Vec::new()).await;
+    let harness = Harness::live(&discord.discord_url(), &summary_section()).await;
+    let id = queue_now(&harness).await;
+    let window_end: i64 = harness.query("SELECT max(window_end) FROM summaries").await;
+    let cancel = spawn(worker(&harness, "ops", Duration::from_secs(2)));
+    let state = wait_for_state(&harness.store, id, "sent").await;
+    cancel.cancel();
+    let stats = harness.store.probe().await.unwrap();
+    let metrics = harness.state.metrics.render().unwrap();
+    assert!(
+        state == "sent"
+            && stats.summary_delivered == Some(window_end)
+            && metrics
+                .contains(r#"criers_deliveries_finished_total{destination="ops",state="sent"} 1"#),
+        "state={state} delivered={:?}\n{metrics}",
+        stats.summary_delivered
+    );
+}

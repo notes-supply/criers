@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     config::{Delivery, Destination},
     http_body::{BodyError, read_bounded},
-    metrics::{DestinationOutcome, Metrics},
+    metrics::{DestinationOutcome, DestinationState, Metrics},
     render::DISCORD_CONTENT_CHARS,
     store::{Batch, Claim, ClaimLimits, Completion, Store},
 };
@@ -441,13 +441,34 @@ impl Worker {
                     settings.max_attempts,
                 )
                 .await;
-            let Err(error) = result else { return };
-            attempt = attempt.saturating_add(1);
-            tracing::error!(destination = %self.destination, %error, attempt, "cannot record delivery outcome");
-            tokio::select! {
-                () = cancel.cancelled() => return,
-                () = tokio::time::sleep(backoff(attempt, Duration::from_millis(200), Duration::from_secs(10))) => {}
+            let finished = match result {
+                Ok(finished) => finished,
+                Err(error) => {
+                    attempt = attempt.saturating_add(1);
+                    tracing::error!(destination = %self.destination, %error, attempt, "cannot record delivery outcome");
+                    tokio::select! {
+                        () = cancel.cancelled() => return,
+                        () = tokio::time::sleep(backoff(attempt, Duration::from_millis(200), Duration::from_secs(10))) => {}
+                    }
+                    continue;
+                }
+            };
+            for (state, count) in [
+                ("sent", finished.sent),
+                ("failed", finished.failed),
+                ("ambiguous", finished.ambiguous),
+            ] {
+                if count > 0 {
+                    self.metrics
+                        .deliveries_finished
+                        .get_or_create(&DestinationState {
+                            destination: self.destination.clone(),
+                            state,
+                        })
+                        .inc_by(count);
+                }
             }
+            return;
         }
     }
 }
