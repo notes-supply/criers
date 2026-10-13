@@ -59,7 +59,7 @@ pub(crate) fn coverage_recovered(source: &str) -> String {
 }
 
 /// Escapes Markdown and mention syntax and truncates to `limit` characters.
-fn escape(text: &str, limit: usize) -> String {
+pub(crate) fn escape(text: &str, limit: usize) -> String {
     let mut escaped = String::with_capacity(text.len().min(limit * 2));
     for (index, character) in text.chars().enumerate() {
         if index == limit {

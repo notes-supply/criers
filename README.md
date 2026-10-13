@@ -6,7 +6,8 @@ notifications through a durable outbox. It can also record Cloudflare Clef
 impact probabilities, which never change who gets notified.
 
 Alertmanager keeps grouping, silences and inhibition. Criers decides between
-recording, a quiet post and a ping, and keeps the delivery history.
+recording, a quiet post, a ping and the daily summary, and keeps the delivery
+history.
 
 ## Quickstart
 
@@ -41,7 +42,8 @@ cargo run --package criers -- check --config examples/criers.toml
 One TOML file plus separately mounted secret files. The
 [example](examples/criers.toml) documents every section: sources and their
 credential files, severity policy, Discord destinations, delivery retries,
-retention and optional assessment. Set `mode = "live"` to deliver.
+retention, the optional daily summary and optional assessment. Set
+`mode = "live"` to deliver.
 
 [Operating Criers](docs/operations.md) covers the Alertmanager setup, HTTP and
 delivery contracts, rotation, retention, metrics and Kubernetes.

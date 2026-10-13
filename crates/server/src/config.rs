@@ -72,6 +72,7 @@ struct RawConfig {
     sources: BTreeMap<String, RawSource>,
     #[serde(default)]
     destinations: BTreeMap<String, RawDestination>,
+    summary: Option<RawSummary>,
     assessment: Option<RawAssessment>,
 }
 
@@ -225,6 +226,18 @@ enum RawDestination {
 
 fn default_mention_cooldown() -> HumanDuration {
     HumanDuration(Duration::from_secs(60))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSummary {
+    destination: String,
+    #[serde(default = "default_summary_at")]
+    at: String,
+}
+
+fn default_summary_at() -> String {
+    "06:00".to_owned()
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
@@ -391,6 +404,14 @@ impl fmt::Debug for Destination {
     }
 }
 
+/// The daily summary: when each reporting window ends and where it is posted.
+#[derive(Debug)]
+pub(crate) struct Summary {
+    pub destination: String,
+    /// Time of day, in UTC, at which each reporting window ends.
+    pub at: Duration,
+}
+
 /// Shadow-mode Cloudflare Clef assessment settings.
 pub(crate) struct Assessment {
     pub url: Url,
@@ -428,6 +449,7 @@ pub(crate) struct Config {
     pub policy_version: String,
     pub sources: BTreeMap<String, Source>,
     pub destinations: BTreeMap<String, Destination>,
+    pub summary: Option<Summary>,
     pub assessment: Option<Arc<Assessment>>,
     /// Non-fatal findings shown by `check` and logged at startup.
     pub warnings: Vec<String>,
@@ -502,6 +524,15 @@ fn validate(raw: RawConfig, base: &Path) -> Result<Config> {
         sources.insert(id, source);
     }
 
+    let summary = raw
+        .summary
+        .map(|summary| validate_summary(summary, &destinations, &storage))
+        .transpose()?;
+    ensure!(
+        summary.is_some() || !policy.can_digest(),
+        "[policy] maps a severity to digest, which needs a [summary] section to report it"
+    );
+
     let assessment = raw
         .assessment
         .map(|assessment| validate_assessment(assessment, base).map(Arc::new))
@@ -522,6 +553,7 @@ fn validate(raw: RawConfig, base: &Path) -> Result<Config> {
         policy_version,
         sources,
         destinations,
+        summary,
         assessment,
         warnings,
     })
@@ -822,7 +854,7 @@ fn validate_source(
                 known()
             );
             ensure!(
-                heartbeat.action != Action::Record,
+                heartbeat.action.is_immediate(),
                 "sources.{id}.heartbeat.action must be quiet_post or ping"
             );
             Ok(Heartbeat {
@@ -839,6 +871,37 @@ fn validate_source(
         receivers: raw.receivers,
         trust_severity: raw.trust_severity,
         heartbeat,
+    })
+}
+
+fn validate_summary(
+    raw: RawSummary,
+    destinations: &BTreeMap<String, Destination>,
+    storage: &Storage,
+) -> Result<Summary> {
+    ensure!(
+        destinations.contains_key(&raw.destination),
+        "summary.destination {:?} is not a configured destination (known: {})",
+        raw.destination,
+        destinations.keys().cloned().collect::<Vec<_>>().join(", ")
+    );
+    let at = chrono::NaiveTime::parse_from_str(&raw.at, "%H:%M")
+        .ok()
+        .filter(|_| raw.at.len() == 5)
+        .with_context(|| {
+            format!(
+                "summary.at {:?} must be a UTC time such as \"06:00\"",
+                raw.at
+            )
+        })?;
+    // A report delayed by a restart still needs its whole window in storage.
+    ensure!(
+        storage.retention >= Duration::from_secs(2 * 86_400),
+        "storage.retention must be at least 2d when [summary] is configured"
+    );
+    Ok(Summary {
+        destination: raw.destination,
+        at: Duration::from_secs(u64::from(chrono::Timelike::num_seconds_from_midnight(&at))),
     })
 }
 

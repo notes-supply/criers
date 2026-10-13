@@ -26,7 +26,9 @@ GROUP BY d.occurrence_id;
 INSERT INTO occurrences(id, source, fingerprint, starts_at, status, highest_action, alertname,
     severity, labels, summary, first_seen_at, last_seen_at, observations, closed_at)
 SELECT
-    o.id, o.source, o.fingerprint, o.starts_at, o.status, o.highest_action,
+    -- Scaffold ranks predate digest: quiet_post and ping each move up one place.
+    o.id, o.source, o.fingerprint, o.starts_at, o.status,
+    CASE WHEN o.highest_action > 0 THEN o.highest_action + 1 ELSE 0 END,
     coalesce(json_extract(alert.value, '$.labels.alertname'), ''),
     json_extract(alert.value, '$.labels.severity'),
     coalesce(json_extract(alert.value, '$.labels'), '{}'),

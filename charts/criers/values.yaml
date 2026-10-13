@@ -47,6 +47,11 @@ config: |
   mention_users = []
   mention_roles = []
 
+  # Optional daily summary, posted without mentions (see docs/operations.md).
+  # [summary]
+  # destination = "ops"
+  # at = "06:00"
+
 # Existing Secrets, created outside the chart, projected together into
 # /run/secrets/criers. Each key becomes a file named after the key unless
 # `items` maps keys to paths. Projected volumes receive Secret updates, which

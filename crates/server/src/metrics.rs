@@ -81,6 +81,7 @@ pub(crate) struct Metrics {
     pub retention_deleted: Family<TableLabels, Counter>,
     pub credential_files_valid: Family<SourceLabels, Gauge>,
     pub credential_reload_failures: Family<SourceLabels, Counter>,
+    pub summary_window_end: FloatGauge,
     pub ready: Gauge,
 }
 
@@ -108,6 +109,7 @@ impl Metrics {
             retention_deleted: Family::default(),
             credential_files_valid: Family::default(),
             credential_reload_failures: Family::default(),
+            summary_window_end: FloatGauge::default(),
             ready: Gauge::default(),
             registry: Registry::default(),
         };
@@ -201,6 +203,11 @@ impl Metrics {
             "credential_reload_failures",
             "Rejected credential file updates; last-good tokens stay active",
             m.credential_reload_failures.clone(),
+        );
+        registry.register(
+            "summary_window_end_seconds",
+            "Unix time at which the latest reported summary window ended",
+            m.summary_window_end.clone(),
         );
         registry.register("ready", "1 when storage is writable", m.ready.clone());
         Self {

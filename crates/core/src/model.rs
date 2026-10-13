@@ -57,11 +57,15 @@ pub enum Status {
 }
 
 /// A policy proposal, separate from assessment and actual delivery.
+///
+/// Variants are declared in escalation order, so `Ord` matches [`Action::rank`].
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Action {
     /// Persist the observation without notifying anyone.
     Record,
+    /// List the occurrence in the next scheduled summary instead of posting now.
+    Digest,
     /// Post a notification without a mention.
     QuietPost,
     /// Notify with an explicitly configured recipient mention.
@@ -73,6 +77,7 @@ impl Action {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Record => "record",
+            Self::Digest => "digest",
             Self::QuietPost => "quiet_post",
             Self::Ping => "ping",
         }
@@ -82,8 +87,9 @@ impl Action {
     pub fn rank(self) -> u8 {
         match self {
             Self::Record => 0,
-            Self::QuietPost => 1,
-            Self::Ping => 2,
+            Self::Digest => 1,
+            Self::QuietPost => 2,
+            Self::Ping => 3,
         }
     }
 
@@ -91,9 +97,18 @@ impl Action {
     pub fn from_rank(rank: u8) -> Option<Self> {
         match rank {
             0 => Some(Self::Record),
-            1 => Some(Self::QuietPost),
-            2 => Some(Self::Ping),
+            1 => Some(Self::Digest),
+            2 => Some(Self::QuietPost),
+            3 => Some(Self::Ping),
             _ => None,
+        }
+    }
+
+    /// Whether the action creates an immediate delivery intent.
+    pub fn is_immediate(self) -> bool {
+        match self {
+            Self::Record | Self::Digest => false,
+            Self::QuietPost | Self::Ping => true,
         }
     }
 }

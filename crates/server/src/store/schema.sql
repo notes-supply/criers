@@ -1,4 +1,4 @@
--- Schema version 3; migrate_v1.sql and migrate_v2.sql upgrade earlier databases.
+-- Schema version 4; migrate_v1.sql to migrate_v3.sql upgrade earlier databases.
 -- Times are Unix milliseconds unless named *_at TEXT.
 
 CREATE TABLE meta (
@@ -28,6 +28,7 @@ CREATE TABLE occurrences (
     fingerprint TEXT NOT NULL,
     starts_at TEXT NOT NULL,
     status TEXT NOT NULL CHECK (status IN ('firing', 'resolved', 'superseded')),
+    -- Action rank: 0 record, 1 digest, 2 quiet_post, 3 ping.
     highest_action INTEGER NOT NULL,
     alertname TEXT NOT NULL,
     severity TEXT,
@@ -40,6 +41,8 @@ CREATE TABLE occurrences (
     UNIQUE(source, fingerprint, starts_at)
 ) STRICT;
 CREATE INDEX occurrences_closed ON occurrences(closed_at) WHERE closed_at IS NOT NULL;
+-- Summaries read open occurrences and those closed since a window began.
+CREATE INDEX occurrences_open ON occurrences(first_seen_at) WHERE closed_at IS NULL;
 
 -- Changes only; repeated identical observations are compacted into occurrence counters.
 CREATE TABLE decisions (
@@ -59,7 +62,7 @@ CREATE TABLE outbox (
     occurrence_id INTEGER REFERENCES occurrences(id) ON DELETE CASCADE,
     source TEXT NOT NULL,
     destination TEXT NOT NULL,
-    kind TEXT NOT NULL CHECK (kind IN ('notify', 'recovery', 'coverage')),
+    kind TEXT NOT NULL CHECK (kind IN ('notify', 'recovery', 'coverage', 'summary')),
     action TEXT NOT NULL CHECK (action IN ('quiet_post', 'ping')),
     mode TEXT NOT NULL CHECK (mode IN ('shadow', 'live')),
     state TEXT NOT NULL CHECK (state IN
@@ -128,4 +131,23 @@ CREATE TABLE source_status (
     coverage_changed_at INTEGER,
     -- The configured heartbeat alertname that last_heartbeat_at and coverage refer to.
     heartbeat_alertname TEXT
+) STRICT;
+
+-- Coverage transitions, so a summary can report gaps inside its window.
+CREATE TABLE coverage_history (
+    id INTEGER PRIMARY KEY,
+    source TEXT NOT NULL,
+    previous TEXT NOT NULL,
+    state TEXT NOT NULL,
+    at INTEGER NOT NULL
+) STRICT;
+CREATE INDEX coverage_history_at ON coverage_history(at);
+
+-- One row per reporting window; the latest window_end is the summary cursor.
+-- A row without an outbox intent marks where reporting started.
+CREATE TABLE summaries (
+    window_end INTEGER PRIMARY KEY,
+    window_start INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    outbox_id INTEGER REFERENCES outbox(id) ON DELETE SET NULL
 ) STRICT;

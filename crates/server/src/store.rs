@@ -26,7 +26,11 @@ use crate::{
     render::{self, Subject},
 };
 
-const SCHEMA_VERSION: i64 = 3;
+mod summary;
+
+pub(crate) use summary::SummaryTick;
+
+const SCHEMA_VERSION: i64 = 4;
 const SUMMARY_CHARS: usize = 512;
 
 #[derive(Debug, Error)]
@@ -244,6 +248,8 @@ pub(crate) struct Retention {
     pub occurrences: usize,
     pub deliveries: usize,
     pub assessments: usize,
+    pub coverage: usize,
+    pub summaries: usize,
 }
 
 #[derive(Debug)]
@@ -689,9 +695,41 @@ impl Store {
                          ORDER BY completed_at LIMIT ?2)",
                     params![cutoff, batch],
                 )?,
+                coverage: transaction.execute(
+                    "DELETE FROM coverage_history WHERE id IN
+                        (SELECT id FROM coverage_history WHERE at < ?1 ORDER BY at LIMIT ?2)",
+                    params![cutoff, batch],
+                )?,
+                // The latest window end is the summary cursor and always stays.
+                summaries: transaction.execute(
+                    "DELETE FROM summaries WHERE window_end IN
+                        (SELECT window_end FROM summaries WHERE window_end < ?1
+                         AND window_end < (SELECT max(window_end) FROM summaries)
+                         ORDER BY window_end LIMIT ?2)",
+                    params![cutoff, batch],
+                )?,
             };
             transaction.commit()?;
             Ok(deleted)
+        })
+        .await
+    }
+
+    /// Queues the scheduled summary when a reporting window has ended.
+    ///
+    /// Returns `None` without a `[summary]` section. Generation, the outbox
+    /// intent and the new cursor commit together, so a crash can neither lose
+    /// a window nor queue it twice.
+    pub(crate) async fn summary_tick(
+        &self,
+        config: Arc<Config>,
+        now: i64,
+    ) -> Result<Option<SummaryTick>, StoreError> {
+        self.write(move |connection| {
+            let transaction = connection.transaction()?;
+            let tick = summary::tick(&transaction, &config, now)?;
+            transaction.commit()?;
+            Ok(tick)
         })
         .await
     }
@@ -856,7 +894,10 @@ fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
         if version < 2 {
             transaction.execute_batch(include_str!("store/migrate_v1.sql"))?;
         }
-        transaction.execute_batch(include_str!("store/migrate_v2.sql"))?;
+        if version < 3 {
+            transaction.execute_batch(include_str!("store/migrate_v2.sql"))?;
+        }
+        transaction.execute_batch(include_str!("store/migrate_v3.sql"))?;
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.commit()?;
         return Ok(());
@@ -1008,8 +1049,11 @@ fn process_alert(
     } = *context;
     let mut observed = upsert_occurrence(transaction, context, alert)?;
     let id = observed.id;
-    if let Prior::Firing(_) = observed.prior {
-        observed.prior = Prior::Firing(announced_at(transaction, id, destination)?);
+    if let Prior::Firing(highest) = observed.prior {
+        // Immediate notifications are tracked per destination; a digest has no
+        // intent and applies to the occurrence as a whole.
+        let digested = highest.min(Action::Digest);
+        observed.prior = Prior::Firing(announced_at(transaction, id, destination)?.max(digested));
     }
     // Every destination that was, or may have been, told about the occurrence gets
     // its own recovery; destinations whose sends never happened get none.
@@ -1060,7 +1104,7 @@ fn process_alert(
             transition.escalate_to.map_or(0, Action::rank)
         ])?;
     match transition.cancel {
-        Cancel::Nothing | Cancel::Below(Action::Record | Action::QuietPost) => {}
+        Cancel::Nothing | Cancel::Below(Action::Record | Action::Digest | Action::QuietPost) => {}
         // Escalation replaces a lower post only at the destination it escalates.
         Cancel::Below(Action::Ping) => supersede_unattempted(
             transaction,
@@ -1358,11 +1402,19 @@ fn announced_at(
 ) -> Result<Action, StoreError> {
     let rank: Option<u8> = transaction
         .prepare_cached(
-            "SELECT max(CASE action WHEN 'ping' THEN 2 WHEN 'quiet_post' THEN 1 END)
+            "SELECT max(CASE action WHEN 'ping' THEN ?3 WHEN 'quiet_post' THEN ?4 END)
              FROM outbox WHERE occurrence_id = ?1 AND kind = 'notify'
              AND destination IN (?2, '')",
         )?
-        .query_row(params![occurrence, destination], |row| row.get(0))?;
+        .query_row(
+            params![
+                occurrence,
+                destination,
+                Action::Ping.rank(),
+                Action::QuietPost.rank()
+            ],
+            |row| row.get(0),
+        )?;
     Ok(rank.and_then(Action::from_rank).unwrap_or(Action::Record))
 }
 
@@ -1410,16 +1462,16 @@ fn insert_intent(
 
 /// SQL condition on outbox row `b`: no earlier intent of the same lifecycle is still
 /// pending or in flight at the same destination. Occurrence intents follow their
-/// occurrence; coverage intents, which have no occurrence, follow their source.
-/// Ordering is per destination, so an unavailable channel never holds back
-/// another destination's escalation or recovery.
+/// occurrence; coverage intents, which have no occurrence, follow their source, and
+/// summaries follow earlier summaries. Ordering is per destination, so an
+/// unavailable channel never holds back another destination's escalation or recovery.
 macro_rules! no_open_predecessor {
     () => {
         "AND NOT EXISTS (SELECT 1 FROM outbox e WHERE e.occurrence_id = b.occurrence_id
             AND e.destination = b.destination
             AND e.id < b.id AND e.state IN ('pending', 'in_flight'))
-         AND NOT (b.kind = 'coverage' AND EXISTS (SELECT 1 FROM outbox e
-            WHERE e.kind = 'coverage' AND e.source = b.source
+         AND NOT (b.kind IN ('coverage', 'summary') AND EXISTS (SELECT 1 FROM outbox e
+            WHERE e.kind = b.kind AND e.source = b.source
             AND e.destination = b.destination
             AND e.id < b.id AND e.state IN ('pending', 'in_flight')))"
     };
@@ -1509,8 +1561,10 @@ fn claim_transaction(
                 continue;
             }
         }
+        // A summary is a complete message of its own, never mixed with alert lines.
+        let alone = candidate.kind == "summary";
         let length = candidate.content.chars().count() + 1;
-        if !batch.ids.is_empty() && used + length > limits.budget_chars {
+        if !batch.ids.is_empty() && (alone || used + length > limits.budget_chars) {
             break;
         }
         used += length;
@@ -1519,6 +1573,9 @@ fn claim_transaction(
         batch.max_failures = batch.max_failures.max(candidate.failures);
         batch.ids.push(candidate.id);
         batch.lines.push(candidate.content);
+        if alone {
+            break;
+        }
     }
     if batch.ids.is_empty() {
         // Rows waiting behind an earlier send of their occurrence are not claimable,
@@ -1669,6 +1726,13 @@ fn coverage_transaction(
         let Some(heartbeat) = &source.heartbeat else {
             // Monitoring is off: drop freshness and coverage left by an earlier
             // configuration so nothing keeps advertising them. No notice is sent.
+            let previous: Option<String> = transaction
+                .query_row(
+                    "SELECT coverage FROM source_status WHERE source = ?1",
+                    [source_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
             let cleared = transaction.execute(
                 "UPDATE source_status SET last_heartbeat_at = NULL, heartbeat_alertname = NULL,
                     coverage = 'unknown', coverage_changed_at = ?2
@@ -1676,6 +1740,9 @@ fn coverage_transaction(
                     OR heartbeat_alertname IS NOT NULL OR coverage != 'unknown')",
                 params![source_id, now],
             )?;
+            if let Some(previous) = previous.filter(|previous| previous != "unknown") {
+                record_coverage(transaction, source_id, &previous, "unknown", now)?;
+            }
             if cleared > 0 {
                 changes.push(CoverageChange {
                     source: source_id.clone(),
@@ -1709,6 +1776,7 @@ fn coverage_transaction(
                 params![source_id, now, heartbeat.alertname],
             )?;
             if previous != "unknown" {
+                record_coverage(transaction, source_id, &previous, "unknown", now)?;
                 changes.push(CoverageChange {
                     source: source_id.clone(),
                     state: "unknown",
@@ -1733,6 +1801,7 @@ fn coverage_transaction(
                 coverage_changed_at = excluded.coverage_changed_at",
             params![source_id, state, now],
         )?;
+        record_coverage(transaction, source_id, &previous, state, now)?;
         let message = match (previous.as_str(), state) {
             ("stale" | "never_seen", "healthy") => Some(render::coverage_recovered(source_id)),
             (_, "stale") => Some(render::coverage_stale(
@@ -1767,6 +1836,22 @@ fn coverage_transaction(
         });
     }
     Ok(changes)
+}
+
+/// Keeps a coverage transition for summaries of the window it falls in.
+fn record_coverage(
+    transaction: &Transaction<'_>,
+    source: &str,
+    previous: &str,
+    state: &str,
+    at: i64,
+) -> Result<(), StoreError> {
+    transaction
+        .prepare_cached(
+            "INSERT INTO coverage_history(source, previous, state, at) VALUES (?1, ?2, ?3, ?4)",
+        )?
+        .execute(params![source, previous, state, at])?;
+    Ok(())
 }
 
 fn stats(connection: &Connection, page_size: i64, max_pages: i64) -> Result<Stats, StoreError> {

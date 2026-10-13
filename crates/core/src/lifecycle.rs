@@ -7,8 +7,9 @@ use crate::{Action, Proposal, Status};
 pub enum Prior {
     /// The occurrence was just created by this observation.
     New,
-    /// Firing, with the highest notification action recorded for the target
-    /// destination (`Record` if no intent was recorded).
+    /// Firing, with the highest action already taken for the target destination:
+    /// the highest recorded intent there, or `Digest` if the occurrence is already
+    /// listed for the summary, otherwise `Record`.
     Firing(Action),
     /// Already resolved.
     Resolved,
@@ -121,8 +122,10 @@ impl Transition {
 ///
 /// Escalation is monotonic per destination: only a strictly higher action than
 /// an intent already recorded for that destination produces another intent.
-/// Pending and in-flight intents count. Resolution never reopens, and recovery
-/// requires a possible prior notification rather than merely a recorded intent.
+/// Pending and in-flight intents count. A digested occurrence has no intent; it
+/// still escalates when a later proposal notifies immediately. Resolution never
+/// reopens, and recovery requires a possible prior notification rather than
+/// merely a recorded intent.
 ///
 /// ```
 /// use criers_core::{Action, Cancel, Intent, Notified, Policy, Prior, Status, apply};
@@ -161,10 +164,12 @@ pub fn apply(prior: Prior, status: Status, proposal: Proposal, notified: Notifie
             {
                 return Transition::record(Reason::UnchangedOrLowerPriority);
             }
-            let intent = match proposal.action {
-                Action::Record => None,
-                Action::QuietPost | Action::Ping => Some(Intent::Notify(proposal.action)),
-            };
+            // Record and digest create no delivery intent; a digested occurrence is
+            // reported by the next summary from its stored history.
+            let intent = proposal
+                .action
+                .is_immediate()
+                .then_some(Intent::Notify(proposal.action));
             Transition {
                 action: proposal.action,
                 reason: Reason::Policy(proposal.reason),
@@ -210,6 +215,70 @@ mod tests {
         assert_eq!(
             (transition.action, transition.intent),
             (Action::Record, None)
+        );
+    }
+
+    fn digest_policy(severity: &str) -> Proposal {
+        Policy::new(
+            [
+                ("critical".to_owned(), Action::Ping),
+                ("warning".to_owned(), Action::Digest),
+            ]
+            .into(),
+            Action::Ping,
+            ["critical".to_owned()].into(),
+        )
+        .unwrap()
+        .propose(Some(severity), true)
+    }
+
+    #[test]
+    fn digested_warning_records_a_decision_without_an_intent() {
+        let transition = apply(
+            Prior::New,
+            Status::Firing,
+            digest_policy("warning"),
+            Notified::No,
+        );
+        assert_eq!(
+            (transition.action, transition.intent, transition.escalate_to),
+            (Action::Digest, None, Some(Action::Digest))
+        );
+    }
+
+    #[test]
+    fn repeated_digested_warning_is_compacted() {
+        let transition = apply(
+            Prior::Firing(Action::Digest),
+            Status::Firing,
+            digest_policy("warning"),
+            Notified::No,
+        );
+        assert_eq!(transition.reason, Reason::UnchangedOrLowerPriority);
+    }
+
+    #[test]
+    fn digested_warning_that_turns_critical_pings_at_once() {
+        let transition = apply(
+            Prior::Firing(Action::Digest),
+            Status::Firing,
+            digest_policy("critical"),
+            Notified::No,
+        );
+        assert_eq!(transition.intent, Some(Intent::Notify(Action::Ping)));
+    }
+
+    #[test]
+    fn digested_warning_resolves_without_a_recovery_message() {
+        let transition = apply(
+            Prior::Firing(Action::Digest),
+            Status::Resolved,
+            digest_policy("warning"),
+            Notified::No,
+        );
+        assert_eq!(
+            (transition.resolve, transition.intent, transition.reason),
+            (true, None, Reason::ResolutionWithoutNotification)
         );
     }
 

@@ -21,6 +21,7 @@ mod http_body;
 mod metrics;
 mod render;
 mod store;
+mod summary;
 mod tasks;
 
 #[cfg(test)]
@@ -122,6 +123,13 @@ fn check(path: &Path) -> Result<()> {
                     heartbeat.alertname,
                     humantime::format_duration(heartbeat.stale_after)
                 ))
+        );
+    }
+    if let Some(summary) = &config.summary {
+        println!(
+            "  summary: daily at {} UTC to destination {}",
+            summary::time_of_day(summary.at),
+            summary.destination
         );
     }
     for warning in &config.warnings {
@@ -232,6 +240,13 @@ async fn serve(path: &Path) -> Result<()> {
         Arc::clone(&credentials),
         Arc::clone(&metrics),
         config.server.credential_reload_interval,
+        cancel.child_token(),
+    ));
+    workers.spawn(tasks::summary(
+        store.clone(),
+        Arc::clone(&config),
+        Arc::clone(&metrics),
+        Arc::clone(&wake),
         cancel.child_token(),
     ));
     for worker in delivery_workers {

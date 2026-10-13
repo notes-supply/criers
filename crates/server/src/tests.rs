@@ -24,6 +24,7 @@ use crate::{
 mod assessment;
 mod delivery;
 pub(crate) mod fixtures;
+mod summary;
 
 pub(crate) const TOKEN: &str = "synthetic-test-token-not-a-live-secret-0123456789";
 pub(crate) const OTHER_TOKEN: &str = "synthetic-other-token-not-a-live-secret-987654321";
