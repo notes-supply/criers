@@ -194,7 +194,11 @@ Scheduling and delivery:
 - **Durable cursor.** Generation, the outbox intent and the new window end
   commit in one transaction. A crash cannot lose a window or queue it twice.
 - **Catch-up.** After downtime, one report covers everything since the previous
-  summary, marked as delayed, rather than one report per missed day. It never
+  summary, marked as delayed, rather than one report per missed day. Which
+  occurrences were open or resolved is decided at the window end, but a delayed
+  report uses each one's current action, severity and labels: an alert that
+  escalated after the window ended is listed with its later state, even if it
+  was only recorded at the window end. It never
   starts before the retention cutoff, so `storage.retention` must be at least
   2 days.
 - **Delivery.** The summary is an ordinary quiet outbox row: retries, rate

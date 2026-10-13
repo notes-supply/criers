@@ -111,11 +111,19 @@ fn report(
         start,
         end,
         generated_at: now,
-        show_source: config.sources.len() > 1,
         ..Report::default()
     };
     report.open = section(transaction, "open", start, end)?;
     report.resolved = section(transaction, "resolved", start, end)?;
+    // History can hold sources no longer configured; name sources whenever the
+    // listed groups are not all from the only configured one.
+    report.show_source = config.sources.len() > 1
+        || report
+            .open
+            .groups
+            .iter()
+            .chain(&report.resolved.groups)
+            .any(|group| !config.sources.contains_key(&group.source));
     for (source, settings) in &config.sources {
         if let Some(heartbeat) = &settings.heartbeat {
             let coverage = coverage(transaction, source, heartbeat, start, end)?;
@@ -365,8 +373,76 @@ fn coverage(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::tests::Harness;
+
+    #[tokio::test]
+    async fn alerts_of_a_removed_source_are_named_when_one_source_remains() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::write(root.join("token"), crate::tests::TOKEN).unwrap();
+        std::fs::write(
+            root.join("ops.url"),
+            "https://discord.invalid/api/webhooks/1/x",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("criers.toml"),
+            "[storage]\npath = \"alerts.sqlite\"\n[sources.example]\n\
+             credential_files = [\"token\"]\ndefault_destination = \"ops\"\n\
+             [destinations.ops]\nkind = \"discord\"\nwebhook_url_file = \"ops.url\"\n\
+             [summary]\ndestination = \"ops\"\nat = \"00:00\"\n",
+        )
+        .unwrap();
+        let config = Arc::new(Config::load(&root.join("criers.toml")).unwrap());
+        let store =
+            crate::store::Store::open(config.storage.path.clone(), config.storage.max_bytes)
+                .await
+                .unwrap();
+        let now = crate::now_ms();
+        let SummaryTick::Started(end) = store
+            .summary_tick(Arc::clone(&config), now - crate::summary::DAY_MS)
+            .await
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("reporting did not start");
+        };
+        // The same alert from the configured source and from one since removed.
+        store
+            .with_connection(move |connection| {
+                connection.execute(
+                    "INSERT INTO occurrences(source, fingerprint, starts_at, status,
+                        highest_action, alertname, severity, labels, summary, first_seen_at,
+                        last_seen_at, observations)
+                     SELECT source, '000000000000000' || n, '2026-10-12T00:00:00.000000000Z',
+                        'firing', 3, 'DiskFull', 'critical', '{}', '', ?1, ?1, 1
+                     FROM (SELECT 'example' AS source, 1 AS n UNION ALL SELECT 'retired', 2)",
+                    [end + 1],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        store.summary_tick(Arc::clone(&config), now).await.unwrap();
+        let text: String = store
+            .with_connection(|connection| {
+                Ok(connection.query_row(
+                    "SELECT content FROM outbox WHERE kind = 'summary'",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert!(
+            text.contains("- example: DiskFull [critical]")
+                && text.contains("- retired: DiskFull [critical]"),
+            "{text}"
+        );
+    }
 
     #[tokio::test]
     async fn a_section_reads_at_most_the_listed_groups_but_counts_all_of_them() {
