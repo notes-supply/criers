@@ -9,7 +9,7 @@
 use criers_core::Action;
 use rusqlite::{OptionalExtension, Transaction, params};
 
-use super::{HeartbeatStatus, NewIntent, StoreError, insert_intent};
+use super::{FirstDue, HeartbeatStatus, NewIntent, StoreError, insert_intent};
 use crate::{
     config::{Config, Heartbeat},
     summary::{
@@ -285,7 +285,8 @@ fn coverage(
     let stale_after = i64::try_from(heartbeat.stale_after.as_millis()).unwrap_or(i64::MAX);
     let (gap_count, gap_ms): (u64, i64) = transaction
         .prepare_cached(
-            "SELECT count(*), coalesce(sum(min(ended_at, ?3) - max(started_at, ?2)), 0)
+            "SELECT count(*),
+                coalesce(sum(min(ended_at, ?3) - max(coalesce(started_at, ?2), ?2)), 0)
              FROM (SELECT started_at, ended_at FROM heartbeat_gaps
                 WHERE source = ?1 AND ended_at > ?2 AND ended_at < ?3
                 ORDER BY ended_at LIMIT ?4)",
@@ -304,10 +305,11 @@ fn coverage(
             Ok((row.get(0)?, row.get(1)?))
         })?
         .collect::<Result<_, _>>()?;
-    let closed_later: Option<i64> = transaction
+    // An unknown start (NULL) precedes any window end.
+    let closed_later: Option<Option<i64>> = transaction
         .prepare_cached(
             "SELECT started_at FROM heartbeat_gaps
-             WHERE source = ?1 AND ended_at >= ?2 AND started_at < ?2
+             WHERE source = ?1 AND ended_at >= ?2 AND (started_at IS NULL OR started_at < ?2)
              ORDER BY ended_at LIMIT 1",
         )?
         .query_row(params![source, end], |row| row.get(0))
@@ -327,19 +329,22 @@ fn coverage(
             recorded: false,
         }),
         (None, Some(last)) => (last < end && end - last > stale_after).then_some(Ongoing {
-            since: last + stale_after,
+            since: Some(last + stale_after),
             recorded: true,
         }),
         // No heartbeat of the configured alertname yet: overdue once the startup
-        // grace after monitoring began ran out, or unobserved for the whole
-        // window if monitoring never began.
-        (None, None) => {
-            let since = first_due.unwrap_or(start);
-            (since < end).then_some(Ongoing {
-                since,
+        // grace after monitoring began ran out, or since an unknown time if that
+        // start was never recorded or the source was never watched.
+        (None, None) => match first_due {
+            Some(FirstDue::At(due)) => (due < end).then_some(Ongoing {
+                since: Some(due),
                 recorded: false,
-            })
-        }
+            }),
+            Some(FirstDue::Unknown) | None => Some(Ongoing {
+                since: None,
+                recorded: false,
+            }),
+        },
     };
     Ok(Coverage {
         source: source.to_owned(),

@@ -92,7 +92,8 @@ pub(crate) struct Section {
 pub(crate) struct Coverage {
     pub source: String,
     /// The earliest closed gaps, as start and end, at most [`MAX_GAP_LINES`].
-    pub gaps: Vec<(i64, i64)>,
+    /// A gap without a start had no recorded heartbeat before its end at all.
+    pub gaps: Vec<(Option<i64>, i64)>,
     /// Closed gaps counted; if `capped`, there are more than this.
     pub gap_count: u64,
     pub capped: bool,
@@ -105,7 +106,8 @@ pub(crate) struct Coverage {
 /// A heartbeat gap open at the window end.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Ongoing {
-    pub since: i64,
+    /// `None` when no heartbeat was ever recorded and monitoring's start is unknown.
+    pub since: Option<i64>,
     /// Whether the gap is known to follow a received heartbeat. Otherwise the
     /// report says only that no heartbeat was recorded since.
     pub recorded: bool,
@@ -200,9 +202,13 @@ impl Report {
             let source = &coverage.source;
             if coverage.capped || coverage.gap_count > MAX_GAP_LINES as u64 {
                 let at_least = if coverage.capped { "at least " } else { "" };
-                let first = coverage.gaps.first().map_or_else(String::new, |(from, _)| {
-                    format!(", first {}", timestamp(*from, "%m-%d %H:%M"))
-                });
+                let first = coverage
+                    .gaps
+                    .first()
+                    .and_then(|(from, _)| *from)
+                    .map_or_else(String::new, |from| {
+                        format!(", first {}", timestamp(from, "%m-%d %H:%M"))
+                    });
                 lines.push(format!(
                     "- {source}: {at_least}{} heartbeat gaps, {at_least}{} without \
                      heartbeats{first}",
@@ -210,25 +216,33 @@ impl Report {
                     minutes(coverage.gap_ms)
                 ));
             } else {
-                lines.extend(coverage.gaps.iter().map(|(from, until)| {
-                    format!(
+                lines.extend(coverage.gaps.iter().map(|(from, until)| match from {
+                    Some(from) => format!(
                         "- {source}: no heartbeat {} to {} ({})",
                         timestamp(*from, "%m-%d %H:%M"),
                         timestamp(*until, "%H:%M"),
                         minutes(until - from)
-                    )
+                    ),
+                    None => format!(
+                        "- {source}: no heartbeat ever recorded before {}",
+                        timestamp(*until, "%m-%d %H:%M")
+                    ),
                 }));
             }
             if let Some(ongoing) = coverage.ongoing {
-                let what = if ongoing.recorded {
-                    "heartbeat stale"
-                } else {
-                    "no heartbeat recorded"
-                };
-                lines.push(format!(
-                    "- {source}: {what} since {}, ongoing at window end",
-                    timestamp(ongoing.since, "%m-%d %H:%M")
-                ));
+                lines.push(match (ongoing.since, ongoing.recorded) {
+                    (Some(since), true) => format!(
+                        "- {source}: heartbeat stale since {}, ongoing at window end",
+                        timestamp(since, "%m-%d %H:%M")
+                    ),
+                    (Some(since), false) => format!(
+                        "- {source}: no heartbeat recorded since {}, ongoing at window end",
+                        timestamp(since, "%m-%d %H:%M")
+                    ),
+                    (None, _) => {
+                        format!("- {source}: no heartbeat ever recorded, ongoing at window end")
+                    }
+                });
             }
         }
         if self.coverage.len() > MAX_COVERAGE_LINES {
@@ -431,12 +445,12 @@ mod tests {
         report.coverage = (0..100)
             .map(|index| Coverage {
                 source: format!("source{index}"),
-                gaps: vec![(SIX - DAY_MS, SIX - DAY_MS + 60_000); MAX_GAP_LINES],
+                gaps: vec![(Some(SIX - DAY_MS), SIX - DAY_MS + 60_000); MAX_GAP_LINES],
                 gap_count: 10_000,
                 capped: true,
                 gap_ms: 20 * HOUR,
                 ongoing: Some(Ongoing {
-                    since: SIX - HOUR,
+                    since: Some(SIX - HOUR),
                     recorded: true,
                 }),
             })
@@ -505,7 +519,7 @@ mod tests {
         let mut report = report();
         report.coverage = vec![Coverage {
             source: "apollo".to_owned(),
-            gaps: vec![(SIX - 20 * HOUR, SIX - 20 * HOUR + 60_000)],
+            gaps: vec![(Some(SIX - 20 * HOUR), SIX - 20 * HOUR + 60_000)],
             gap_count: 10_000,
             capped: true,
             gap_ms: 10 * HOUR,

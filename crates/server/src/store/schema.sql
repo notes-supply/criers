@@ -139,7 +139,8 @@ CREATE TABLE source_status (
 CREATE TABLE heartbeat_gaps (
     id INTEGER PRIMARY KEY,
     source TEXT NOT NULL,
-    started_at INTEGER NOT NULL,
+    -- NULL when the heartbeat had never been recorded and monitoring's start is unknown.
+    started_at INTEGER,
     ended_at INTEGER NOT NULL
 ) STRICT;
 CREATE INDEX heartbeat_gaps_source ON heartbeat_gaps(source, ended_at);

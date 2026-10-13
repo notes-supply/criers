@@ -949,6 +949,67 @@ async fn first_heartbeat_after_downtime_does_not_erase_unobserved_summary_window
 }
 
 #[tokio::test]
+async fn first_heartbeat_after_schema_3_upgrade_keeps_the_unobserved_window() {
+    let mut harness = Harness::shadow(&format!(
+        "{}[sources.example.heartbeat]\nstale_after = \"10m\"\n",
+        summary_section()
+    ))
+    .await;
+    let now = crate::now_ms();
+    let end = start(&harness).await;
+    let started = end - DAY_MS;
+    let upgraded_path = harness.directory.path().join("schema-3.sqlite");
+    {
+        let connection = rusqlite::Connection::open(&upgraded_path).unwrap();
+        connection
+            .execute_batch(include_str!("../store/schema_v3.sql"))
+            .unwrap();
+        connection.pragma_update(None, "user_version", 3).unwrap();
+        connection
+            .execute(
+                "INSERT INTO source_status(source, coverage, coverage_changed_at,
+                    heartbeat_alertname) VALUES ('example', 'unknown', ?1, 'Watchdog')",
+                [started],
+            )
+            .unwrap();
+    }
+    let migrated = Store::open(upgraded_path.clone(), harness.config.storage.max_bytes)
+        .await
+        .unwrap();
+    harness.store = migrated.clone();
+    harness.state.store = migrated;
+    harness.path = upgraded_path;
+    // Reporting begins after the native schema upgrade, before the downtime.
+    assert_eq!(
+        tick(&harness, now - DAY_MS).await,
+        SummaryTick::Started(started)
+    );
+    harness
+        .store
+        .coverage_tick(Arc::clone(&harness.config), started, started)
+        .await
+        .unwrap();
+    // The migrated source has never had a heartbeat. Its first one arrives
+    // after a whole reporting window has elapsed without collection.
+    harness
+        .ingest(alert("Watchdog", "none", "4000000000000001", "firing"))
+        .await;
+    tick(&harness, now).await;
+    let text = summaries(&harness).await.pop().unwrap().1;
+    // Schema 3 kept when watching began for this still-unknown source, so the gap
+    // starts at the end of its startup grace.
+    assert!(
+        !text.contains("**Coverage gaps:** none")
+            && text.contains("example")
+            && text.contains(&format!(
+                "- example: no heartbeat recorded since {}, ongoing at window end",
+                minute(started + 10 * 60_000)
+            )),
+        "the upgraded source's unobserved window must not become healthy:\n{text}"
+    );
+}
+
+#[tokio::test]
 async fn late_never_seen_evaluation_does_not_erase_the_unobserved_summary_window() {
     let harness = Harness::shadow(&format!(
         "{}[sources.example.heartbeat]\nstale_after = \"10m\"\n",
@@ -1154,4 +1215,117 @@ async fn a_first_heartbeat_within_startup_grace_records_no_gap() {
         .await
         .unwrap();
     assert_eq!((gaps, unobserved), (0, None));
+}
+
+/// Reporting from one window ago over a native schema-3 database whose
+/// `example` source already watched Watchdog, in `coverage` since `changed`
+/// after the window start (none if `None`), with no heartbeat yet. Returns the
+/// harness and the window start.
+async fn upgraded_from_schema_3(coverage: &str, changed: Option<i64>) -> (Harness, i64) {
+    let mut harness = Harness::shadow(&format!(
+        "{}[sources.example.heartbeat]\nstale_after = \"10m\"\n",
+        summary_section()
+    ))
+    .await;
+    let end = start(&harness).await;
+    let started = end - DAY_MS;
+    let upgraded_path = harness.directory.path().join("schema-3.sqlite");
+    {
+        let connection = rusqlite::Connection::open(&upgraded_path).unwrap();
+        connection
+            .execute_batch(include_str!("../store/schema_v3.sql"))
+            .unwrap();
+        connection.pragma_update(None, "user_version", 3).unwrap();
+        connection
+            .execute(
+                "INSERT INTO source_status(source, coverage, coverage_changed_at,
+                    heartbeat_alertname) VALUES ('example', ?1, ?2, 'Watchdog')",
+                rusqlite::params![coverage, changed.map(|offset| started + offset)],
+            )
+            .unwrap();
+    }
+    let migrated = Store::open(upgraded_path.clone(), harness.config.storage.max_bytes)
+        .await
+        .unwrap();
+    harness.store = migrated.clone();
+    harness.state.store = migrated;
+    harness.path = upgraded_path;
+    assert_eq!(
+        tick(&harness, crate::now_ms() - DAY_MS).await,
+        SummaryTick::Started(started)
+    );
+    (harness, started)
+}
+
+fn minute(millis: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(millis)
+        .unwrap()
+        .format("%m-%d %H:%M")
+        .to_string()
+}
+
+#[tokio::test]
+async fn first_heartbeat_ingested_before_any_tick_after_schema_3_upgrade_keeps_the_gap() {
+    let (harness, started) = upgraded_from_schema_3("unknown", Some(0)).await;
+    harness
+        .ingest(alert("Watchdog", "none", "4000000000000001", "firing"))
+        .await;
+    tick(&harness, crate::now_ms()).await;
+    let text = summaries(&harness).await.pop().unwrap().1;
+    assert!(
+        text.contains(&format!(
+            "- example: no heartbeat recorded since {}, ongoing at window end",
+            minute(started + 10 * 60_000)
+        )),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn upgraded_never_seen_source_is_unobserved_before_and_after_its_first_heartbeat() {
+    // 0.1.0 had found the heartbeat overdue two hours into the window, but schema 3
+    // did not keep when watching began, so no start may be invented.
+    let (harness, started) = upgraded_from_schema_3("never_seen", Some(2 * HOUR)).await;
+    let expected = "- example: no heartbeat ever recorded, ongoing at window end";
+    let before = harness
+        .store
+        .summary_tick(Arc::clone(&harness.config), crate::now_ms())
+        .await
+        .unwrap();
+    let before_text = summaries(&harness).await.pop().unwrap().1;
+    // The same window, reported again after the first heartbeat arrived.
+    harness
+        .store
+        .with_connection(move |connection| {
+            connection.execute("DELETE FROM summaries WHERE window_end > ?1", [started])?;
+            connection.execute("DELETE FROM outbox", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    harness
+        .ingest(alert("Watchdog", "none", "4000000000000001", "firing"))
+        .await;
+    tick(&harness, crate::now_ms()).await;
+    let after_text = summaries(&harness).await.pop().unwrap().1;
+    assert!(
+        matches!(before, Some(SummaryTick::Queued(_)))
+            && before_text.contains(expected)
+            && after_text.contains(expected),
+        "before:\n{before_text}\nafter:\n{after_text}"
+    );
+}
+
+#[tokio::test]
+async fn upgraded_source_without_any_recorded_coverage_time_is_never_reported_healthy() {
+    let (harness, _) = upgraded_from_schema_3("unknown", None).await;
+    harness
+        .ingest(alert("Watchdog", "none", "4000000000000001", "firing"))
+        .await;
+    tick(&harness, crate::now_ms()).await;
+    let text = summaries(&harness).await.pop().unwrap().1;
+    assert!(
+        text.contains("- example: no heartbeat ever recorded, ongoing at window end"),
+        "{text}"
+    );
 }

@@ -49,7 +49,8 @@ CREATE INDEX occurrences_open ON occurrences(first_seen_at) WHERE closed_at IS N
 CREATE TABLE heartbeat_gaps (
     id INTEGER PRIMARY KEY,
     source TEXT NOT NULL,
-    started_at INTEGER NOT NULL,
+    -- NULL when the heartbeat had never been recorded and monitoring's start is unknown.
+    started_at INTEGER,
     ended_at INTEGER NOT NULL
 ) STRICT;
 CREATE INDEX heartbeat_gaps_source ON heartbeat_gaps(source, ended_at);
@@ -63,6 +64,10 @@ CREATE TABLE summaries (
 ) STRICT;
 
 -- When monitoring of the configured heartbeat began, until its first heartbeat
--- arrives. Upgraded sources have no record: one still waiting for its first
--- heartbeat is reported unobserved for whole windows until it arrives.
+-- arrives. Schema 3 kept that start only for a watched source still in its
+-- `unknown` state (coverage_changed_at is not moved while unknown). For a
+-- `never_seen` source it is lost: such a source stays without a marker and is
+-- reported as never having had a recorded heartbeat, with no invented start.
 ALTER TABLE source_status ADD COLUMN unobserved_since INTEGER;
+UPDATE source_status SET unobserved_since = coverage_changed_at
+WHERE heartbeat_alertname IS NOT NULL AND last_heartbeat_at IS NULL AND coverage = 'unknown';

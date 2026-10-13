@@ -166,7 +166,10 @@ Criers' own stored history, not from Alertmanager or Prometheus:
   the next, so time Criers itself was down counts as a gap; a source with no
   heartbeat recorded is never shown as healthy. Before the first heartbeat of
   the configured alertname, the gap starts `stale_after` after monitoring began,
-  however late Criers next evaluates it. Whether a gap was still open at
+  however late Criers next evaluates it. A source upgraded from schema 3 that
+  never received its heartbeat, and whose start of monitoring schema 3 did not
+  keep, is reported as never having had a recorded heartbeat, without a start
+  time. Whether a gap was still open at
   the window end comes from the latest heartbeat. Up to 10,000 gaps are counted
   per source; beyond that the report says "at least".
 

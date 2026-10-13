@@ -1767,7 +1767,7 @@ fn coverage_transaction(
             // configuration so nothing keeps advertising them. No notice is sent.
             let cleared = transaction.execute(
                 "UPDATE source_status SET last_heartbeat_at = NULL, heartbeat_alertname = NULL,
-                    coverage = 'unknown', coverage_changed_at = ?2
+                    unobserved_since = NULL, coverage = 'unknown', coverage_changed_at = ?2
                  WHERE source = ?1 AND (last_heartbeat_at IS NOT NULL
                     OR heartbeat_alertname IS NOT NULL OR coverage != 'unknown')",
                 params![source_id, now],
@@ -1866,6 +1866,14 @@ fn coverage_transaction(
     Ok(changes)
 }
 
+/// When a heartbeat that has never been received became overdue.
+enum FirstDue {
+    At(i64),
+    /// Watched since before Criers recorded when; only a database upgraded from
+    /// schema 3 that never received the heartbeat lacks the start of monitoring.
+    Unknown,
+}
+
 /// A source's stored heartbeat freshness.
 struct HeartbeatStatus {
     last_heartbeat_at: Option<i64>,
@@ -1897,12 +1905,13 @@ impl HeartbeatStatus {
         self.last_heartbeat_at.filter(|_| self.watches(heartbeat))
     }
 
-    /// When the configured heartbeat became overdue without ever arriving: its
-    /// startup grace after monitoring began.
-    fn first_due_for(&self, heartbeat: &Heartbeat, stale_after: i64) -> Option<i64> {
-        self.unobserved_since
-            .filter(|_| self.watches(heartbeat) && self.last_heartbeat_at.is_none())
-            .map(|since| since + stale_after)
+    /// When the configured heartbeat became overdue without ever arriving: the
+    /// end of its startup grace after monitoring began, if that is known.
+    fn first_due_for(&self, heartbeat: &Heartbeat, stale_after: i64) -> Option<FirstDue> {
+        (self.watches(heartbeat) && self.last_heartbeat_at.is_none()).then(|| {
+            self.unobserved_since
+                .map_or(FirstDue::Unknown, |since| FirstDue::At(since + stale_after))
+        })
     }
 
     fn watches(&self, heartbeat: &Heartbeat) -> bool {
@@ -1915,7 +1924,8 @@ impl HeartbeatStatus {
 /// Gaps are derived from heartbeat arrival times, so a gap is recorded even when
 /// Criers was down for all of it and never evaluated coverage meanwhile. Only a
 /// previous heartbeat of the configured alertname counts; for the first one, the
-/// gap starts when the startup grace after monitoring began ran out.
+/// gap starts when the startup grace after monitoring began ran out, or has no
+/// known start (stored as NULL) when that was never recorded.
 fn record_heartbeat_gap(
     transaction: &Transaction<'_>,
     source: &str,
@@ -1923,15 +1933,16 @@ fn record_heartbeat_gap(
     now: i64,
 ) -> Result<(), StoreError> {
     let stale_after = i64::try_from(heartbeat.stale_after.as_millis()).unwrap_or(i64::MAX);
-    let started = HeartbeatStatus::read(transaction, source)?.and_then(|status| {
+    let gap = HeartbeatStatus::read(transaction, source)?.and_then(|status| {
         match status.last_for(heartbeat) {
-            Some(last) => (now - last > stale_after).then(|| last + stale_after),
-            None => status
-                .first_due_for(heartbeat, stale_after)
-                .filter(|due| now > *due),
+            Some(last) => (now - last > stale_after).then_some(Some(last + stale_after)),
+            None => match status.first_due_for(heartbeat, stale_after)? {
+                FirstDue::At(due) => (now > due).then_some(Some(due)),
+                FirstDue::Unknown => Some(None),
+            },
         }
     });
-    if let Some(started) = started {
+    if let Some(started) = gap {
         transaction
             .prepare_cached(
                 "INSERT INTO heartbeat_gaps(source, started_at, ended_at) VALUES (?1, ?2, ?3)",
