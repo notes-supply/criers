@@ -329,8 +329,8 @@ repair.
 | `criers_storage_used_bytes`, `criers_storage_limit_bytes` | storage headroom |
 | `criers_credential_files_valid`, `criers_credential_reload_failures_total` | rotation health |
 | `criers_deliveries_finished_total{destination,state}` | live deliveries that ended: sent, failed, ambiguous |
-| `criers_summary_window_end_seconds` | end of the latest generated summary window |
-| `criers_summary_delivered_window_end_seconds` | end of the latest summary window whose message was sent; absent until one is |
+| `criers_summary_window_end_seconds` | end of the latest generated summary window; 0 before the first |
+| `criers_summary_delivered_window_end_seconds` | end of the latest summary window whose message was sent; 0 until one is, and always 0 in shadow mode |
 
 Coverage changes create durable notifications to the heartbeat destination: no
 heartbeat within `stale_after` of startup (`never_seen`), heartbeats stopped
