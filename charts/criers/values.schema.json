@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft-07/schema#",
   "type": "object",
   "additionalProperties": false,
-  "required": ["image", "config", "secrets", "ports", "persistence", "service", "terminationGracePeriodSeconds"],
+  "required": ["image", "config", "secrets", "ports", "persistence", "tmp", "service", "terminationGracePeriodSeconds"],
   "properties": {
     "global": { "type": "object" },
     "image": {
@@ -79,6 +79,14 @@
         "size": { "type": "string", "pattern": "^[0-9]+(\\.[0-9]+)?(Ki|Mi|Gi|Ti)$" },
         "retainOnUninstall": { "type": "boolean" },
         "annotations": { "$ref": "#/definitions/stringMap" }
+      }
+    },
+    "tmp": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sizeLimit"],
+      "properties": {
+        "sizeLimit": { "type": "string", "pattern": "^[0-9]+(\\.[0-9]+)?(Ki|Mi|Gi|Ti)$" }
       }
     },
     "service": {

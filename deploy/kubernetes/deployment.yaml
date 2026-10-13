@@ -74,6 +74,10 @@ spec:
               readOnly: true
             - name: data
               mountPath: /var/lib/criers
+            # SQLite spills statement journals and large sorts here; the root
+            # filesystem is read-only. About the database size at most.
+            - name: tmp
+              mountPath: /tmp
       volumes:
         - name: config
           configMap:
@@ -89,3 +93,6 @@ spec:
         - name: data
           persistentVolumeClaim:
             claimName: criers-data
+        - name: tmp
+          emptyDir:
+            sizeLimit: 1Gi

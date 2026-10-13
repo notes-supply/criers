@@ -61,6 +61,10 @@ check "probes use the ops port" "$container" '.startupProbe.httpGet.path == "/he
 check "grace exceeds both 12s shutdown phases" "$pod" '.terminationGracePeriodSeconds >= 30' default
 check "image defaults to the chart appVersion" "$container" '.image == "ghcr.io/notes-supply/criers:0.2.0"' default
 check "created claim fences with ReadWriteOncePod and is kept" "$claim" '.spec.accessModes[0] == "ReadWriteOncePod" and (.spec.accessModes | length) == 1 and .metadata.annotations["helm.sh/resource-policy"] == "keep"' default
+# SQLite needs a writable temporary directory beside the read-only root.
+check "/tmp is a bounded emptyDir for SQLite temporary files" "$pod | .volumes[] | select(.name == \"tmp\")" '.emptyDir.sizeLimit == "1Gi" and (.emptyDir | has("medium") | not)' default
+check "/tmp is mounted writable in the container" "$container | .volumeMounts[] | select(.name == \"tmp\")" '.mountPath == "/tmp" and (has("readOnly") | not)' default
+check "only data and /tmp are writable" "$container" '(.volumeMounts | map(select(.readOnly != true) | .mountPath) | join(",")) == "/var/lib/criers,/tmp"' default
 check "data volume uses the created claim" "$pod | .volumes[] | select(.name == \"data\")" '.persistentVolumeClaim.claimName == "criers-data"' default
 check "ingest Service exposes the ingest port" "$ingest" '.spec.ports[0].targetPort == "ingest" and .spec.ports[0].port == 8080' default
 check "ops Service is ClusterIP and scrapeable" "$ops" '.spec.type == "ClusterIP" and .spec.ports[0].targetPort == "ops" and .metadata.annotations["prometheus.io/scrape"] == "true" and .metadata.annotations["prometheus.io/port"] == "9090" and .metadata.annotations["prometheus.io/path"] == "/metrics"' default
@@ -88,6 +92,7 @@ reject "unknown values such as replicas" "additional properties 'replicas' not a
 reject "no Secrets" "at '/secrets': minItems" --set-json 'secrets=[]'
 reject "a shared access mode" "at '/persistence/accessMode'" --set persistence.accessMode=ReadWriteMany
 reject "a mutable tag in the digest field" "at '/image/digest'" --set image.digest=latest
+reject "a /tmp limit without a unit" "at '/tmp/sizeLimit'" --set tmp.sizeLimit=1024
 reject "equal container ports" "ports.ingest and ports.ops must differ" --set ports.ops=8080
 
 # The generic Flux example: valid Flux resources whose values the chart accepts.

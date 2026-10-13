@@ -80,6 +80,14 @@ persistence:
   retainOnUninstall: true
   annotations: {}
 
+# SQLite spills statement journals and large sorts to temporary files in /tmp,
+# for example in schema upgrades and daily summaries over many alerts. The root
+# filesystem stays read-only, so /tmp is an emptyDir on node storage. It needs
+# at most about the database size (config `storage.max_size_mib`); the kubelet
+# evicts the pod if the limit is exceeded.
+tmp:
+  sizeLimit: 1Gi
+
 service:
   ingest:
     type: ClusterIP

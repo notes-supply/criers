@@ -376,6 +376,15 @@ projected volume (so updates reach the files), a PersistentVolumeClaim, probes,
 resources, and a non-root, read-only-root container. Replace the placeholder
 image and secret values; the placeholders fail validation on purpose.
 
+SQLite writes temporary files for statement journals and large sorts, for
+example during a schema upgrade or a daily summary over many alerts, and needs
+a writable temporary directory. Both the chart and the manifests mount an
+`emptyDir` at `/tmp` (1 GiB limit, about the database's maximum size) and keep
+the root filesystem read-only. Without it, Criers fails with SQLite error code
+6410 (no temporary path) once the data outgrows SQLite's in-memory buffers, so a
+small test database can pass. With `docker run --read-only`, add
+`--mount type=tmpfs,dst=/tmp` or a volume at `/tmp`.
+
 Run exactly one Criers per database. The claim requests `ReadWriteOncePod`,
 which needs a CSI driver that supports it and then prevents a second pod from
 mounting the volume. Plain `ReadWriteOnce` only restricts mounting to one node.
