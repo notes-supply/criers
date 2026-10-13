@@ -136,24 +136,34 @@ pub(crate) struct Report {
 }
 
 impl Report {
-    /// Renders the report within [`MAX_CHARS`], folding the least important
-    /// group lines into a counted "more" line until it fits.
+    /// Renders the report within [`MAX_CHARS`]. Detail is folded into counted
+    /// lines until it fits: first the least important group lines, then coverage
+    /// detail per gap, then per source. Section totals, omitted alerts and failed
+    /// or uncertain notifications are always kept.
     pub(crate) fn render(&self) -> String {
+        let attempts = [Detail::Gaps, Detail::Sources, Detail::Totals]
+            .into_iter()
+            .flat_map(|detail| {
+                let floor = if detail == Detail::Totals { 0 } else { 3 };
+                (floor..=MAX_GROUP_LINES)
+                    .rev()
+                    .map(move |limit| (detail, limit))
+            });
         let mut text = String::new();
-        for limit in (0..=MAX_GROUP_LINES).rev() {
-            text = self.render_with(limit);
+        for (detail, limit) in attempts {
+            text = self.render_with(limit, detail);
             if text.chars().count() <= MAX_CHARS {
                 return text;
             }
         }
-        // Unreachable with the fixed line caps; the bound holds regardless.
+        // Unreachable: totals and twelve bounded lines are far below the cap.
         text.chars()
             .take(MAX_CHARS - 3)
             .chain("...".chars())
             .collect()
     }
 
-    fn render_with(&self, group_lines: usize) -> String {
+    fn render_with(&self, group_lines: usize, detail: Detail) -> String {
         let mut lines = vec![self.title()];
         section(
             &mut lines,
@@ -171,7 +181,7 @@ impl Report {
             false,
             self.show_source,
         );
-        let coverage = self.coverage_lines();
+        let coverage = self.coverage_lines(detail);
         if coverage.is_empty() {
             lines.push("**Coverage gaps:** none".to_owned());
         } else {
@@ -196,73 +206,45 @@ impl Report {
         title
     }
 
-    fn coverage_lines(&self) -> Vec<String> {
+    fn coverage_lines(&self, detail: Detail) -> Vec<String> {
         let mut lines = Vec::new();
-        for coverage in self.coverage.iter().take(MAX_COVERAGE_LINES) {
-            let source = &coverage.source;
-            if coverage.capped || coverage.gap_count > MAX_GAP_LINES as u64 {
-                let at_least = if coverage.capped { "at least " } else { "" };
-                let first = coverage
-                    .gaps
-                    .first()
-                    .and_then(|(from, _)| *from)
-                    .map_or_else(String::new, |from| {
-                        format!(", first {}", timestamp(from, "%m-%d %H:%M"))
-                    });
-                lines.push(format!(
-                    "- {source}: {at_least}{} heartbeat gaps, {at_least}{} without \
-                     heartbeats{first}",
-                    coverage.gap_count,
-                    minutes(coverage.gap_ms)
-                ));
-            } else {
-                lines.extend(coverage.gaps.iter().map(|(from, until)| match from {
-                    Some(from) => format!(
-                        "- {source}: no heartbeat {} to {} ({})",
-                        timestamp(*from, "%m-%d %H:%M"),
-                        timestamp(*until, "%H:%M"),
-                        minutes(until - from)
-                    ),
-                    None => format!(
-                        "- {source}: no heartbeat ever recorded before {}",
-                        timestamp(*until, "%m-%d %H:%M")
-                    ),
+        let shown = MAX_COVERAGE_LINES.min(self.coverage.len());
+        match detail {
+            Detail::Gaps => {
+                for coverage in &self.coverage[..shown] {
+                    gap_lines(&mut lines, coverage);
+                }
+                more_sources(&mut lines, &self.coverage[shown..]);
+            }
+            Detail::Sources => {
+                lines.extend(self.coverage[..shown].iter().map(|coverage| {
+                    format!(
+                        "- {}: {}",
+                        coverage.source,
+                        gap_totals(std::slice::from_ref(coverage))
+                    )
                 }));
+                more_sources(&mut lines, &self.coverage[shown..]);
             }
-            if let Some(ongoing) = coverage.ongoing {
-                lines.push(match (ongoing.since, ongoing.recorded) {
-                    (Some(since), true) => format!(
-                        "- {source}: heartbeat stale since {}, ongoing at window end",
-                        timestamp(since, "%m-%d %H:%M")
-                    ),
-                    (Some(since), false) => format!(
-                        "- {source}: no heartbeat recorded since {}, ongoing at window end",
-                        timestamp(since, "%m-%d %H:%M")
-                    ),
-                    (None, _) => {
-                        format!("- {source}: no heartbeat ever recorded, ongoing at window end")
-                    }
-                });
+            Detail::Totals => {
+                if !self.coverage.is_empty() {
+                    lines.push(format!(
+                        "- heartbeat gaps on {} sources: {}",
+                        self.coverage.len(),
+                        gap_totals(&self.coverage)
+                    ));
+                }
             }
         }
-        if self.coverage.len() > MAX_COVERAGE_LINES {
+        if detail == Detail::Gaps && self.truncated.len() <= MAX_COVERAGE_LINES {
+            lines.extend(self.truncated.iter().map(|(source, count)| {
+                format!("- {source}: {count} alerts omitted by Alertmanager")
+            }));
+        } else if !self.truncated.is_empty() {
+            let omitted: u64 = self.truncated.iter().map(|(_, count)| count).sum();
             lines.push(format!(
-                "- +{} more sources with heartbeat gaps",
-                self.coverage.len() - MAX_COVERAGE_LINES
-            ));
-        }
-        lines.extend(
-            self.truncated
-                .iter()
-                .take(MAX_COVERAGE_LINES)
-                .map(|(source, count)| {
-                    format!("- {source}: {count} alerts omitted by Alertmanager")
-                }),
-        );
-        if self.truncated.len() > MAX_COVERAGE_LINES {
-            lines.push(format!(
-                "- +{} more sources with omitted alerts",
-                self.truncated.len() - MAX_COVERAGE_LINES
+                "- {omitted} alerts omitted by Alertmanager across {} sources",
+                self.truncated.len()
             ));
         }
         if self.failed + self.uncertain > 0 {
@@ -273,6 +255,91 @@ impl Report {
         }
         lines
     }
+}
+
+/// How much coverage detail a rendering keeps.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Detail {
+    /// Each gap, per source.
+    Gaps,
+    /// One counted line per source.
+    Sources,
+    /// One counted line for all sources.
+    Totals,
+}
+
+fn gap_lines(lines: &mut Vec<String>, coverage: &Coverage) {
+    let source = &coverage.source;
+    if coverage.capped || coverage.gap_count > MAX_GAP_LINES as u64 {
+        let at_least = if coverage.capped { "at least " } else { "" };
+        let first = coverage
+            .gaps
+            .first()
+            .and_then(|(from, _)| *from)
+            .map_or_else(String::new, |from| {
+                format!(", first {}", timestamp(from, "%m-%d %H:%M"))
+            });
+        lines.push(format!(
+            "- {source}: {at_least}{} heartbeat gaps, {at_least}{} without heartbeats{first}",
+            coverage.gap_count,
+            minutes(coverage.gap_ms)
+        ));
+    } else {
+        lines.extend(coverage.gaps.iter().map(|(from, until)| match from {
+            Some(from) => format!(
+                "- {source}: no heartbeat {} to {} ({})",
+                timestamp(*from, "%m-%d %H:%M"),
+                timestamp(*until, "%H:%M"),
+                minutes(until - from)
+            ),
+            None => format!(
+                "- {source}: no heartbeat ever recorded before {}",
+                timestamp(*until, "%m-%d %H:%M")
+            ),
+        }));
+    }
+    if let Some(ongoing) = coverage.ongoing {
+        lines.push(match (ongoing.since, ongoing.recorded) {
+            (Some(since), true) => format!(
+                "- {source}: heartbeat stale since {}, ongoing at window end",
+                timestamp(since, "%m-%d %H:%M")
+            ),
+            (Some(since), false) => format!(
+                "- {source}: no heartbeat recorded since {}, ongoing at window end",
+                timestamp(since, "%m-%d %H:%M")
+            ),
+            (None, _) => format!("- {source}: no heartbeat ever recorded, ongoing at window end"),
+        });
+    }
+}
+
+fn more_sources(lines: &mut Vec<String>, rest: &[Coverage]) {
+    if !rest.is_empty() {
+        lines.push(format!(
+            "- +{} more sources with heartbeat gaps: {}",
+            rest.len(),
+            gap_totals(rest)
+        ));
+    }
+}
+
+/// Closed gaps, time without heartbeats and open gaps across `coverage`.
+fn gap_totals(coverage: &[Coverage]) -> String {
+    let at_least = if coverage.iter().any(|coverage| coverage.capped) {
+        "at least "
+    } else {
+        ""
+    };
+    let gaps: u64 = coverage.iter().map(|coverage| coverage.gap_count).sum();
+    let gap_ms: i64 = coverage.iter().map(|coverage| coverage.gap_ms).sum();
+    let ongoing = coverage
+        .iter()
+        .filter(|coverage| coverage.ongoing.is_some())
+        .count();
+    format!(
+        "{at_least}{gaps} closed gaps, {at_least}{} without heartbeats, {ongoing} ongoing",
+        minutes(gap_ms)
+    )
 }
 
 fn section(
@@ -530,6 +597,54 @@ mod tests {
         assert!(
             exact.contains("(1h 59m)") && longer.contains("(2h)"),
             "{exact}\n{longer}"
+        );
+    }
+
+    #[test]
+    fn dense_coverage_keeps_every_diagnostic_total_within_the_budget() {
+        let mut report = report();
+        let long = "\u{00e9}".repeat(70);
+        report.open = Section {
+            total: 40,
+            new: 40,
+            group_count: 30,
+            groups: (0..MAX_GROUP_LINES)
+                .map(|index| {
+                    let mut group = group(&format!("{long}{index}"), 2, 2);
+                    group.summary = Some(long.clone());
+                    group
+                })
+                .collect(),
+        };
+        report.coverage = (0..5)
+            .map(|index| Coverage {
+                source: format!("{index}{}", "s".repeat(63)),
+                gaps: (0..3)
+                    .map(|gap| (Some(SIX - (20 - gap) * HOUR), SIX - (19 - gap) * HOUR))
+                    .collect(),
+                gap_count: 3,
+                capped: false,
+                gap_ms: 3 * HOUR,
+                ongoing: Some(Ongoing {
+                    since: Some(SIX - HOUR),
+                    recorded: true,
+                }),
+            })
+            .collect();
+        report.truncated = (0..5)
+            .map(|index| (format!("{index}{}", "s".repeat(63)), 7))
+            .collect();
+        report.failed = 2;
+        report.uncertain = 1;
+        let text = report.render();
+        assert!(
+            text.chars().count() <= MAX_CHARS
+                && !text.ends_with("...")
+                && text.contains("5 sources")
+                && text.contains("35 alerts omitted")
+                && text.contains("- notifications: 2 failed, 1 may not have arrived"),
+            "{} chars:\n{text}",
+            text.chars().count()
         );
     }
 

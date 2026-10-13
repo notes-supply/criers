@@ -310,6 +310,9 @@ fn observe(metrics: &Metrics, source: &str, receipt: &Receipt, firing: u64, reso
             })
             .inc();
     }
+    for ended in &receipt.ended {
+        metrics.delivery_ended(&ended.destination, ended.state, 1);
+    }
     if receipt.assessments_skipped > 0 {
         metrics
             .assessments

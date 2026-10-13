@@ -187,9 +187,12 @@ async fn serve(path: &Path) -> Result<()> {
             .abandon_unconfigured(config.destinations.keys().cloned().collect())
             .await
             .context("cannot reconcile deliveries for removed destinations")?;
-        if abandoned > 0 {
+        for ended in &abandoned {
+            metrics.delivery_ended(&ended.destination, ended.state, 1);
+        }
+        if !abandoned.is_empty() {
             tracing::warn!(
-                abandoned,
+                abandoned = abandoned.len(),
                 "ended open deliveries for destinations no longer configured"
             );
         }

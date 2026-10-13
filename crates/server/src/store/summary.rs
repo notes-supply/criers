@@ -9,7 +9,7 @@
 use criers_core::Action;
 use rusqlite::{OptionalExtension, Transaction, params};
 
-use super::{FirstDue, HeartbeatStatus, NewIntent, StoreError, insert_intent};
+use super::{FirstDue, HeartbeatStatus, NewIntent, StoreError, insert_intent, watch_heartbeat};
 use crate::{
     config::{Config, Heartbeat},
     summary::{
@@ -75,6 +75,13 @@ pub(super) fn tick(
             cursor.max(retained).min(end)
         }
     };
+    // Coverage is read only for heartbeats being watched, whichever of this and the
+    // coverage tick runs first after a configuration change.
+    for (source, settings) in &config.sources {
+        if let Some(heartbeat) = &settings.heartbeat {
+            watch_heartbeat(transaction, source, heartbeat, now)?;
+        }
+    }
     let report = report(transaction, config, start, end, now)?;
     let intent = NewIntent {
         occurrence: None,
@@ -212,10 +219,10 @@ fn section(
     let (total, new, group_count) = transaction
         .prepare_cached(concat!(
             candidates!(),
-            "SELECT count(*), coalesce(sum(first_seen_at >= ?1), 0),
-                count(DISTINCT source || char(31) || alertname || char(31)
-                    || coalesce(severity, char(30)))
-             FROM candidates WHERE category = ?4"
+            "SELECT coalesce(sum(size), 0), coalesce(sum(fresh), 0), count(*)
+             FROM (SELECT count(*) AS size, sum(first_seen_at >= ?1) AS fresh
+                FROM candidates WHERE category = ?4
+                GROUP BY source, alertname, severity)"
         ))?
         .query_row(params![start, end, digest, category], |row| {
             Ok((count(row, 0)?, count(row, 1)?, count(row, 2)?))

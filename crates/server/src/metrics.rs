@@ -88,6 +88,7 @@ pub(crate) struct Metrics {
     pub retention_deleted: Family<TableLabels, Counter>,
     pub credential_files_valid: Family<SourceLabels, Gauge>,
     pub credential_reload_failures: Family<SourceLabels, Counter>,
+    pub summary_cursor: FloatGauge,
     pub summary_window_end: FloatGauge,
     pub summary_delivered_window_end: FloatGauge,
     pub ready: Gauge,
@@ -118,6 +119,7 @@ impl Metrics {
             retention_deleted: Family::default(),
             credential_files_valid: Family::default(),
             credential_reload_failures: Family::default(),
+            summary_cursor: FloatGauge::default(),
             summary_window_end: FloatGauge::default(),
             summary_delivered_window_end: FloatGauge::default(),
             ready: Gauge::default(),
@@ -220,6 +222,11 @@ impl Metrics {
             m.credential_reload_failures.clone(),
         );
         registry.register(
+            "summary_cursor_seconds",
+            "Unix time of the latest window end the summary schedule has reached",
+            m.summary_cursor.clone(),
+        );
+        registry.register(
             "summary_window_end_seconds",
             "Unix time at which the latest generated summary window ended",
             m.summary_window_end.clone(),
@@ -233,6 +240,18 @@ impl Metrics {
         Self {
             registry,
             ..metrics
+        }
+    }
+
+    /// Counts live deliveries that ended, whichever path ended them.
+    pub(crate) fn delivery_ended(&self, destination: &str, state: &'static str, count: u64) {
+        if count > 0 {
+            self.deliveries_finished
+                .get_or_create(&DestinationState {
+                    destination: destination.to_owned(),
+                    state,
+                })
+                .inc_by(count);
         }
     }
 

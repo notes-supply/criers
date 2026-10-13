@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     config::{Delivery, Destination},
     http_body::{BodyError, read_bounded},
-    metrics::{DestinationOutcome, DestinationState, Metrics},
+    metrics::{DestinationOutcome, Metrics},
     render::DISCORD_CONTENT_CHARS,
     store::{Batch, Claim, ClaimLimits, Completion, Store},
 };
@@ -458,15 +458,7 @@ impl Worker {
                 ("failed", finished.failed),
                 ("ambiguous", finished.ambiguous),
             ] {
-                if count > 0 {
-                    self.metrics
-                        .deliveries_finished
-                        .get_or_create(&DestinationState {
-                            destination: self.destination.clone(),
-                            state,
-                        })
-                        .inc_by(count);
-                }
+                self.metrics.delivery_ended(&self.destination, state, count);
             }
             return;
         }

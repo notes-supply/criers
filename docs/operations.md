@@ -176,7 +176,11 @@ Criers' own stored history, not from Alertmanager or Prometheus:
 It lists occurrences whose highest action was `digest`, `quiet_post` or `ping`;
 `record` occurrences and heartbeats are not listed. Each section's count equals
 its lines plus a final "+N more" line, and the whole report fits one Discord
-message (at most 1500 characters). Alert text is escaped like any other post.
+message (at most 1500 characters): when space runs out, coverage detail is
+folded into one line per source and then into totals, while omitted alerts and
+failed or uncertain notifications are always shown. Alert text is escaped like
+any other post. Omitted alerts are kept even when a webhook carried only the
+heartbeat.
 
 Warnings and the summary interact through policy only: with
 `warning = "quiet_post"` warnings post at once and also appear in the summary;
@@ -203,10 +207,11 @@ Scheduling and delivery:
 Generation holds the database connection for its duration, which is how long it
 can delay a concurrent webhook commit. Measured with the release build: about
 80 ms for 20,000 notifying occurrences in one window and 270 ms for 100,000.
-`criers_summary_window_end_seconds` shows that summaries are generated;
+`criers_summary_cursor_seconds` shows that the schedule advances,
+`criers_summary_window_end_seconds` that summaries are generated, and
 `criers_summary_delivered_window_end_seconds` shows that one actually reached
-Discord. A revoked webhook or blocked egress leaves the first fresh and the
-second stale, and shows up in `criers_deliveries_finished_total{state="failed"}`
+Discord. A revoked webhook or blocked egress leaves the generated window fresh
+and the delivered one stale, and shows up in `criers_deliveries_finished_total{state="failed"}`
 and `criers_delivery_oldest_pending_age_seconds`. Alert on those from outside
 the instance: an alert routed through the broken destination cannot arrive.
 
@@ -333,7 +338,8 @@ repair.
 | `criers_assessments_total{outcome}`, `criers_assessment_queue` | shadow assessment |
 | `criers_storage_used_bytes`, `criers_storage_limit_bytes` | storage headroom |
 | `criers_credential_files_valid`, `criers_credential_reload_failures_total` | rotation health |
-| `criers_deliveries_finished_total{destination,state}` | live deliveries that ended: sent, failed, ambiguous |
+| `criers_deliveries_finished_total{destination,state}` | live deliveries that ended: sent, failed, ambiguous, including those ended because their destination was removed |
+| `criers_summary_cursor_seconds` | latest window end the summary schedule has reached, including where reporting started |
 | `criers_summary_window_end_seconds` | end of the latest generated summary window; 0 before the first |
 | `criers_summary_delivered_window_end_seconds` | end of the latest summary window whose message was sent; 0 until one is, and always 0 in shadow mode |
 

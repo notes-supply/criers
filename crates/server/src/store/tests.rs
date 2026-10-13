@@ -459,7 +459,16 @@ async fn open_deliveries_for_removed_destinations_are_ended() {
         .await
         .unwrap();
     let state: String = harness.query("SELECT state FROM outbox").await;
-    assert_eq!((abandoned, state.as_str()), (1, "failed"));
+    assert_eq!(
+        (abandoned, state.as_str()),
+        (
+            vec![super::Ended {
+                destination: "quiet".to_owned(),
+                state: "failed"
+            }],
+            "failed"
+        )
+    );
 }
 
 fn sent() -> super::Completion {
@@ -891,12 +900,12 @@ async fn recovery_for_a_removed_destination_is_terminal_and_does_not_pin_retenti
         .await
         .unwrap();
     assert!(
-        abandoned == 0
+        abandoned.is_empty()
             && recovery == "quiet:failed:destination_not_configured"
             && matches!(claim, Claim::Wait(None))
             && early.occurrences == 0
             && later.occurrences == 1,
-        "abandoned={abandoned} recovery={recovery} claim={claim:?} early={early:?} later={later:?}"
+        "abandoned={abandoned:?} recovery={recovery} claim={claim:?} early={early:?} later={later:?}"
     );
 }
 

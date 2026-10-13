@@ -53,6 +53,9 @@ fn publish(config: &Config, metrics: &Metrics, stats: &Stats) {
     metrics.storage_used_bytes.set(stats.used_bytes);
     metrics.storage_limit_bytes.set(stats.limit_bytes);
     metrics.assessment_queue.set(stats.assessment_queue);
+    if let Some(end) = stats.summary_generated {
+        metrics.summary_window_end.set(end as f64 / 1000.0);
+    }
     if let Some(end) = stats.summary_delivered {
         metrics
             .summary_delivered_window_end
@@ -268,9 +271,7 @@ pub(crate) async fn summary(
                             wake.notify_waiters();
                         }
                         cursor = Some(tick.cursor());
-                        metrics
-                            .summary_window_end
-                            .set(tick.cursor() as f64 / 1000.0);
+                        metrics.summary_cursor.set(tick.cursor() as f64 / 1000.0);
                     }
                     SUMMARY_POLL
                 }

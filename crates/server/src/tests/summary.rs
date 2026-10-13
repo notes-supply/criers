@@ -1330,3 +1330,166 @@ async fn upgraded_source_without_any_recorded_coverage_time_is_never_reported_he
         "{text}"
     );
 }
+
+/// Restarts the store under the same configuration, as a daemon restart would.
+async fn restart(harness: Harness, extra: &str) -> Harness {
+    let Harness {
+        directory,
+        path,
+        config,
+        store,
+        state,
+    } = harness;
+    drop(state);
+    drop(store);
+    let store = Store::open(path.clone(), config.storage.max_bytes)
+        .await
+        .unwrap();
+    let mut harness = Harness::shadow(extra).await;
+    harness.directory = directory;
+    harness.path = path;
+    harness.config = config;
+    harness.state.store = store.clone();
+    harness.store = store;
+    harness
+}
+
+#[tokio::test]
+async fn a_newly_configured_heartbeat_reports_alike_in_either_startup_order() {
+    let extra = format!(
+        "{}[sources.example.heartbeat]\nstale_after = \"10m\"\n",
+        summary_section()
+    );
+    let mut coverage = Vec::new();
+    for coverage_first in [false, true] {
+        let harness = Harness::shadow(&extra).await;
+        // Reporting began a day ago, before this heartbeat was configured.
+        start(&harness).await;
+        harness
+            .store
+            .with_connection(|connection| {
+                connection.execute(
+                    "UPDATE summaries SET window_end = window_end - ?1",
+                    [DAY_MS],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let now = crate::now_ms();
+        if coverage_first {
+            harness
+                .store
+                .coverage_tick(Arc::clone(&harness.config), now, now)
+                .await
+                .unwrap();
+        }
+        assert!(matches!(tick(&harness, now).await, SummaryTick::Queued(_)));
+        let text = summaries(&harness).await.pop().unwrap().1;
+        coverage.push(text.split_once("**Coverage gaps").unwrap().1.to_owned());
+    }
+    assert_eq!(
+        (coverage[0].as_str(), coverage[1].as_str()),
+        (":** none", ":** none"),
+        "monitoring began after the window, in both orders"
+    );
+}
+
+#[tokio::test]
+async fn groups_differing_only_around_control_characters_are_counted_apart() {
+    let harness = Harness::shadow(&summary_section()).await;
+    let end = start(&harness).await;
+    for index in 0..13 {
+        harness
+            .ingest(alert(
+                &format!("Plain{index:02}"),
+                "warning",
+                &format!("1{index:015x}"),
+                "firing",
+            ))
+            .await;
+    }
+    // Joined with the separators the old count used, these two groups collided.
+    harness
+        .ingest(alert("a\u{1f}b", "c", "2000000000000001", "firing"))
+        .await;
+    harness
+        .ingest(alert("a", "b\u{1f}c", "2000000000000002", "firing"))
+        .await;
+    tick(&harness, end + DAY_MS).await;
+    let text = summaries(&harness).await.remove(0).1;
+    assert!(
+        text.contains("**Open: 15** (15 new)") && text.contains("- +3 more alert names (3 alerts)"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn omissions_reported_with_only_a_heartbeat_survive_a_clean_heartbeat_and_restart() {
+    let extra = format!(
+        "{}[sources.example.heartbeat]\nstale_after = \"10m\"\n",
+        summary_section()
+    );
+    let harness = Harness::shadow(&extra).await;
+    let end = start(&harness).await;
+    let truncated = with(
+        alert("Watchdog", "none", "4000000000000001", "firing"),
+        "/truncatedAlerts",
+        json!(5),
+    );
+    harness.ingest(truncated).await;
+    harness
+        .ingest(alert("Watchdog", "none", "4000000000000001", "firing"))
+        .await;
+    let harness = restart(harness, &extra).await;
+    heartbeats_until(&harness, end + DAY_MS - 30_000).await;
+    tick(&harness, end + DAY_MS).await;
+    let text = summaries(&harness).await.remove(0).1;
+    let (occurrences, decisions): (i64, i64) = harness
+        .store
+        .with_connection(|connection| {
+            Ok(connection.query_row(
+                "SELECT (SELECT count(*) FROM occurrences), (SELECT count(*) FROM decisions)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert!(
+        text.contains("- example: 5 alerts omitted by Alertmanager")
+            && !text.contains("Watchdog")
+            && (occurrences, decisions) == (0, 0),
+        "occurrences={occurrences} decisions={decisions}\n{text}"
+    );
+}
+
+#[tokio::test]
+async fn the_generated_window_is_reported_only_after_a_summary_is_generated() {
+    let harness = Harness::shadow(&summary_section()).await;
+    let end = start(&harness).await;
+    let initial = harness.store.probe().await.unwrap();
+    let restarted = restart(harness, &summary_section()).await;
+    let current = tick(&restarted, crate::now_ms()).await;
+    let after_restart = restarted.store.probe().await.unwrap();
+    tick(&restarted, end + DAY_MS).await;
+    let generated = restarted.store.probe().await.unwrap();
+    let again = restart(restarted, &summary_section()).await;
+    let restored = again.store.probe().await.unwrap();
+    assert_eq!(
+        (
+            initial.summary_generated,
+            current,
+            after_restart.summary_generated,
+            generated.summary_generated,
+            restored.summary_generated
+        ),
+        (
+            None,
+            SummaryTick::Current(end),
+            None,
+            Some(end + DAY_MS),
+            Some(end + DAY_MS)
+        )
+    );
+}
