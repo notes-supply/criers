@@ -23,7 +23,7 @@ use tokio::sync::OwnedSemaphorePermit;
 use crate::{
     assessment::{self, Answers, QUESTIONS_VERSION},
     config::{Config, Heartbeat, Mode, Source},
-    render::{self, Subject},
+    render::{self, EMBEDS_TOTAL_LIMIT, MAX_EMBEDS, Part, Subject, units},
 };
 
 mod summary;
@@ -160,7 +160,9 @@ pub(crate) struct Snapshot {
 #[derive(Debug)]
 pub(crate) struct Batch {
     pub ids: Vec<i64>,
-    pub lines: Vec<String>,
+    pub parts: Vec<Part>,
+    /// The headline of the first card that pings, which follows the mention.
+    pub headline: Option<String>,
     pub ping: bool,
     /// Set when this batch may mention recipients; the cooldown is already consumed.
     pub mention: Option<MentionClaim>,
@@ -192,10 +194,11 @@ pub(crate) enum Claim {
     Wait(Option<i64>),
 }
 
-/// Destination-specific claim bounds.
+/// Destination-specific claim bounds. Embeds are bounded by Discord's limits.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ClaimLimits {
     pub max_rows: u32,
+    /// Message content left for plain lines of earlier releases, in UTF-16 units.
     pub budget_chars: usize,
     pub mention_cooldown_ms: i64,
 }
@@ -1187,6 +1190,8 @@ fn process_alert(
         alertname: alert.alertname(),
         severity: alert.severity(),
         summary: &observed.summary,
+        labels: &alert.labels,
+        started_at: alert.starts_at,
     };
     let intent_id = match transition.intent {
         None => None,
@@ -1197,12 +1202,15 @@ fn process_alert(
                 destination,
                 kind: "notify",
                 action,
-                content: render::firing(&subject),
+                content: render::firing(&subject, action, &config.icons(destination)).stored(),
             };
             insert_intent(transaction, config.mode, &intent, now)?
         }
         Some(Intent::Recovery) => {
-            let content = render::resolved(&subject);
+            let highest = match observed.prior {
+                Prior::Firing(highest) => highest,
+                Prior::New | Prior::Resolved | Prior::Superseded => Action::QuietPost,
+            };
             let mut first = None;
             for recovery_destination in &recovery_destinations {
                 let intent = NewIntent {
@@ -1211,7 +1219,13 @@ fn process_alert(
                     destination: recovery_destination,
                     kind: "recovery",
                     action: Action::QuietPost,
-                    content: content.clone(),
+                    content: render::resolved(
+                        &subject,
+                        highest,
+                        alert.ends_at,
+                        &config.icons(recovery_destination),
+                    )
+                    .stored(),
                 };
                 let inserted = insert_intent(transaction, config.mode, &intent, now)?;
                 // A destination removed from the configuration has no worker, so its
@@ -1600,13 +1614,14 @@ fn claim_transaction(
         .collect::<Result<Vec<_>, _>>()?;
     let mut batch = Batch {
         ids: Vec::with_capacity(candidates.len()),
-        lines: Vec::with_capacity(candidates.len()),
+        parts: Vec::with_capacity(candidates.len()),
+        headline: None,
         ping: false,
         mention: None,
         possibly_duplicate: false,
         max_failures: 0,
     };
-    let mut used = 0;
+    let (mut line_units, mut embed_units, mut embeds) = (0, 0, 0);
     for candidate in candidates {
         if candidate.kind == "recovery" {
             let delivered: bool = transaction
@@ -1625,18 +1640,34 @@ fn claim_transaction(
                 continue;
             }
         }
-        // A summary is a complete message of its own, never mixed with alert lines.
+        // A summary is a complete message of its own, never mixed with alerts.
         let alone = candidate.kind == "summary";
-        let length = candidate.content.chars().count() + 1;
-        if !batch.ids.is_empty() && (alone || used + length > limits.budget_chars) {
+        let part = Part::parse(candidate.content);
+        let fits = match &part {
+            Part::Card(card) => {
+                embeds < MAX_EMBEDS && embed_units + card.embed.units() <= EMBEDS_TOTAL_LIMIT
+            }
+            Part::Line(line) => line_units + units(line) < limits.budget_chars,
+        };
+        if !batch.ids.is_empty() && (alone || !fits) {
             break;
         }
-        used += length;
-        batch.ping |= candidate.action == "ping";
+        let ping = candidate.action == "ping";
+        match &part {
+            Part::Card(card) => {
+                embeds += 1;
+                embed_units += card.embed.units();
+                if ping && batch.headline.is_none() {
+                    batch.headline = Some(card.headline.clone());
+                }
+            }
+            Part::Line(line) => line_units += units(line) + 1,
+        }
+        batch.ping |= ping;
         batch.possibly_duplicate |= candidate.possibly_delivered;
         batch.max_failures = batch.max_failures.max(candidate.failures);
         batch.ids.push(candidate.id);
-        batch.lines.push(candidate.content);
+        batch.parts.push(part);
         if alone {
             break;
         }
@@ -1860,27 +1891,34 @@ fn coverage_transaction(
                 coverage_changed_at = excluded.coverage_changed_at",
             params![source_id, state, now],
         )?;
+        let icons = config.icons(&heartbeat.destination);
         let message = match (previous.as_str(), state) {
-            ("stale" | "never_seen", "healthy") => Some(render::coverage_recovered(source_id)),
+            ("stale" | "never_seen", "healthy") => {
+                Some(render::coverage_recovered(source_id, now, &icons))
+            }
             (_, "stale") => Some(render::coverage_stale(
                 source_id,
-                Duration::from_millis(u64::try_from(now - last.unwrap_or(now)).unwrap_or(0)),
+                last.unwrap_or(now),
+                now,
+                &icons,
             )),
             (_, "never_seen") => Some(render::coverage_never_seen(
                 source_id,
                 heartbeat.stale_after,
+                now,
+                &icons,
             )),
             _ => None,
         };
         let notified = match message {
-            Some(content) => {
+            Some(card) => {
                 let intent = NewIntent {
                     occurrence: None,
                     source: source_id,
                     destination: &heartbeat.destination,
                     kind: "coverage",
                     action: heartbeat.action,
-                    content,
+                    content: card.stored(),
                 };
                 insert_intent(transaction, config.mode, &intent, now)?;
                 true

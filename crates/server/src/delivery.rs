@@ -16,14 +16,14 @@ use crate::{
     config::{Delivery, Destination},
     http_body::{BodyError, read_bounded},
     metrics::{DestinationOutcome, Metrics},
-    render::DISCORD_CONTENT_CHARS,
+    render::{CONTENT_LIMIT, Embed, HEADLINE_LIMIT, Part},
     store::{Batch, Claim, ClaimLimits, Completion, Store},
 };
 
 const MAX_RESPONSE_BYTES: usize = 65_536;
 const IDLE_POLL: Duration = Duration::from_secs(5);
 const MIN_WAIT: Duration = Duration::from_millis(50);
-const MENTION_COALESCED: &str = "(mention coalesced; recently pinged)\n";
+const MENTION_COALESCED: &str = "(mention coalesced; recently pinged)";
 
 /// What a Discord request achieved.
 #[derive(Debug, PartialEq)]
@@ -74,10 +74,23 @@ struct AllowedMentions<'a> {
 
 #[derive(Serialize)]
 struct Message<'a> {
+    #[serde(skip_serializing_if = "str::is_empty")]
     content: &'a str,
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    embeds: &'a [&'a Embed],
     allowed_mentions: AllowedMentions<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
     username: Option<&'a str>,
+}
+
+/// One rendered Discord message for a batch.
+#[derive(Debug)]
+pub(crate) struct Rendered<'a> {
+    /// Mentions, the pinging card's headline and any plain lines from earlier releases.
+    pub content: String,
+    pub embeds: Vec<&'a Embed>,
+    /// Whether this message may mention the destination's recipients.
+    pub mention: bool,
 }
 
 /// One Discord webhook with its explicit mention recipients.
@@ -126,40 +139,62 @@ impl Discord {
         })
     }
 
-    /// Characters available to alert lines after the largest possible prefix.
+    /// Content left for plain lines of earlier releases after the largest
+    /// possible mention and headline, in UTF-16 units.
     pub(crate) fn line_budget(&self) -> usize {
-        DISCORD_CONTENT_CHARS
-            - self
-                .mention_prefix
-                .chars()
-                .count()
-                .max(MENTION_COALESCED.len())
-            - 2
+        CONTENT_LIMIT
+            - crate::render::units(&self.mention_prefix).max(MENTION_COALESCED.len())
+            - HEADLINE_LIMIT
+            - 3
     }
 
-    /// Renders a batch. Mentions are explicit IDs only; `parse` is always empty.
-    fn message(&self, batch: &Batch) -> (String, bool) {
+    /// Renders a batch: one embed per card, in order. Mentions are explicit IDs
+    /// only; `parse` is always empty.
+    pub(crate) fn message<'a>(&self, batch: &'a Batch) -> Rendered<'a> {
         let mention = batch.ping && batch.mention_allowed() && !self.mention_prefix.is_empty();
-        let mut content = String::with_capacity(DISCORD_CONTENT_CHARS);
+        let mut lines: Vec<&str> = Vec::with_capacity(batch.parts.len() + 1);
+        let lead;
         if mention {
-            content.push_str(&self.mention_prefix);
-            content.push('\n');
+            lead = match &batch.headline {
+                Some(headline) => format!("{} {headline}", self.mention_prefix),
+                None => self.mention_prefix.clone(),
+            };
+            lines.push(&lead);
         } else if batch.ping && !self.mention_prefix.is_empty() {
-            content.push_str(MENTION_COALESCED);
+            lines.push(MENTION_COALESCED);
         }
-        content.push_str(&batch.lines.join("\n"));
-        (content, mention)
+        let mut embeds = Vec::with_capacity(batch.parts.len());
+        for part in &batch.parts {
+            match part {
+                Part::Card(card) => embeds.push(&card.embed),
+                Part::Line(line) => lines.push(line),
+            }
+        }
+        Rendered {
+            content: lines.join("\n"),
+            embeds,
+            mention,
+        }
     }
 
     /// Posts one message with `wait=true` and classifies the response.
-    pub(crate) async fn send(&self, content: &str, mention: bool) -> Outcome {
+    pub(crate) async fn send(&self, rendered: &Rendered<'_>) -> Outcome {
         let empty: &[String] = &[];
         let message = Message {
-            content,
+            content: &rendered.content,
+            embeds: &rendered.embeds,
             allowed_mentions: AllowedMentions {
                 parse: [],
-                users: if mention { &self.mention_users } else { empty },
-                roles: if mention { &self.mention_roles } else { empty },
+                users: if rendered.mention {
+                    &self.mention_users
+                } else {
+                    empty
+                },
+                roles: if rendered.mention {
+                    &self.mention_roles
+                } else {
+                    empty
+                },
             },
             username: self.username.as_deref(),
         };
@@ -373,8 +408,7 @@ impl Worker {
     }
 
     async fn deliver(&self, batch: Batch, cancel: &CancellationToken) {
-        let (content, mention) = self.discord.message(&batch);
-        let outcome = self.discord.send(&content, mention).await;
+        let outcome = self.discord.send(&self.discord.message(&batch)).await;
         self.metrics
             .delivery_attempts
             .get_or_create(&DestinationOutcome {

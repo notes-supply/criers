@@ -16,7 +16,10 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Deserializer};
 use sha2::{Digest, Sha256};
 
-use crate::credentials;
+use crate::{
+    credentials,
+    render::{Icons, Tone, is_custom_emoji},
+};
 
 const MAX_CONFIG_BYTES: u64 = 1_048_576;
 const MAX_SECRET_BYTES: u64 = 4096;
@@ -221,7 +224,44 @@ enum RawDestination {
         #[serde(default = "default_mention_cooldown")]
         mention_cooldown: HumanDuration,
         username: Option<String>,
+        /// Custom emoji markup per tone; tones without one use Unicode.
+        #[serde(default)]
+        icons: RawIcons,
     },
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawIcons {
+    critical: Option<String>,
+    warning: Option<String>,
+    info: Option<String>,
+    recovered: Option<String>,
+    coverage: Option<String>,
+}
+
+impl RawIcons {
+    fn validate(self, id: &str) -> Result<Icons> {
+        let entries = [
+            (Tone::Critical, self.critical),
+            (Tone::Warning, self.warning),
+            (Tone::Info, self.info),
+            (Tone::Recovered, self.recovered),
+            (Tone::Coverage, self.coverage),
+        ];
+        let mut custom = Vec::with_capacity(entries.len());
+        for (tone, markup) in entries {
+            let Some(markup) = markup else { continue };
+            ensure!(
+                is_custom_emoji(&markup),
+                "destinations.{id}.icons.{} must be custom emoji markup such as \
+                 <:name:123456789012345678>",
+                tone.key()
+            );
+            custom.push((tone, markup));
+        }
+        Ok(Icons::new(custom))
+    }
 }
 
 fn default_mention_cooldown() -> HumanDuration {
@@ -387,6 +427,7 @@ pub(crate) struct Destination {
     pub mention_roles: Vec<String>,
     pub mention_cooldown: Duration,
     pub username: Option<String>,
+    pub icons: Icons,
 }
 
 impl fmt::Debug for Destination {
@@ -400,6 +441,7 @@ impl fmt::Debug for Destination {
             .field("mention_users", &self.mention_users)
             .field("mention_roles", &self.mention_roles)
             .field("mention_cooldown", &self.mention_cooldown)
+            .field("icons", &self.icons)
             .finish_non_exhaustive()
     }
 }
@@ -467,6 +509,14 @@ impl Config {
             .with_context(|| format!("invalid configuration {}", path.display()))?;
         let base = path.parent().unwrap_or_else(|| Path::new("."));
         validate(raw, base)
+    }
+
+    /// The icons for messages to `destination`; Unicode for one no longer configured.
+    pub(crate) fn icons(&self, destination: &str) -> Icons {
+        self.destinations
+            .get(destination)
+            .map(|destination| destination.icons.clone())
+            .unwrap_or_default()
     }
 }
 
@@ -700,7 +750,9 @@ fn validate_destination(
         mention_roles,
         mention_cooldown,
         username,
+        icons,
     } = raw;
+    let icons = icons.validate(id)?;
     for (field, ids) in [
         ("mention_users", &mention_users),
         ("mention_roles", &mention_roles),
@@ -751,6 +803,7 @@ fn validate_destination(
         mention_roles,
         mention_cooldown: mention_cooldown.0,
         username,
+        icons,
     })
 }
 

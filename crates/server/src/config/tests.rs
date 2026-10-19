@@ -330,3 +330,45 @@ fn coverage_notices_cannot_wait_for_the_summary() {
     ));
     assert!(message.contains("must be quiet_post or ping"), "{message}");
 }
+
+#[test]
+fn destination_icons_use_configured_custom_emoji_and_unicode_otherwise() {
+    let directory = tempfile::tempdir().unwrap();
+    let body = format!(
+        "{MINIMAL}\n[destinations.ops.icons]\ncritical = \"<:criers_critical:123456789012345678>\"\n"
+    );
+    let config = Config::load(&write(directory.path(), &body)).unwrap();
+    let icons = config.icons("ops");
+    let removed = config.icons("removed");
+    assert_eq!(
+        (
+            icons.get(crate::render::Tone::Critical),
+            icons.get(crate::render::Tone::Warning),
+            removed.get(crate::render::Tone::Critical)
+        ),
+        (
+            "<:criers_critical:123456789012345678>",
+            "\u{1F7E0}",
+            "\u{1F534}"
+        )
+    );
+}
+
+#[test]
+fn destination_icons_must_be_custom_emoji_markup() {
+    let message = error(&format!(
+        "{MINIMAL}\n[destinations.ops.icons]\nwarning = \"<@123456789012345678>\"\n"
+    ));
+    assert!(
+        message.contains("destinations.ops.icons.warning must be custom emoji markup"),
+        "{message}"
+    );
+}
+
+#[test]
+fn unknown_icon_names_are_rejected() {
+    let message = error(&format!(
+        "{MINIMAL}\n[destinations.ops.icons]\nfiring = \"<:fire:123456789012345678>\"\n"
+    ));
+    assert!(message.contains("unknown field `firing`"), "{message}");
+}

@@ -107,7 +107,21 @@ the firing alerts in Alertmanager when you switch.
   the next live startup.
 - **Discord.** Requests use `?wait=true` and an explicit `allowed_mentions`
   with `parse: []`. Only configured user and role IDs can be mentioned; alert
-  text is escaped so it cannot form mentions or links.
+  text is escaped so it cannot form mentions, links or formatting.
+- **Messages.** Each notification is one embed: the alert's `summary`
+  annotation (or its name) as the title, then its state, severity and affected
+  resource, with the source, alert name and fingerprint in the footer. A colour,
+  an icon and a label all carry the state, so it does not depend on colour:
+  critical, warning or info while firing; recovered, with how long it lasted,
+  once resolved whatever its severity; coverage when heartbeats stop. A mention
+  is followed by the card's one-line headline, which is what push notifications
+  show. Embeds are rendered when the intent is recorded, so retries resend
+  exactly the same message; plain-text messages queued by earlier releases are
+  sent as they were.
+- **Icons.** Without configuration the icons are Unicode emoji.
+  `[destinations.<id>.icons]` maps `critical`, `warning`, `info`, `recovered`
+  and `coverage` to custom emoji markup such as `<:criers_critical:123...>`;
+  [assets/discord-icons](../assets/discord-icons) has a matching set to upload.
 - **Rate limits.** A 429 pauses the destination for the longer of `Retry-After`
   and the body's `retry_after`, capped by `delivery.max_rate_limit_wait`, plus
   jitter. A global limit (`X-RateLimit-Scope: global`, `X-RateLimit-Global` or
@@ -133,8 +147,9 @@ the firing alerts in Alertmanager when you switch.
   through another receiver, the ping's channel). If the alert resolves before
   its first send was attempted, the pending send is cancelled and nothing is
   posted; the decision history keeps `resolution_without_notification`.
-- **Storms.** Due rows for a destination are batched into one message (up to
-  `delivery.batch_max` lines within Discord's 2000-character limit). A batch
+- **Storms.** Due rows for a destination are batched into one message: up to
+  `delivery.batch_max` notifications, at most 10 embeds and Discord's
+  6000-character limit across them, counted in UTF-16 code units. A batch
   mentions recipients at most once, and within `mention_cooldown` of the last
   mention a ping is posted with a "mention coalesced" note instead. Every alert
   is still posted. The cooldown starts when a mention is attempted: an ambiguous
@@ -156,7 +171,9 @@ The report covers the window since the previous summary and is built from
 Criers' own stored history, not from Alertmanager or Prometheus:
 
 - **Open**: occurrences firing at the window end, grouped by alert name and
-  severity, with how many started inside the window.
+  severity, with how many started inside the window. They are split into
+  critical, warning and info by severity label; other labels follow their
+  policy action (`ping` is critical, `digest` and `quiet_post` warning).
 - **Resolved**: occurrences that resolved inside the window. A recovery is
   never counted as open, and an occurrence replaced by a newer start is not a
   resolution.
@@ -174,13 +191,17 @@ Criers' own stored history, not from Alertmanager or Prometheus:
   per source; beyond that the report says "at least".
 
 It lists occurrences whose highest action was `digest`, `quiet_post` or `ping`;
-`record` occurrences and heartbeats are not listed. Each section's count equals
-its lines plus a final "+N more" line, and the whole report fits one Discord
-message (at most 1500 characters): when space runs out, coverage detail is
-folded into one line per source and then into totals, while omitted alerts and
-failed or uncertain notifications are always shown. Alert text is escaped like
-any other post. Omitted alerts are kept even when a webhook carried only the
-heartbeat.
+`record` occurrences and heartbeats are not listed. The report is one embed: a
+status line with the open, new and recovered totals, then a field per severity
+with open alerts, one for recoveries and one for coverage problems. Its colour
+is red with critical alerts open, purple with a coverage problem, then amber,
+blue or green. Each field's count equals its lines plus a final "+N more" line.
+The embed stays within Discord's limits (1024 characters per field, 6000 in
+total): group lines are folded into that counted line, and coverage detail into
+one line per source and then into totals, while omitted alerts and failed or
+uncertain notifications are always shown. Times are Discord timestamps, shown
+in each reader's time zone. Alert text is escaped like any other post. Omitted
+alerts are kept even when a webhook carried only the heartbeat.
 
 Warnings and the summary interact through policy only: with
 `warning = "quiet_post"` warnings post at once and also appear in the summary;

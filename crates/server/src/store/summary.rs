@@ -12,8 +12,9 @@ use rusqlite::{OptionalExtension, Transaction, params};
 use super::{FirstDue, HeartbeatStatus, NewIntent, StoreError, insert_intent, watch_heartbeat};
 use crate::{
     config::{Config, Heartbeat},
+    render::{Tier, tier_sql},
     summary::{
-        Coverage, Group, MAX_GAP_LINES, MAX_GROUP_LINES, Ongoing, Report, Schedule, Section,
+        Count, Coverage, Group, MAX_GAP_LINES, MAX_GROUP_LINES, Ongoing, Report, Schedule, Section,
     },
 };
 
@@ -89,7 +90,7 @@ pub(super) fn tick(
         destination: &settings.destination,
         kind: "summary",
         action: Action::QuietPost,
-        content: report.render(),
+        content: report.card(&config.icons(&settings.destination)).stored(),
     };
     let outbox = insert_intent(transaction, config.mode, &intent, now)?;
     transaction.execute(
@@ -155,29 +156,36 @@ fn count(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
     Ok(u64::try_from(row.get::<_, i64>(index)?).unwrap_or(0))
 }
 
-/// Occurrences that notify (digest or higher) with their section: open if it
-/// started before the window end and had not closed by then, resolved if it
-/// resolved inside the window. Both branches of the union use an index: the
+/// Occurrences that notify (digest or higher) with their section and tier: open
+/// if it started before the window end and had not closed by then, resolved if
+/// it resolved inside the window. Both branches of the union use an index: the
 /// open one on first_seen_at for unclosed occurrences, the closed one on
 /// closed_at. Parameters: ?1 window start, ?2 window end, ?3 digest rank.
 macro_rules! candidates {
     () => {
-        "WITH candidates AS (
+        concat!(
+            "WITH candidates AS (
             SELECT 'open' AS category, source, alertname, severity, highest_action,
-                first_seen_at, summary, labels
+                first_seen_at, summary, labels, ",
+            tier_sql!(),
+            " AS tier
             FROM occurrences
             WHERE closed_at IS NULL AND first_seen_at < ?2 AND highest_action >= ?3
             UNION ALL
             SELECT CASE WHEN closed_at >= ?2 THEN 'open' ELSE 'resolved' END, source,
-                alertname, severity, highest_action, first_seen_at, summary, labels
+                alertname, severity, highest_action, first_seen_at, summary, labels, ",
+            tier_sql!(),
+            "
             FROM occurrences
             WHERE closed_at >= ?1 AND first_seen_at < ?2 AND highest_action >= ?3
             AND (closed_at >= ?2 OR status = 'resolved')
         ) "
+        )
     };
 }
 
-/// The resource an alert is about, in the old digest's order of preference.
+/// The resource an alert is about; [`crate::render::resource`] follows the same
+/// order of preference, and a test keeps the two in agreement.
 macro_rules! context {
     ($labels:literal) => {
         concat!(
@@ -207,6 +215,9 @@ macro_rules! context {
             ", '$.host'),
             json_extract(",
             $labels,
+            ", '$.service'),
+            json_extract(",
+            $labels,
             ", '$.instance'),
             json_extract(",
             $labels,
@@ -215,8 +226,9 @@ macro_rules! context {
     };
 }
 
-/// One section: its true totals from an aggregate, and its most important groups
-/// (highest action, then size) read in display order with a limit.
+/// One section: true totals per tier from an aggregate, and each tier's most
+/// important groups (highest action, then size) read in display order, at most
+/// [`MAX_GROUP_LINES`] per tier.
 fn section(
     transaction: &Transaction<'_>,
     category: &str,
@@ -224,39 +236,48 @@ fn section(
     end: i64,
 ) -> Result<Section, StoreError> {
     let digest = Action::Digest.rank();
-    let (total, new, group_count) = transaction
-        .prepare_cached(concat!(
-            candidates!(),
-            "SELECT coalesce(sum(size), 0), coalesce(sum(fresh), 0), count(*)
-             FROM (SELECT count(*) AS size, sum(first_seen_at >= ?1) AS fresh
-                FROM candidates WHERE category = ?4
-                GROUP BY source, alertname, severity)"
-        ))?
-        .query_row(params![start, end, digest, category], |row| {
-            Ok((count(row, 0)?, count(row, 1)?, count(row, 2)?))
-        })?;
+    let mut counts = [Count::default(); 3];
+    let mut rows = transaction.prepare_cached(concat!(
+        candidates!(),
+        "SELECT tier, coalesce(sum(size), 0), coalesce(sum(fresh), 0), count(*)
+         FROM (SELECT tier, count(*) AS size, sum(first_seen_at >= ?1) AS fresh
+            FROM candidates WHERE category = ?4
+            GROUP BY source, alertname, severity, tier)
+         GROUP BY tier"
+    ))?;
+    let mut totals = rows.query(params![start, end, digest, category])?;
+    while let Some(row) = totals.next()? {
+        counts[Tier::from_index(row.get(0)?).index()] = Count {
+            occurrences: count(row, 1)?,
+            new: count(row, 2)?,
+            groups: count(row, 3)?,
+        };
+    }
     let groups = transaction
         .prepare_cached(concat!(
             candidates!(),
-            "SELECT source, alertname, severity, count(*) AS size,
-                coalesce(sum(first_seen_at >= ?1), 0), max(summary),
-                min(",
+            "SELECT source, alertname, severity, tier, size, fresh, summary, first, last
+             FROM (SELECT source, alertname, severity, tier, count(*) AS size,
+                    coalesce(sum(first_seen_at >= ?1), 0) AS fresh, max(summary) AS summary,
+                    min(",
             context!("labels"),
-            "), max(",
+            ") AS first, max(",
             context!("labels"),
-            ")
-             FROM candidates WHERE category = ?4
-             GROUP BY source, alertname, severity
-             ORDER BY max(highest_action) DESC, size DESC, alertname, severity, source
-             LIMIT ?5"
+            ") AS last,
+                    row_number() OVER (PARTITION BY tier ORDER BY max(highest_action) DESC,
+                        count(*) DESC, alertname, severity, source) AS rank
+                FROM candidates WHERE category = ?4
+                GROUP BY source, alertname, severity, tier)
+             WHERE rank <= ?5
+             ORDER BY tier, rank"
         ))?
         .query_map(
             params![start, end, digest, category, MAX_GROUP_LINES as i64],
             |row| {
-                let size = count(row, 3)?;
-                let summary: Option<String> = row.get(5)?;
+                let size = count(row, 4)?;
+                let summary: Option<String> = row.get(6)?;
                 let mut contexts: Vec<String> = Vec::with_capacity(2);
-                for index in [6, 7] {
+                for index in [7, 8] {
                     if let Some(context) = row.get::<_, Option<String>>(index)?
                         && !contexts.contains(&context)
                     {
@@ -267,20 +288,16 @@ fn section(
                     source: row.get(0)?,
                     alertname: row.get(1)?,
                     severity: row.get(2)?,
+                    tier: Tier::from_index(row.get(3)?),
                     count: size,
-                    new: count(row, 4)?,
+                    new: count(row, 5)?,
                     contexts,
                     summary: summary.filter(|_| size == 1),
                 })
             },
         )?
         .collect::<Result<_, _>>()?;
-    Ok(Section {
-        total,
-        new,
-        group_count,
-        groups,
-    })
+    Ok(Section { counts, groups })
 }
 
 /// Heartbeat coverage of one source inside the window.
@@ -437,9 +454,9 @@ mod tests {
             })
             .await
             .unwrap();
+        let text = crate::render::Part::parse(text).text();
         assert!(
-            text.contains("- example: DiskFull [critical]")
-                && text.contains("- retired: DiskFull [critical]"),
+            text.contains("example · **DiskFull**") && text.contains("retired · **DiskFull**"),
             "{text}"
         );
     }
@@ -465,9 +482,82 @@ mod tests {
             })
             .await
             .unwrap();
+        let total = section.total();
         assert_eq!(
-            (section.total, section.group_count, section.groups.len()),
+            (total.occurrences, total.groups, section.groups.len()),
             (5000, 5000, MAX_GROUP_LINES)
         );
+    }
+
+    /// The SQL used for summaries and the Rust used for alert cards must agree.
+    #[test]
+    fn tier_and_resource_rules_agree_between_sql_and_cards() {
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        let severities = [
+            Some("critical"),
+            Some("CRITICAL"),
+            Some("warning"),
+            Some("Info"),
+            Some("error"),
+            Some(""),
+            None,
+        ];
+        let actions = [
+            Action::Record,
+            Action::Digest,
+            Action::QuietPost,
+            Action::Ping,
+        ];
+        for severity in severities {
+            for action in actions {
+                let sql: i64 = connection
+                    .query_row(
+                        concat!(
+                            "SELECT ",
+                            tier_sql!(),
+                            " FROM (SELECT ?1 AS severity, ?2 AS highest_action)"
+                        ),
+                        rusqlite::params![severity, action.rank()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    Tier::from_index(sql),
+                    Tier::of(severity, action),
+                    "{severity:?} {action:?}"
+                );
+            }
+        }
+        let label_sets = [
+            &[
+                ("namespace", "media"),
+                ("pod", "sonarr-0"),
+                ("host", "iris"),
+            ][..],
+            &[("namespace", "media"), ("deployment", "sonarr")][..],
+            &[("namespace", "media")][..],
+            &[("container", "app"), ("instance", "10.0.0.1:9100")][..],
+            &[("host", "iris"), ("service", "web"), ("job", "node")][..],
+            &[
+                ("service", "web"),
+                ("instance", "10.0.0.1:9100"),
+                ("job", "node"),
+            ][..],
+            &[("instance", "10.0.0.1:9100"), ("job", "node")][..],
+            &[("job", "node")][..],
+            &[("namespace", ""), ("host", "iris")][..],
+            &[][..],
+        ];
+        for labels in label_sets {
+            let map: std::collections::BTreeMap<String, String> = labels
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                .collect();
+            let json = serde_json::to_string(&map).unwrap();
+            let sql: Option<String> = connection
+                .query_row(concat!("SELECT ", context!("?1")), [json], |row| row.get(0))
+                .unwrap();
+            assert_eq!(sql, crate::render::resource(&map), "{labels:?}");
+        }
     }
 }
