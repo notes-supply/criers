@@ -189,40 +189,37 @@ macro_rules! candidates {
 macro_rules! context {
     ($labels:literal) => {
         concat!(
-            "coalesce(nullif(concat_ws('/', json_extract(",
-            $labels,
-            ", '$.namespace'),
-                coalesce(json_extract(",
-            $labels,
-            ", '$.pod'),
-                    json_extract(",
-            $labels,
-            ", '$.deployment'),
-                    json_extract(",
-            $labels,
-            ", '$.statefulset'),
-                    json_extract(",
-            $labels,
-            ", '$.daemonset'),
-                    json_extract(",
-            $labels,
-            ", '$.job_name'),
-                    json_extract(",
-            $labels,
-            ", '$.container'))), ''),
-            json_extract(",
-            $labels,
-            ", '$.host'),
-            json_extract(",
-            $labels,
-            ", '$.service'),
-            json_extract(",
-            $labels,
-            ", '$.instance'),
-            json_extract(",
-            $labels,
-            ", '$.job'))"
+            "coalesce(nullif(concat_ws('/', ",
+            label!($labels, "namespace"),
+            ", coalesce(",
+            label!($labels, "pod"),
+            ", ",
+            label!($labels, "deployment"),
+            ", ",
+            label!($labels, "statefulset"),
+            ", ",
+            label!($labels, "daemonset"),
+            ", ",
+            label!($labels, "job_name"),
+            ", ",
+            label!($labels, "container"),
+            ")), ''), ",
+            label!($labels, "host"),
+            ", ",
+            label!($labels, "service"),
+            ", ",
+            label!($labels, "instance"),
+            ", ",
+            label!($labels, "job"),
+            ")"
         )
+    };
+}
+
+/// A label's value, NULL when absent or empty.
+macro_rules! label {
+    ($labels:literal, $name:literal) => {
+        concat!("nullif(json_extract(", $labels, ", '$.", $name, "'), '')")
     };
 }
 
@@ -535,6 +532,8 @@ mod tests {
                 ("host", "iris"),
             ][..],
             &[("namespace", "media"), ("deployment", "sonarr")][..],
+            &[("namespace", "ns"), ("pod", ""), ("deployment", "api")][..],
+            &[("host", ""), ("service", "web")][..],
             &[("namespace", "media")][..],
             &[("container", "app"), ("instance", "10.0.0.1:9100")][..],
             &[("host", "iris"), ("service", "web"), ("job", "node")][..],
