@@ -56,8 +56,26 @@ pub(super) async fn wait_for_state(store: &Store, id: i64, expected: &'static st
     state
 }
 
+/// The message content; empty when a message is embeds only.
 pub(super) fn content(request: &super::fixtures::Captured) -> &str {
-    request.body["content"].as_str().unwrap()
+    request.body["content"].as_str().unwrap_or_default()
+}
+
+/// Everything a reader sees in a sent message: content, then each embed's text.
+pub(super) fn shown(request: &super::fixtures::Captured) -> String {
+    let mut lines = vec![content(request).to_owned()];
+    for embed in request.body["embeds"].as_array().into_iter().flatten() {
+        let embed: crate::render::Embed = serde_json::from_value(embed.clone()).unwrap();
+        lines.push(
+            crate::render::Part::Card(crate::render::Card {
+                headline: String::new(),
+                embed,
+            })
+            .text(),
+        );
+    }
+    lines.retain(|line| !line.is_empty());
+    lines.join("\n")
 }
 
 #[tokio::test]
@@ -77,7 +95,10 @@ async fn critical_alert_is_delivered_with_wait_true_and_explicit_mentions() {
             requests[0].query.as_deref(),
             &requests[0].body["allowed_mentions"],
             content(&requests[0])
-                .starts_with(&format!("<@{USER_ID}>\n**FIRING** ExampleStorageFailure")),
+                == format!(
+                    "<@{USER_ID}> Critical: Synthetic critical storage alert, not a real incident"
+                )
+                && shown(&requests[0]).contains("**Critical** · firing · example-service"),
             state.as_str(),
             remote.as_str()
         ),
@@ -263,8 +284,8 @@ async fn recovery_cannot_overtake_an_unresolved_ambiguous_send() {
     assert_eq!(
         (
             receipt.decisions[0].reason,
-            content(&requests[0]).contains("**FIRING**"),
-            content(&requests[1]).contains("**RESOLVED**")
+            shown(&requests[0]).contains("**Critical** · firing"),
+            shown(&requests[1]).contains("**Recovered** · critical")
         ),
         ("recovery", true, true)
     );
@@ -366,7 +387,22 @@ async fn storm_is_batched_and_mentions_are_coalesced_without_dropping_alerts() {
         .count();
     let longest = requests
         .iter()
-        .map(|request| content(request).chars().count())
+        .map(|request| {
+            let embeds: Vec<crate::render::Embed> =
+                serde_json::from_value(request.body["embeds"].clone()).unwrap();
+            let within = embeds.len() <= crate::render::MAX_EMBEDS
+                && embeds.iter().all(crate::render::Embed::within_limits)
+                && embeds
+                    .iter()
+                    .map(crate::render::Embed::units)
+                    .sum::<usize>()
+                    <= crate::render::EMBEDS_TOTAL_LIMIT;
+            if within {
+                crate::render::units(content(request))
+            } else {
+                usize::MAX
+            }
+        })
         .max()
         .unwrap();
     assert!(
@@ -411,4 +447,73 @@ async fn global_rate_limit_pauses_every_destination_worker() {
 async fn shared_rate_limit_pauses_only_its_own_destination() {
     let gap = rate_limit_gap("shared", false).await;
     assert!(gap < Duration::from_secs(1), "{gap:?}");
+}
+
+/// Rows an earlier release left pending hold plain Markdown lines.
+async fn queue_plain(harness: &Harness, kind: &str, content: &str) {
+    let (kind, content) = (kind.to_owned(), content.to_owned());
+    harness
+        .store
+        .with_connection(move |connection| {
+            connection.execute(
+                "INSERT INTO outbox(occurrence_id, source, destination, kind, action, mode, state,
+                    content, created_at, due_at)
+                 VALUES (NULL, 'example', 'ops', ?1, 'quiet_post', 'live', 'pending', ?2, ?3, ?3)",
+                rusqlite::params![kind, content, crate::now_ms()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn messages_queued_by_an_earlier_release_are_still_sent_unchanged() {
+    let discord = MockProvider::discord(Vec::new()).await;
+    let harness = Harness::live(&discord.discord_url(), "").await;
+    let line = "**COVERAGE RECOVERED** source example: heartbeats resumed";
+    let summary = format!(
+        "**Summary** 2026-10-12 06:00 to 2026-10-13 06:00 UTC\n**Open: 0**\n{}",
+        "- x [warning]\n".repeat(100)
+    );
+    queue_plain(&harness, "coverage", line).await;
+    harness
+        .ingest(with(
+            fixture(),
+            "/alerts/0/labels/severity",
+            json!("warning"),
+        ))
+        .await;
+    queue_plain(&harness, "summary", &summary).await;
+    let cancel = spawn(worker(&harness, "ops", Duration::from_secs(2)));
+    let requests = discord.wait_for(2).await;
+    cancel.cancel();
+    let embeds =
+        |request: &super::fixtures::Captured| request.body["embeds"].as_array().map_or(0, Vec::len);
+    assert_eq!(
+        (
+            content(&requests[0]),
+            embeds(&requests[0]),
+            shown(&requests[0]).contains("**Warning** · firing"),
+            content(&requests[1]),
+            embeds(&requests[1]),
+        ),
+        (line, 1, true, summary.as_str(), 0),
+        "{requests:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_retried_card_is_sent_exactly_as_first_rendered() {
+    let discord = MockProvider::discord(vec![Scripted::json(504, json!({}))]).await;
+    let harness = Harness::live(&discord.discord_url(), "").await;
+    harness.ingest(fixture()).await;
+    let cancel = spawn(worker(&harness, "ops", Duration::from_secs(2)));
+    let requests = discord.wait_for(2).await;
+    cancel.cancel();
+    assert!(
+        requests[0].body["embeds"] == requests[1].body["embeds"]
+            && requests[1].body["embeds"][0]["title"].is_string(),
+        "{requests:?}"
+    );
 }

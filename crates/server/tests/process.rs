@@ -616,19 +616,25 @@ async fn digested_warnings_wait_for_the_summary_that_a_restart_catches_up() {
     );
     let bodies = discord.bodies.lock().unwrap().clone();
     let page = bodies[0]["content"].as_str().unwrap_or_default();
+    let page_status = bodies[0]["embeds"][0]["description"]
+        .as_str()
+        .unwrap_or_default();
     let summary = bodies
         .get(1)
-        .and_then(|body| body["content"].as_str())
+        .map(|body| body["embeds"][0].clone())
         .unwrap_or_default();
+    let summary_text = summary.to_string();
     assert!(
         warning_status == 202
             && critical_status == 202
             && posts_before_restart == 1
-            && page.contains("**FIRING** ExampleStorageFailure")
+            && page.starts_with("<@123456789012345678> Critical: ")
+            && page_status.contains("**Critical** · firing")
             && bodies[0]["allowed_mentions"]["users"] == json!(["123456789012345678"])
-            && summary.starts_with("**Summary**")
-            && summary.contains("**Open: 2** (2 new)")
-            && summary.contains("- SyntheticDiskFilling [warning], new: media/sonarr-0")
+            && summary["title"] == "Daily summary"
+            && summary_text.contains("**2 open** (1 critical, 1 warning) · 2 new")
+            && summary_text.contains("**SyntheticDiskFilling** · new · media/sonarr-0")
+            && bodies[1].get("content").is_none()
             && bodies[1]["allowed_mentions"]["users"] == json!([])
             && started_metrics.contains("criers_summary_window_end_seconds 0.0")
             && !started_metrics.contains("criers_summary_cursor_seconds 0.0")

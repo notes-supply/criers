@@ -63,6 +63,12 @@ mention_users = []
 mention_roles = []
 mention_cooldown = "1m"
 
+# Optional custom emoji per message tone; omitted tones use Unicode emoji.
+# See assets/discord-icons for a matching set to upload.
+# [destinations.ops.icons]
+# critical = "<:criers_critical:123456789012345678>"
+# recovered = "<:criers_recovered:123456789012345678>"
+
 # Optional, opt-in assessment with Cloudflare Clef in either delivery mode. It sends
 # the allowlisted fields below to Cloudflare; results never change notifications.
 # [assessment]

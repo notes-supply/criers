@@ -979,7 +979,7 @@ async fn recovery_for_a_healthy_destination_is_not_held_by_another_destinations_
         .await
         .unwrap();
     assert!(
-        matches!(&ops, Claim::Batch(batch) if batch.lines[0].contains("**RESOLVED**")),
+        matches!(&ops, Claim::Batch(batch) if batch.parts[0].text().contains("**Recovered**")),
         "{ops:?}"
     );
 }

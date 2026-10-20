@@ -7,14 +7,15 @@ use serde_json::{Value, json};
 
 use super::{
     Harness,
-    delivery::{content, spawn, wait_for_state, worker},
+    delivery::{shown, spawn, wait_for_state, worker},
     fixture,
     fixtures::{MockProvider, Scripted},
     with,
 };
 use crate::{
+    render::Part,
     store::{Claim, ClaimLimits, Store, SummaryTick},
-    summary::{DAY_MS, MAX_CHARS},
+    summary::DAY_MS,
 };
 
 const HOUR: i64 = 3_600_000;
@@ -92,8 +93,9 @@ async fn queue_now(harness: &Harness) -> i64 {
         .await
 }
 
+/// Each summary's state and what a reader sees in it.
 async fn summaries(harness: &Harness) -> Vec<(String, String)> {
-    harness
+    let rows: Vec<(String, String)> = harness
         .store
         .with_connection(|connection| {
             Ok(connection
@@ -102,7 +104,10 @@ async fn summaries(harness: &Harness) -> Vec<(String, String)> {
                 .collect::<Result<_, _>>()?)
         })
         .await
-        .unwrap()
+        .unwrap();
+    rows.into_iter()
+        .map(|(state, content)| (state, Part::parse(content).text()))
+        .collect()
 }
 
 #[tokio::test]
@@ -163,10 +168,12 @@ async fn ended_window_reports_open_new_and_resolved_alerts_separately() {
         (
             queued,
             reports.len(),
-            text.contains("**Open: 2** (2 new)"),
-            text.contains("- example: PodCrashLooping [warning] x2, new: media/podcrashlooping-0"),
-            text.contains("**Resolved: 1**"),
-            text.contains("- example: DiskFull [critical]: media/diskfull-0 - Synthetic critical"),
+            text.contains("**2 open** (2 warning) · 2 new · 1 recovered"),
+            text.contains("example · **PodCrashLooping** ×2 · new · media/podcrashlooping-0"),
+            text.contains("Recovered · 1"),
+            text.contains(
+                "example · **DiskFull** · critical · media/diskfull-0 — Synthetic critical"
+            ),
             text.contains("Informational"),
         ),
         (
@@ -196,7 +203,9 @@ async fn heartbeats_are_coverage_evidence_not_alerts() {
     tick(&harness, end + DAY_MS).await;
     let text = summaries(&harness).await.remove(0).1;
     assert!(
-        !text.contains("Watchdog") && text.contains("**Open: 0**"),
+        !text.contains("Watchdog")
+            && text.contains("**No open alerts** · **coverage gaps**")
+            && !text.contains("All clear"),
         "{text}"
     );
 }
@@ -231,7 +240,7 @@ async fn a_heartbeat_ending_a_gap_records_its_span() {
     tick(&harness, end + DAY_MS).await;
     let text = summaries(&harness).await.remove(0).1;
     assert!(
-        text.contains("- example: no heartbeat ")
+        text.contains("example: no heartbeat ")
             && text.contains("(1h 59m)")
             && !text.contains("ongoing"),
         "{text}"
@@ -282,7 +291,7 @@ async fn downtime_over_several_days_queues_one_summary_since_the_last_window() {
             window_start,
             window_end,
             reports.len(),
-            reports[0].1.contains("(delayed")
+            reports[0].1.contains("\nDelayed · generated <t:")
         ),
         (
             SummaryTick::Queued(end + 3 * DAY_MS),
@@ -366,7 +375,7 @@ async fn an_alert_resolved_after_the_window_end_was_open_at_that_end() {
     tick(&harness, window_end + 20).await;
     let text = summaries(&harness).await.remove(0).1;
     assert!(
-        text.contains("**Open: 1**") && text.contains("**Resolved: 0**"),
+        text.contains("**1 open** (1 warning)") && !text.contains("Recovered"),
         "{text}"
     );
 }
@@ -420,12 +429,13 @@ async fn live_summary_is_posted_alone_and_without_mentions() {
     let summary = &requests[0];
     assert_eq!(
         (
-            content(summary).starts_with("**Summary**"),
-            content(summary).contains("Escalated"),
+            shown(summary).starts_with("Daily summary"),
+            shown(summary).contains("Escalated"),
             summary.body["allowed_mentions"]["users"].clone(),
-            content(&requests[1]).contains("**FIRING** Escalated"),
+            shown(&requests[1]).contains("**Critical** · firing"),
+            shown(&requests[1]).contains("example · Escalated · 5000000000000001"),
         ),
-        (true, false, json!([]), true),
+        (true, false, json!([]), true, true),
         "{requests:?}"
     );
 }
@@ -509,7 +519,7 @@ async fn queued_summary_survives_restart_and_is_not_generated_again() {
             again,
             requests.len(),
             discord.requests().len(),
-            content(&requests[0]).starts_with("**Summary**")
+            shown(&requests[0]).starts_with("Daily summary")
         ),
         (Some(SummaryTick::Current(cursor)), 1, 1, true)
     );
@@ -585,11 +595,7 @@ async fn retention_keeps_the_cursor_and_a_window_still_being_reported() {
         .unwrap();
     let cursor: i64 = harness.query("SELECT max(window_end) FROM summaries").await;
     assert_eq!(
-        (
-            reported.contains("**Resolved: 1**"),
-            later.summaries,
-            cursor
-        ),
+        (reported.contains("Recovered · 1"), later.summaries, cursor),
         (true, 1, end + DAY_MS),
         "{reported}"
     );
@@ -680,7 +686,7 @@ async fn digested_warning_resolution_is_reported_by_the_summary_not_a_recovery()
     tick(&harness, end + DAY_MS).await;
     let text = summaries(&harness).await.remove(0).1;
     assert!(
-        recoveries == 0 && text.contains("**Resolved: 1**") && text.contains("JobFailed"),
+        recoveries == 0 && text.contains("Recovered · 1") && text.contains("JobFailed"),
         "recoveries={recoveries}\n{text}"
     );
 }
@@ -726,13 +732,13 @@ async fn critical_routing_does_not_wait_for_a_pending_or_failing_summary() {
         panic!("critical page was not claimable: {claim:?}");
     };
     assert!(
-        batch.ping && batch.lines[0].contains("NodeDown"),
+        batch.ping && batch.parts[0].text().contains("NodeDown"),
         "{batch:?}"
     );
 }
 
 #[tokio::test]
-async fn the_largest_mention_prefix_still_leaves_room_for_a_summary() {
+async fn the_widest_mention_and_longest_headline_keep_content_within_discords_limit() {
     let users: Vec<String> = (0..10).map(|index| format!("{:020}", index + 1)).collect();
     let roles: Vec<String> = (0..10).map(|index| format!("{:020}", index + 11)).collect();
     let harness = Harness::live(
@@ -746,10 +752,29 @@ async fn the_largest_mention_prefix_still_leaves_room_for_a_summary() {
     let discord =
         crate::delivery::Discord::new(&harness.config.destinations["wide"], Duration::from_secs(1))
             .unwrap();
+    // A pinging card with the longest headline, then plain lines of an earlier
+    // release filling the rest of the claim budget.
+    let headline = "\u{1F534}".repeat(crate::render::HEADLINE_LIMIT / 2);
+    let batch = crate::store::Batch {
+        ids: vec![1, 2],
+        parts: vec![
+            Part::Card(crate::render::Card {
+                headline: headline.clone(),
+                embed: crate::render::Embed::default(),
+            }),
+            Part::Line("x".repeat(discord.line_budget() - 1)),
+        ],
+        headline: Some(headline),
+        ping: true,
+        mention: Some(crate::store::MentionClaim { at: 0, previous: 0 }),
+        possibly_duplicate: false,
+        max_failures: 0,
+    };
+    let rendered = discord.message(&batch);
     assert!(
-        discord.line_budget() >= MAX_CHARS,
-        "{}",
-        discord.line_budget()
+        rendered.mention && crate::render::units(&rendered.content) <= crate::render::CONTENT_LIMIT,
+        "{} units",
+        crate::render::units(&rendered.content)
     );
 }
 
@@ -764,10 +789,7 @@ async fn an_ongoing_gap_is_reported_from_heartbeat_freshness_after_retention() {
         .unwrap();
     tick(&harness, end + 2 * DAY_MS).await;
     let later = summaries(&harness).await.pop().unwrap().1;
-    let onset = chrono::DateTime::from_timestamp_millis(last + 10 * 60_000)
-        .unwrap()
-        .format("%m-%d %H:%M")
-        .to_string();
+    let onset = crate::render::discord_time(last + 10 * 60_000, 'f');
     assert!(
         removed.summaries == 1
             && later.contains(&format!("heartbeat stale since {onset}, ongoing")),
@@ -895,10 +917,7 @@ async fn restart_after_the_boundary_before_a_fresh_heartbeat_reports_the_outage(
         .unwrap();
     tick(&harness, after_boundary).await;
     let text = summaries(&harness).await.pop().unwrap().1;
-    let onset = chrono::DateTime::from_timestamp_millis(last + 10 * 60_000)
-        .unwrap()
-        .format("%m-%d %H:%M")
-        .to_string();
+    let onset = crate::render::discord_time(last + 10 * 60_000, 'f');
     assert!(
         text.contains(&format!("since {onset}, ongoing at window end")),
         "expected an outage from {onset}:\n{text}"
@@ -935,15 +954,12 @@ async fn first_heartbeat_after_downtime_does_not_erase_unobserved_summary_window
     tick(&harness, crate::now_ms()).await;
     let text = summaries(&harness).await.pop().unwrap().1;
     // The gap began when the startup grace ran out and was open at the window end.
-    let onset = chrono::DateTime::from_timestamp_millis(started + 10 * 60_000)
-        .unwrap()
-        .format("%m-%d %H:%M")
-        .to_string();
+    let onset = crate::render::discord_time(started + 10 * 60_000, 'f');
     assert!(
-        !text.contains("**Coverage gaps:** none")
+        !text.contains("No heartbeat gaps")
             && text.contains("example")
             && text.contains(&format!(
-                "- example: no heartbeat recorded since {onset}, ongoing at window end"
+                "example: no heartbeat recorded since {onset}, ongoing at window end"
             )),
         "the entire window lacked heartbeat evidence:\n{text}"
     );
@@ -1000,10 +1016,10 @@ async fn first_heartbeat_after_schema_3_upgrade_keeps_the_unobserved_window() {
     // Schema 3 kept when watching began for this still-unknown source, so the gap
     // starts at the end of its startup grace.
     assert!(
-        !text.contains("**Coverage gaps:** none")
+        !text.contains("No heartbeat gaps")
             && text.contains("example")
             && text.contains(&format!(
-                "- example: no heartbeat recorded since {}, ongoing at window end",
+                "example: no heartbeat recorded since {}, ongoing at window end",
                 minute(started + 10 * 60_000)
             )),
         "the upgraded source's unobserved window must not become healthy:\n{text}"
@@ -1043,14 +1059,11 @@ async fn late_never_seen_evaluation_does_not_erase_the_unobserved_summary_window
         .unwrap();
     tick(&harness, late).await;
     let text = summaries(&harness).await.pop().unwrap().1;
-    let onset = chrono::DateTime::from_timestamp_millis(started + 10 * 60_000)
-        .unwrap()
-        .format("%m-%d %H:%M")
-        .to_string();
+    let onset = crate::render::discord_time(started + 10 * 60_000, 'f');
     assert!(
         changes.iter().any(|change| change.state == "never_seen")
             && text.contains(&format!(
-                "- example: no heartbeat recorded since {onset}, ongoing at window end"
+                "example: no heartbeat recorded since {onset}, ongoing at window end"
             )),
         "{changes:?}\n{text}"
     );
@@ -1072,12 +1085,9 @@ async fn restart_after_the_boundary_after_a_fresh_heartbeat_reports_the_closed_o
     heartbeats_until(&harness, end + DAY_MS - 30_000).await;
     tick(&harness, end + DAY_MS + 60_000).await;
     let text = summaries(&harness).await.pop().unwrap().1;
-    let onset = chrono::DateTime::from_timestamp_millis(last + 10 * 60_000)
-        .unwrap()
-        .format("%m-%d %H:%M")
-        .to_string();
+    let onset = crate::render::discord_time(last + 10 * 60_000, 'f');
     assert!(
-        text.contains(&format!("no heartbeat {onset} to ")) && !text.contains("ongoing"),
+        text.contains(&format!("no heartbeat {onset} – ")) && !text.contains("ongoing"),
         "expected a closed outage from {onset}:\n{text}"
     );
 }
@@ -1134,8 +1144,8 @@ async fn counting_stops_at_the_cap_without_hiding_other_sources_or_the_end_state
     tick(&harness, end + DAY_MS).await;
     let text = summaries(&harness).await.remove(0).1;
     assert!(
-        text.contains(&format!("- example: at least {cap} heartbeat gaps"))
-            && text.contains("- other: no heartbeat ")
+        text.contains(&format!("example: at least {cap} heartbeat gaps"))
+            && text.contains("other: no heartbeat ")
             && text.contains("(30m)")
             && !text.contains("ongoing"),
         "{text}"
@@ -1173,16 +1183,16 @@ async fn thousands_of_alert_names_report_true_totals_from_a_bounded_read() {
     let text = summaries(&harness).await.remove(0).1;
     let listed = text
         .lines()
-        .filter(|line| line.starts_with("- example:") || line.starts_with("- other:"))
+        .filter(|line| line.starts_with("example · ") || line.starts_with("other · "))
         .count();
     assert!(
-        text.contains("**Open: 5030** (5030 new)")
+        text.contains("**5030 open** (5030 warning) · 5030 new")
             && text
                 .lines()
-                .nth(2)
-                .is_some_and(|line| line.contains("Storm") && line.contains("x15"))
+                .find(|line| line.starts_with("example · ") || line.starts_with("other · "))
+                .is_some_and(|line| line.contains("Storm") && line.contains("×15"))
             && listed <= crate::summary::MAX_GROUP_LINES
-            && text.contains(&format!("- +{} more alert names", 5002 - listed)),
+            && text.contains(&format!("+{} more (", 5002 - listed)),
         "listed={listed}\n{text}"
     );
 }
@@ -1259,10 +1269,7 @@ async fn upgraded_from_schema_3(coverage: &str, changed: Option<i64>) -> (Harnes
 }
 
 fn minute(millis: i64) -> String {
-    chrono::DateTime::from_timestamp_millis(millis)
-        .unwrap()
-        .format("%m-%d %H:%M")
-        .to_string()
+    crate::render::discord_time(millis, 'f')
 }
 
 #[tokio::test]
@@ -1275,7 +1282,7 @@ async fn first_heartbeat_ingested_before_any_tick_after_schema_3_upgrade_keeps_t
     let text = summaries(&harness).await.pop().unwrap().1;
     assert!(
         text.contains(&format!(
-            "- example: no heartbeat recorded since {}, ongoing at window end",
+            "example: no heartbeat recorded since {}, ongoing at window end",
             minute(started + 10 * 60_000)
         )),
         "{text}"
@@ -1287,7 +1294,7 @@ async fn upgraded_never_seen_source_is_unobserved_before_and_after_its_first_hea
     // 0.1.0 had found the heartbeat overdue two hours into the window, but schema 3
     // did not keep when watching began, so no start may be invented.
     let (harness, started) = upgraded_from_schema_3("never_seen", Some(2 * HOUR)).await;
-    let expected = "- example: no heartbeat ever recorded, ongoing at window end";
+    let expected = "example: no heartbeat ever recorded, ongoing at window end";
     let before = harness
         .store
         .summary_tick(Arc::clone(&harness.config), crate::now_ms())
@@ -1326,7 +1333,7 @@ async fn upgraded_source_without_any_recorded_coverage_time_is_never_reported_he
     tick(&harness, crate::now_ms()).await;
     let text = summaries(&harness).await.pop().unwrap().1;
     assert!(
-        text.contains("- example: no heartbeat ever recorded, ongoing at window end"),
+        text.contains("example: no heartbeat ever recorded, ongoing at window end"),
         "{text}"
     );
 }
@@ -1386,11 +1393,11 @@ async fn a_newly_configured_heartbeat_reports_alike_in_either_startup_order() {
         }
         assert!(matches!(tick(&harness, now).await, SummaryTick::Queued(_)));
         let text = summaries(&harness).await.pop().unwrap().1;
-        coverage.push(text.split_once("**Coverage gaps").unwrap().1.to_owned());
+        coverage.push(text.contains("No heartbeat gaps") && !text.contains("Coverage"));
     }
     assert_eq!(
-        (coverage[0].as_str(), coverage[1].as_str()),
-        (":** none", ":** none"),
+        (coverage[0], coverage[1]),
+        (true, true),
         "monitoring began after the window, in both orders"
     );
 }
@@ -1419,7 +1426,10 @@ async fn groups_differing_only_around_control_characters_are_counted_apart() {
     tick(&harness, end + DAY_MS).await;
     let text = summaries(&harness).await.remove(0).1;
     assert!(
-        text.contains("**Open: 15** (15 new)") && text.contains("- +3 more alert names (3 alerts)"),
+        text.contains("**15 open** (2 critical, 13 warning) · 15 new")
+            && text.contains("**a** (bc)")
+            && text.contains("**ab** (c)")
+            && text.contains("+5 more (5 alerts)"),
         "{text}"
     );
 }
@@ -1457,7 +1467,7 @@ async fn omissions_reported_with_only_a_heartbeat_survive_a_clean_heartbeat_and_
         .await
         .unwrap();
     assert!(
-        text.contains("- example: 5 alerts omitted by Alertmanager")
+        text.contains("example: 5 alerts omitted by Alertmanager")
             && !text.contains("Watchdog")
             && (occurrences, decisions) == (0, 0),
         "occurrences={occurrences} decisions={decisions}\n{text}"

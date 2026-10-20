@@ -1,4 +1,4 @@
-//! The daily summary: reporting windows and a bounded rendering of one window.
+//! The daily summary: reporting windows and how one window's report reads.
 //!
 //! A summary is built from committed history by the store and delivered through
 //! the outbox like any other quiet post. This module is pure: it decides where
@@ -6,21 +6,16 @@
 
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
-
-use crate::render::escape;
+use crate::render::{
+    Card, Embed, FIELD_VALUE_LIMIT, Field, Footer, Icons, Tier, Tone, discord_time, duration,
+    escape, units,
+};
 
 /// One day in milliseconds.
 pub(crate) const DAY_MS: i64 = 86_400_000;
 
-/// Upper bound on a rendered summary, in characters.
-///
-/// It fits one Discord message even when the destination's largest mention
-/// prefix is reserved, so a summary is never split or rejected for length.
-pub(crate) const MAX_CHARS: usize = 1500;
-
-/// Groups listed per section; the store reads no more than this many.
-pub(crate) const MAX_GROUP_LINES: usize = 12;
+/// Groups listed per tier; the store reads no more than this many per tier.
+pub(crate) const MAX_GROUP_LINES: usize = 8;
 /// Closed heartbeat gaps listed per source before they are summarized.
 pub(crate) const MAX_GAP_LINES: usize = 3;
 /// Coverage lines for sources and truncation shown before the rest is folded.
@@ -59,12 +54,13 @@ pub(crate) fn time_of_day(at: Duration) -> String {
     format!("{:02}:{:02}", minutes / 60 % 24, minutes % 60)
 }
 
-/// Occurrences sharing a source, alert name and severity within one section.
+/// Occurrences sharing a source, alert name, severity and tier within one section.
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct Group {
     pub source: String,
     pub alertname: String,
     pub severity: Option<String>,
+    pub tier: Tier,
     pub count: u64,
     /// Occurrences that started inside the window.
     pub new: u64,
@@ -74,17 +70,49 @@ pub(crate) struct Group {
     pub summary: Option<String>,
 }
 
-/// One section's totals and its most important groups.
+/// Occurrences, those that started inside the window, and their groups.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct Count {
+    pub occurrences: u64,
+    pub new: u64,
+    pub groups: u64,
+}
+
+impl std::ops::Add for Count {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self {
+        Self {
+            occurrences: self.occurrences + other.occurrences,
+            new: self.new + other.new,
+            groups: self.groups + other.groups,
+        }
+    }
+}
+
+/// One section's totals per tier and its most important groups.
 ///
-/// Totals cover every occurrence and group in the section; `groups` holds at
-/// most [`MAX_GROUP_LINES`], already in display order. The rest is folded into
-/// one counted line, so totals always equal what the lines account for.
+/// Counts cover every occurrence and group in the section; `groups` holds at
+/// most [`MAX_GROUP_LINES`] per tier, in display order. Groups that are not
+/// shown are folded into one counted line, so totals always equal what the
+/// lines account for.
 #[derive(Debug, Default, Eq, PartialEq)]
 pub(crate) struct Section {
-    pub total: u64,
-    pub new: u64,
-    pub group_count: u64,
+    /// Indexed by [`Tier::index`].
+    pub counts: [Count; 3],
     pub groups: Vec<Group>,
+}
+
+impl Section {
+    pub(crate) fn count(&self, tier: Tier) -> Count {
+        self.counts[tier.index()]
+    }
+
+    pub(crate) fn total(&self) -> Count {
+        self.counts
+            .into_iter()
+            .fold(Count::default(), |sum, count| sum + count)
+    }
 }
 
 /// Heartbeat coverage of one source inside the window.
@@ -136,74 +164,217 @@ pub(crate) struct Report {
 }
 
 impl Report {
-    /// Renders the report within [`MAX_CHARS`]. Detail is folded into counted
-    /// lines until it fits: first the least important group lines, then coverage
-    /// detail per gap, then per source. Section totals, omitted alerts and failed
-    /// or uncertain notifications are always kept.
-    pub(crate) fn render(&self) -> String {
-        let attempts = [Detail::Gaps, Detail::Sources, Detail::Totals]
-            .into_iter()
-            .flat_map(|detail| {
-                let floor = if detail == Detail::Totals { 0 } else { 3 };
-                (floor..=MAX_GROUP_LINES)
-                    .rev()
-                    .map(move |limit| (detail, limit))
-            });
-        let mut text = String::new();
-        for (detail, limit) in attempts {
-            text = self.render_with(limit, detail);
-            if text.chars().count() <= MAX_CHARS {
-                return text;
+    /// Renders the report as one embed within Discord's limits.
+    ///
+    /// The overall state, per-tier totals, new and recovered counts and every
+    /// coverage or delivery problem are always present. Group lines are folded
+    /// into counted lines until each field and the whole embed fit.
+    pub(crate) fn card(&self, icons: &Icons) -> Card {
+        let coverage = self.coverage_field(icons);
+        let mut card = self.card_with(icons, MAX_GROUP_LINES, coverage.clone());
+        for limit in (0..MAX_GROUP_LINES).rev() {
+            if card.embed.within_limits() {
+                break;
             }
+            card = self.card_with(icons, limit, coverage.clone());
         }
-        // Unreachable: totals and twelve bounded lines are far below the cap.
-        text.chars()
-            .take(MAX_CHARS - 3)
-            .chain("...".chars())
-            .collect()
+        card
     }
 
-    fn render_with(&self, group_lines: usize, detail: Detail) -> String {
-        let mut lines = vec![self.title()];
-        section(
-            &mut lines,
-            "Open",
-            &self.open,
-            group_lines,
-            true,
-            self.show_source,
-        );
-        section(
-            &mut lines,
-            "Resolved",
-            &self.resolved,
-            group_lines,
-            false,
-            self.show_source,
-        );
-        let coverage = self.coverage_lines(detail);
-        if coverage.is_empty() {
-            lines.push("**Coverage gaps:** none".to_owned());
-        } else {
-            lines.push("**Coverage gaps**".to_owned());
-            lines.extend(coverage);
+    fn card_with(&self, icons: &Icons, group_lines: usize, coverage: Option<Field>) -> Card {
+        let open = self.open.total();
+        let resolved = self.resolved.total();
+        let tone = self.tone();
+        let mut fields = Vec::with_capacity(5);
+        for tier in Tier::ALL {
+            let count = self.open.count(tier);
+            if count.occurrences == 0 {
+                continue;
+            }
+            let mut name = format!(
+                "{} {} · {} open",
+                icons.get(tier.tone()),
+                tier.tone().label(),
+                count.occurrences
+            );
+            if count.new > 0 {
+                name.push_str(&format!(" · {} new", count.new));
+            }
+            let groups = self.open.groups.iter().filter(|group| group.tier == tier);
+            fields.push(group_field(name, groups, count, group_lines, |group| {
+                self.group_line(group, true)
+            }));
         }
-        lines.join("\n")
-    }
-
-    fn title(&self) -> String {
-        let mut title = format!(
-            "**Summary** {} to {} UTC",
-            timestamp(self.start, "%Y-%m-%d %H:%M"),
-            timestamp(self.end, "%Y-%m-%d %H:%M")
-        );
-        if self.generated_at - self.end > DELAYED_AFTER_MS {
-            title.push_str(&format!(
-                " (delayed, generated {})",
-                timestamp(self.generated_at, "%m-%d %H:%M")
+        if resolved.occurrences > 0 {
+            let name = format!(
+                "{} {} · {}",
+                icons.get(Tone::Recovered),
+                Tone::Recovered.label(),
+                resolved.occurrences
+            );
+            fields.push(group_field(
+                name,
+                self.resolved.groups.iter(),
+                resolved,
+                group_lines,
+                |group| self.group_line(group, false),
             ));
         }
-        title
+        fields.extend(coverage);
+        let title = if self.end - self.start == DAY_MS {
+            "Daily summary"
+        } else {
+            "Summary"
+        };
+        Card {
+            headline: format!(
+                "{title}: {} open, {} recovered",
+                open.occurrences, resolved.occurrences
+            ),
+            embed: Embed {
+                title: Some(title.to_owned()),
+                description: Some(self.description(icons, tone)),
+                color: tone.color(),
+                fields,
+                footer: self.healthy_coverage().then(|| Footer {
+                    text: "No heartbeat gaps".to_owned(),
+                }),
+                timestamp: chrono::DateTime::from_timestamp_millis(self.end)
+                    .map(|end| end.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+            },
+        }
+    }
+
+    /// The most pressing state: open critical alerts, then a coverage or
+    /// delivery problem, then open warnings or info, else all clear.
+    fn tone(&self) -> Tone {
+        if self.open.count(Tier::Critical).occurrences > 0 {
+            Tone::Critical
+        } else if !self.healthy_coverage() {
+            Tone::Coverage
+        } else if self.open.count(Tier::Warning).occurrences > 0 {
+            Tone::Warning
+        } else if self.open.count(Tier::Info).occurrences > 0 {
+            Tone::Info
+        } else {
+            Tone::Recovered
+        }
+    }
+
+    fn healthy_coverage(&self) -> bool {
+        self.coverage.is_empty() && self.truncated.is_empty() && self.failed + self.uncertain == 0
+    }
+
+    fn description(&self, icons: &Icons, tone: Tone) -> String {
+        let open = self.open.total();
+        let resolved = self.resolved.total();
+        let mut status = if open.occurrences > 0 {
+            String::new()
+        } else if self.healthy_coverage() {
+            "**All clear**".to_owned()
+        } else {
+            "**No open alerts**".to_owned()
+        };
+        if open.occurrences > 0 {
+            let tiers: Vec<String> = Tier::ALL
+                .into_iter()
+                .map(|tier| (tier, self.open.count(tier).occurrences))
+                .filter(|(_, occurrences)| *occurrences > 0)
+                .map(|(tier, occurrences)| {
+                    format!("{occurrences} {}", tier.tone().label().to_lowercase())
+                })
+                .collect();
+            status = format!("**{} open** ({})", open.occurrences, tiers.join(", "));
+        }
+        if open.new > 0 {
+            status.push_str(&format!(" · {} new", open.new));
+        }
+        if resolved.occurrences > 0 {
+            status.push_str(&format!(" · {} recovered", resolved.occurrences));
+        }
+        if !self.coverage.is_empty() {
+            status.push_str(" · **coverage gaps**");
+        }
+        let end_style = if self.end - self.start <= DAY_MS {
+            't'
+        } else {
+            'f'
+        };
+        let mut description = format!(
+            "{} {status}\n{} – {}",
+            icons.get(tone),
+            discord_time(self.start, 'f'),
+            discord_time(self.end, end_style)
+        );
+        if self.generated_at - self.end > DELAYED_AFTER_MS {
+            description.push_str(&format!(
+                "\nDelayed · generated {}",
+                discord_time(self.generated_at, 'R')
+            ));
+        }
+        description
+    }
+
+    fn group_line(&self, group: &Group, open: bool) -> String {
+        let mut line = String::new();
+        if self.show_source {
+            line.push_str(&escape(&group.source, 32));
+            line.push_str(" · ");
+        }
+        line.push_str(&format!("**{}**", escape(&group.alertname, 80)));
+        if group.count > 1 {
+            line.push_str(&format!(" ×{}", group.count));
+        }
+        let label = group.severity.as_deref().unwrap_or("");
+        if !label.is_empty() && !label.eq_ignore_ascii_case(group.tier.tone().label()) {
+            line.push_str(&format!(" ({})", escape(label, 24)));
+        } else if !open && group.tier != Tier::Warning {
+            // Recovered groups share one field; warning is the unmarked default.
+            line.push_str(&format!(" · {}", group.tier.tone().label().to_lowercase()));
+        }
+        if open && group.new > 0 {
+            if group.new == group.count {
+                line.push_str(" · new");
+            } else {
+                line.push_str(&format!(" · {} new", group.new));
+            }
+        }
+        if !group.contexts.is_empty() {
+            let contexts: Vec<String> = group
+                .contexts
+                .iter()
+                .map(|context| escape(context, 48))
+                .collect();
+            line.push_str(" · ");
+            line.push_str(&contexts.join(", "));
+        }
+        if let Some(summary) = group
+            .summary
+            .as_deref()
+            .filter(|summary| !summary.trim().is_empty())
+        {
+            line.push_str(" — ");
+            line.push_str(&escape(summary, 90));
+        }
+        line
+    }
+
+    /// Coverage, omitted alerts and delivery problems, with as much gap detail
+    /// as fits one field; `None` when there are none.
+    fn coverage_field(&self, icons: &Icons) -> Option<Field> {
+        if self.healthy_coverage() {
+            return None;
+        }
+        let value = [Detail::Gaps, Detail::Sources, Detail::Totals]
+            .into_iter()
+            .map(|detail| self.coverage_lines(detail).join("\n"))
+            .find(|value| units(value) <= FIELD_VALUE_LIMIT)
+            .unwrap_or_default();
+        Some(Field {
+            name: format!("{} Coverage", icons.get(Tone::Coverage)),
+            value,
+            inline: false,
+        })
     }
 
     fn coverage_lines(&self, detail: Detail) -> Vec<String> {
@@ -219,8 +390,8 @@ impl Report {
             Detail::Sources => {
                 lines.extend(self.coverage[..shown].iter().map(|coverage| {
                     format!(
-                        "- {}: {}",
-                        coverage.source,
+                        "{}: {}",
+                        escape(&coverage.source, 64),
                         gap_totals(std::slice::from_ref(coverage))
                     )
                 }));
@@ -229,27 +400,30 @@ impl Report {
             Detail::Totals => {
                 if !self.coverage.is_empty() {
                     lines.push(format!(
-                        "- heartbeat gaps on {} sources: {}",
+                        "Heartbeat gaps on {} sources: {}",
                         self.coverage.len(),
                         gap_totals(&self.coverage)
                     ));
                 }
             }
         }
-        if detail == Detail::Gaps && self.truncated.len() <= MAX_COVERAGE_LINES {
+        if detail != Detail::Totals && self.truncated.len() <= MAX_COVERAGE_LINES {
             lines.extend(self.truncated.iter().map(|(source, count)| {
-                format!("- {source}: {count} alerts omitted by Alertmanager")
+                format!(
+                    "{}: {count} alerts omitted by Alertmanager",
+                    escape(source, 64)
+                )
             }));
         } else if !self.truncated.is_empty() {
             let omitted: u64 = self.truncated.iter().map(|(_, count)| count).sum();
             lines.push(format!(
-                "- {omitted} alerts omitted by Alertmanager across {} sources",
+                "{omitted} alerts omitted by Alertmanager across {} sources",
                 self.truncated.len()
             ));
         }
         if self.failed + self.uncertain > 0 {
             lines.push(format!(
-                "- notifications: {} failed, {} may not have arrived",
+                "Notifications: {} failed, {} may not have arrived",
                 self.failed, self.uncertain
             ));
         }
@@ -268,8 +442,53 @@ enum Detail {
     Totals,
 }
 
+/// A field of group lines that fits [`FIELD_VALUE_LIMIT`]: at most `limit`
+/// lines, then one line counting every group and occurrence not listed.
+fn group_field<'a>(
+    name: String,
+    groups: impl Iterator<Item = &'a Group>,
+    count: Count,
+    limit: usize,
+    line: impl Fn(&Group) -> String,
+) -> Field {
+    let mut value = String::new();
+    let (mut shown_groups, mut shown_occurrences) = (0u64, 0u64);
+    let more = |groups: u64, occurrences: u64| {
+        let (groups, occurrences) = (
+            count.groups.saturating_sub(groups),
+            count.occurrences.saturating_sub(occurrences),
+        );
+        (groups > 0).then(|| format!("+{groups} more ({occurrences} alerts)"))
+    };
+    for group in groups.take(limit) {
+        let next = line(group);
+        let after = (shown_groups + 1, shown_occurrences + group.count);
+        let reserve = more(after.0, after.1).map_or(0, |line| units(&line) + 1);
+        let separator = usize::from(!value.is_empty());
+        if units(&value) + separator + units(&next) + reserve > FIELD_VALUE_LIMIT {
+            break;
+        }
+        if separator == 1 {
+            value.push('\n');
+        }
+        value.push_str(&next);
+        (shown_groups, shown_occurrences) = after;
+    }
+    if let Some(line) = more(shown_groups, shown_occurrences) {
+        if !value.is_empty() {
+            value.push('\n');
+        }
+        value.push_str(&line);
+    }
+    Field {
+        name,
+        value,
+        inline: false,
+    }
+}
+
 fn gap_lines(lines: &mut Vec<String>, coverage: &Coverage) {
-    let source = &coverage.source;
+    let source = escape(&coverage.source, 64);
     if coverage.capped || coverage.gap_count > MAX_GAP_LINES as u64 {
         let at_least = if coverage.capped { "at least " } else { "" };
         let first = coverage
@@ -277,38 +496,38 @@ fn gap_lines(lines: &mut Vec<String>, coverage: &Coverage) {
             .first()
             .and_then(|(from, _)| *from)
             .map_or_else(String::new, |from| {
-                format!(", first {}", timestamp(from, "%m-%d %H:%M"))
+                format!(", first {}", discord_time(from, 'f'))
             });
         lines.push(format!(
-            "- {source}: {at_least}{} heartbeat gaps, {at_least}{} without heartbeats{first}",
+            "{source}: {at_least}{} heartbeat gaps, {at_least}{} without heartbeats{first}",
             coverage.gap_count,
             minutes(coverage.gap_ms)
         ));
     } else {
         lines.extend(coverage.gaps.iter().map(|(from, until)| match from {
             Some(from) => format!(
-                "- {source}: no heartbeat {} to {} ({})",
-                timestamp(*from, "%m-%d %H:%M"),
-                timestamp(*until, "%H:%M"),
+                "{source}: no heartbeat {} – {} ({})",
+                discord_time(*from, 'f'),
+                discord_time(*until, 't'),
                 minutes(until - from)
             ),
             None => format!(
-                "- {source}: no heartbeat ever recorded before {}",
-                timestamp(*until, "%m-%d %H:%M")
+                "{source}: no heartbeat ever recorded before {}",
+                discord_time(*until, 'f')
             ),
         }));
     }
     if let Some(ongoing) = coverage.ongoing {
         lines.push(match (ongoing.since, ongoing.recorded) {
             (Some(since), true) => format!(
-                "- {source}: heartbeat stale since {}, ongoing at window end",
-                timestamp(since, "%m-%d %H:%M")
+                "{source}: heartbeat stale since {}, ongoing at window end",
+                discord_time(since, 'f')
             ),
             (Some(since), false) => format!(
-                "- {source}: no heartbeat recorded since {}, ongoing at window end",
-                timestamp(since, "%m-%d %H:%M")
+                "{source}: no heartbeat recorded since {}, ongoing at window end",
+                discord_time(since, 'f')
             ),
-            (None, _) => format!("- {source}: no heartbeat ever recorded, ongoing at window end"),
+            (None, _) => format!("{source}: no heartbeat ever recorded, ongoing at window end"),
         });
     }
 }
@@ -316,7 +535,7 @@ fn gap_lines(lines: &mut Vec<String>, coverage: &Coverage) {
 fn more_sources(lines: &mut Vec<String>, rest: &[Coverage]) {
     if !rest.is_empty() {
         lines.push(format!(
-            "- +{} more sources with heartbeat gaps: {}",
+            "+{} more sources with heartbeat gaps: {}",
             rest.len(),
             gap_totals(rest)
         ));
@@ -342,103 +561,37 @@ fn gap_totals(coverage: &[Coverage]) -> String {
     )
 }
 
-fn section(
-    lines: &mut Vec<String>,
-    title: &str,
-    section: &Section,
-    limit: usize,
-    mark_new: bool,
-    show_source: bool,
-) {
-    lines.push(if mark_new && section.new > 0 {
-        format!("**{title}: {}** ({} new)", section.total, section.new)
-    } else {
-        format!("**{title}: {}**", section.total)
-    });
-    let shown = &section.groups[..limit.min(section.groups.len())];
-    lines.extend(
-        shown
-            .iter()
-            .map(|group| group_line(group, mark_new, show_source)),
-    );
-    let more_groups = section.group_count.saturating_sub(shown.len() as u64);
-    if more_groups > 0 {
-        let shown_alerts: u64 = shown.iter().map(|group| group.count).sum();
-        lines.push(format!(
-            "- +{more_groups} more alert names ({} alerts)",
-            section.total.saturating_sub(shown_alerts)
-        ));
-    }
-}
-
-fn group_line(group: &Group, mark_new: bool, show_source: bool) -> String {
-    let mut line = String::from("- ");
-    if show_source {
-        line.push_str(&group.source);
-        line.push_str(": ");
-    }
-    line.push_str(&escape(&group.alertname, 80));
-    line.push_str(&format!(
-        " [{}]",
-        escape(group.severity.as_deref().unwrap_or("unknown"), 24)
-    ));
-    if group.count > 1 {
-        line.push_str(&format!(" x{}", group.count));
-    }
-    if mark_new && group.new > 0 {
-        if group.new == group.count {
-            line.push_str(", new");
-        } else {
-            line.push_str(&format!(", {} new", group.new));
-        }
-    }
-    if !group.contexts.is_empty() {
-        let contexts: Vec<String> = group
-            .contexts
-            .iter()
-            .map(|context| escape(context, 48))
-            .collect();
-        line.push_str(": ");
-        line.push_str(&contexts.join(", "));
-    }
-    if let Some(summary) = group
-        .summary
-        .as_deref()
-        .filter(|summary| !summary.is_empty())
-    {
-        line.push_str(" - ");
-        line.push_str(&escape(summary, 100));
-    }
-    line
-}
-
-fn timestamp(millis: i64, format: &str) -> String {
-    DateTime::<Utc>::from_timestamp_millis(millis)
-        .map_or_else(|| millis.to_string(), |at| at.format(format).to_string())
-}
-
 fn minutes(millis: i64) -> String {
-    let minutes = u64::try_from(millis).unwrap_or(0).div_ceil(60_000);
-    humantime::format_duration(Duration::from_secs(minutes * 60)).to_string()
+    duration(Duration::from_millis(u64::try_from(millis).unwrap_or(0)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::render::{EMBEDS_TOTAL_LIMIT, Part};
 
     const HOUR: i64 = 3_600_000;
     // 2026-10-13T06:00:00Z
     const SIX: i64 = 1_791_871_200_000;
 
-    fn group(alertname: &str, count: u64, new: u64) -> Group {
+    fn group(alertname: &str, tier: Tier, count: u64, new: u64) -> Group {
         Group {
             source: "apollo".to_owned(),
             alertname: alertname.to_owned(),
-            severity: Some("warning".to_owned()),
+            severity: Some(tier.tone().label().to_lowercase()),
+            tier,
             count,
             new,
             contexts: vec!["media/sonarr".to_owned()],
             summary: None,
+        }
+    }
+
+    fn count(occurrences: u64, new: u64, groups: u64) -> Count {
+        Count {
+            occurrences,
+            new,
+            groups,
         }
     }
 
@@ -449,6 +602,10 @@ mod tests {
             generated_at: SIX + 1000,
             ..Report::default()
         }
+    }
+
+    fn text(report: &Report) -> String {
+        Part::Card(report.card(&Icons::default())).text()
     }
 
     #[test]
@@ -470,44 +627,130 @@ mod tests {
     }
 
     #[test]
-    fn listed_groups_and_the_folded_line_add_up_to_the_section_totals() {
+    fn critical_and_warning_issues_are_separate_with_true_totals() {
         let mut report = report();
         report.open = Section {
-            total: 4_998,
-            new: 40,
-            group_count: 4_000,
-            groups: (0..MAX_GROUP_LINES)
-                .map(|index| group(&format!("Alert{index:02}"), 3, 1))
+            counts: [count(9, 2, 3), count(4_989, 38, 3_997), Count::default()],
+            groups: (0..3)
+                .map(|index| group(&format!("Page{index}"), Tier::Critical, 3, 1))
+                .chain(
+                    (0..MAX_GROUP_LINES)
+                        .map(|index| group(&format!("Warn{index:02}"), Tier::Warning, 3, 1)),
+                )
                 .collect(),
         };
-        let text = report.render();
+        let card = report.card(&Icons::default());
+        let names: Vec<&str> = card
+            .embed
+            .fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect();
+        let text = Part::Card(card.clone()).text();
         assert!(
-            text.contains("**Open: 4998** (40 new)")
-                && text.contains("- +3988 more alert names (4962 alerts)"),
+            card.embed.color == Tone::Critical.color()
+                && names
+                    == [
+                        "\u{1F534} Critical · 9 open · 2 new",
+                        "\u{1F7E0} Warning · 4989 open · 38 new"
+                    ]
+                && text.contains("**4998 open** (9 critical, 4989 warning) · 40 new")
+                && text.contains("+3989 more (4965 alerts)"),
             "{text}"
         );
     }
 
     #[test]
-    fn huge_reports_fit_one_message() {
+    fn a_quiet_window_is_all_clear_and_says_coverage_is_healthy() {
+        let card = report().card(&Icons::default());
+        assert_eq!(
+            (
+                card.embed.color,
+                card.embed.description.as_deref(),
+                card.embed.fields.len(),
+                card.embed.footer.map(|footer| footer.text)
+            ),
+            (
+                Tone::Recovered.color(),
+                Some("\u{1F7E2} **All clear**\n<t:1791784800:f> – <t:1791871200:t>"),
+                0,
+                Some("No heartbeat gaps".to_owned())
+            )
+        );
+    }
+
+    #[test]
+    fn a_coverage_gap_outranks_open_warnings_and_is_never_called_healthy() {
         let mut report = report();
-        let long = "N".repeat(500);
-        let groups = |count| {
-            (0..MAX_GROUP_LINES)
-                .map(|index| group(&format!("{long}{index}"), count, 1))
-                .collect()
-        };
         report.open = Section {
-            total: 5000,
-            new: 5000,
-            group_count: 5000,
-            groups: groups(1),
+            counts: [Count::default(), count(1, 0, 1), Count::default()],
+            groups: vec![group("Disk", Tier::Warning, 1, 0)],
+        };
+        report.coverage = vec![Coverage {
+            source: "apollo".to_owned(),
+            ongoing: Some(Ongoing {
+                since: None,
+                recorded: false,
+            }),
+            ..Coverage::default()
+        }];
+        let card = report.card(&Icons::default());
+        let text = Part::Card(card.clone()).text();
+        assert!(
+            card.embed.color == Tone::Coverage.color()
+                && card.embed.footer.is_none()
+                && text.contains("**coverage gaps**")
+                && text.contains(
+                    "\u{1F50C} Coverage\napollo: no heartbeat ever recorded, ongoing at window end"
+                ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn recoveries_are_green_and_never_counted_as_open() {
+        let mut report = report();
+        report.resolved = Section {
+            counts: [count(2, 2, 1), Count::default(), Count::default()],
+            groups: vec![group("DiskFull", Tier::Critical, 2, 2)],
+        };
+        let text = text(&report);
+        assert!(
+            text.contains("**All clear** · 2 recovered")
+                && text.contains("Recovered · 2\n**DiskFull** ×2 · critical · media/sonarr"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn huge_reports_fit_one_embed_with_every_total() {
+        let mut report = report();
+        let long = "\u{1F525}".repeat(500);
+        let groups = |tier, count| {
+            (0..MAX_GROUP_LINES)
+                .map(|index| {
+                    let mut group = group(&format!("{long}{index}"), tier, count, 1);
+                    group.summary = Some(long.clone());
+                    group.contexts = vec![long.clone(), format!("{long}2")];
+                    group
+                })
+                .collect::<Vec<_>>()
+        };
+        report.show_source = true;
+        report.open = Section {
+            counts: [
+                count(5000, 5000, 5000),
+                count(5000, 0, 5000),
+                count(5000, 1, 5000),
+            ],
+            groups: [Tier::Critical, Tier::Warning, Tier::Info]
+                .into_iter()
+                .flat_map(|tier| groups(tier, 1))
+                .collect(),
         };
         report.resolved = Section {
-            total: 10_000,
-            new: 0,
-            group_count: 5000,
-            groups: groups(2),
+            counts: [count(10_000, 0, 5000), Count::default(), Count::default()],
+            groups: groups(Tier::Critical, 2),
         };
         report.coverage = (0..100)
             .map(|index| Coverage {
@@ -524,48 +767,38 @@ mod tests {
             .collect();
         report.truncated = (0..50).map(|index| (format!("source{index}"), 7)).collect();
         report.failed = 3;
-        let text = report.render();
+        let card = report.card(&Icons::default());
+        let text = Part::Card(card.clone()).text();
         assert!(
-            text.chars().count() <= MAX_CHARS && text.contains("**Resolved: 10000**"),
-            "{} chars:\n{text}",
-            text.chars().count()
+            card.embed.within_limits()
+                && card.embed.units() <= EMBEDS_TOTAL_LIMIT
+                && text.contains("**15000 open** (5000 critical, 5000 warning, 5000 info)")
+                && text.contains("Recovered · 10000")
+                && text.contains("350 alerts omitted by Alertmanager across 50 sources")
+                && text.contains("Notifications: 3 failed, 0 may not have arrived"),
+            "{} units:\n{text}",
+            card.embed.units()
         );
     }
 
     #[test]
     fn untrusted_alert_text_cannot_mention_or_link() {
         let mut report = report();
-        let mut hostile = group("@everyone", 1, 1);
+        let mut hostile = group("@everyone", Tier::Warning, 1, 1);
         hostile.contexts = vec!["<@123456789012345678>".to_owned()];
-        hostile.summary = Some("[click](https://example.invalid) @here".to_owned());
+        hostile.summary = Some("[click](https://example.invalid) @here <t:1:R>".to_owned());
+        hostile.severity = Some("`warning`".to_owned());
         report.open = Section {
-            total: 1,
-            new: 1,
-            group_count: 1,
+            counts: [Count::default(), count(1, 1, 1), Count::default()],
             groups: vec![hostile],
         };
-        let text = report.render();
+        let text = text(&report);
         assert!(
             !text.contains("@everyone")
                 && !text.contains("@here")
                 && !text.contains("<@1")
-                && !text.contains("]("),
-            "{text}"
-        );
-    }
-
-    #[test]
-    fn resolved_occurrences_are_never_counted_as_open() {
-        let mut report = report();
-        report.resolved = Section {
-            total: 2,
-            new: 2,
-            group_count: 1,
-            groups: vec![group("DiskFull", 2, 2)],
-        };
-        let text = report.render();
-        assert!(
-            text.contains("**Open: 0**") && text.contains("**Resolved: 2**"),
+                && !text.contains("](")
+                && !text.contains("<t:1:R>"),
             "{text}"
         );
     }
@@ -574,10 +807,10 @@ mod tests {
     fn a_late_report_says_when_it_was_generated() {
         let mut report = report();
         report.generated_at = SIX + 12 * HOUR;
+        let text = text(&report);
         assert!(
-            report.render().contains("(delayed, generated 10-13 18:00)"),
-            "{}",
-            report.render()
+            text.contains("\nDelayed · generated <t:1791914400:R>"),
+            "{text}"
         );
     }
 
@@ -591,7 +824,7 @@ mod tests {
                 gap_count: 1,
                 ..Coverage::default()
             }];
-            report.render()
+            text(&report)
         };
         let (exact, longer) = (render(119 * 60_000), render(119 * 60_000 + 1));
         assert!(
@@ -601,21 +834,8 @@ mod tests {
     }
 
     #[test]
-    fn dense_coverage_keeps_every_diagnostic_total_within_the_budget() {
+    fn dense_coverage_keeps_every_diagnostic_total_within_its_field() {
         let mut report = report();
-        let long = "\u{00e9}".repeat(70);
-        report.open = Section {
-            total: 40,
-            new: 40,
-            group_count: 30,
-            groups: (0..MAX_GROUP_LINES)
-                .map(|index| {
-                    let mut group = group(&format!("{long}{index}"), 2, 2);
-                    group.summary = Some(long.clone());
-                    group
-                })
-                .collect(),
-        };
         report.coverage = (0..5)
             .map(|index| Coverage {
                 source: format!("{index}{}", "s".repeat(63)),
@@ -636,15 +856,14 @@ mod tests {
             .collect();
         report.failed = 2;
         report.uncertain = 1;
-        let text = report.render();
+        let card = report.card(&Icons::default());
+        let coverage = &card.embed.fields[0].value;
         assert!(
-            text.chars().count() <= MAX_CHARS
-                && !text.ends_with("...")
-                && text.contains("5 sources")
-                && text.contains("35 alerts omitted")
-                && text.contains("- notifications: 2 failed, 1 may not have arrived"),
-            "{} chars:\n{text}",
-            text.chars().count()
+            card.embed.within_limits()
+                && coverage.contains("5 sources")
+                && coverage.contains("35 alerts omitted")
+                && coverage.contains("Notifications: 2 failed, 1 may not have arrived"),
+            "{coverage}"
         );
     }
 
@@ -659,11 +878,10 @@ mod tests {
             gap_ms: 10 * HOUR,
             ongoing: None,
         }];
-        let text = report.render();
+        let text = text(&report);
         assert!(
-            text.contains(
-                "- apollo: at least 10000 heartbeat gaps, at least 10h without heartbeats"
-            ) && !text.contains("ongoing"),
+            text.contains("apollo: at least 10000 heartbeat gaps, at least 10h without heartbeats")
+                && !text.contains("ongoing"),
             "{text}"
         );
     }

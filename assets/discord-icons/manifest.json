@@ -1,0 +1,79 @@
+{
+  "source": "https://github.com/lucide-icons/lucide",
+  "release": "1.59.0",
+  "revision": "1ef60af944de207e0d5176905a0759ba12e6ee8d",
+  "license": "ISC (Lucide); MIT (Feather-derived icons); see LICENSE",
+  "rasterizer": "rsvg-convert version 2.62.3",
+  "icons": [
+    {
+      "tone": "critical",
+      "emoji_name": "criers_critical",
+      "lucide_icon": "octagon-alert",
+      "source_url": "https://github.com/lucide-icons/lucide/blob/1ef60af944de207e0d5176905a0759ba12e6ee8d/icons/octagon-alert.svg",
+      "source_sha256": "86d28171a1d6ee0e65ebd44c9e683dce5803a85a1d3980fcc60bd46465f8c6b2",
+      "colour": "#E5484D",
+      "stroke_width": 2.5,
+      "svg": "criers_critical.svg",
+      "svg_sha256": "a7818b4c2659decc9131942adb08061e41df8dc6978f7e5469b917fa4b64433f",
+      "png": "criers_critical.png",
+      "png_size": [128, 128],
+      "png_sha256": "ad16b70145b248042e9e0cf553e1a88e68a35728e2f81d2cd018053f6a90d57b"
+    },
+    {
+      "tone": "warning",
+      "emoji_name": "criers_warning",
+      "lucide_icon": "triangle-alert",
+      "source_url": "https://github.com/lucide-icons/lucide/blob/1ef60af944de207e0d5176905a0759ba12e6ee8d/icons/triangle-alert.svg",
+      "source_sha256": "4866f38b8560d410f21e3226413e0b77997b6dfbb6931fadfe0a0d5aef9ffeb4",
+      "colour": "#F5A524",
+      "stroke_width": 2.5,
+      "svg": "criers_warning.svg",
+      "svg_sha256": "e66592482342197676c2a120e2c4eb93ddfd368310c5c1f248419793fb8e7bf1",
+      "png": "criers_warning.png",
+      "png_size": [128, 128],
+      "png_sha256": "4b667eb9a6e7a11ecbf2640c3d5e1a6347db5e72369ee19cec54bbf7c671e889"
+    },
+    {
+      "tone": "info",
+      "emoji_name": "criers_info",
+      "lucide_icon": "info",
+      "source_url": "https://github.com/lucide-icons/lucide/blob/1ef60af944de207e0d5176905a0759ba12e6ee8d/icons/info.svg",
+      "source_sha256": "bc977a64eb96f3e9c1041ffd09a3fceb70e3e65c02b571f76064062ed31f3cb9",
+      "colour": "#3E8ED0",
+      "stroke_width": 2.5,
+      "svg": "criers_info.svg",
+      "svg_sha256": "723595229c366a1eb920bf9f50e1fd4f82e311a922a20bd2256cf2ccb36d4622",
+      "png": "criers_info.png",
+      "png_size": [128, 128],
+      "png_sha256": "ae0a7d99ef84fe9717a8551827ed50f94aefdcec3d6adba3937170ea0ce60555"
+    },
+    {
+      "tone": "recovered",
+      "emoji_name": "criers_recovered",
+      "lucide_icon": "circle-check",
+      "source_url": "https://github.com/lucide-icons/lucide/blob/1ef60af944de207e0d5176905a0759ba12e6ee8d/icons/circle-check.svg",
+      "source_sha256": "9711e045a5999f8a3b0782eb88e09b04e0559bc7b379dcc0a4ae645223e10345",
+      "colour": "#30A46C",
+      "stroke_width": 2.5,
+      "svg": "criers_recovered.svg",
+      "svg_sha256": "95cd7f8bafd393f6633022f962891a7e5f9b98449a04416a233faa727d64067c",
+      "png": "criers_recovered.png",
+      "png_size": [128, 128],
+      "png_sha256": "02edd4e52b39811569dbcb80af40c199bdb6b957d11e2599ea59100b1377f9a1"
+    },
+    {
+      "tone": "coverage",
+      "emoji_name": "criers_coverage",
+      "lucide_icon": "unplug",
+      "source_url": "https://github.com/lucide-icons/lucide/blob/1ef60af944de207e0d5176905a0759ba12e6ee8d/icons/unplug.svg",
+      "source_sha256": "469819bc5dbdb54f9c1ccc06415f45c73b995b567016f07fb560af1eeeb0cf2e",
+      "colour": "#8E4EC6",
+      "stroke_width": 2.5,
+      "svg": "criers_coverage.svg",
+      "svg_sha256": "1b47db94ee097fc8704585ffcfc87254d523df00f48874fe4277982675c5b897",
+      "png": "criers_coverage.png",
+      "png_size": [128, 128],
+      "png_sha256": "c735e75fd38ffb74fbde7d5b4815afe1c73890d65fcf85bcd2e940e7e4b036e6"
+    }
+  ]
+}
