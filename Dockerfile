@@ -17,7 +17,7 @@ RUN --mount=type=cache,id=criers-cargo-registry,target=/usr/local/cargo/registry
     && install -D -m 0755 target/release/criers /out/usr/local/bin/criers \
     && install -d -m 0750 /out/var/lib/criers
 
-FROM gcr.io/distroless/cc-debian13:nonroot@sha256:e792ab3d241a468a4fd7519ddbbebe66b49b5f365771716ea688ad40b6c6f1c2
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:83b9b50586253821cf63ffcec87d3d94265a093ad30da232039af962dd8f4edf
 COPY --from=build /out/usr/local/bin/criers /usr/local/bin/criers
 # Seeded ownership lets a fresh named volume start writable for the non-root user.
 COPY --from=build --chown=65532:65532 /out/var/lib/criers /var/lib/criers
