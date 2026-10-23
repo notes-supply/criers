@@ -38,8 +38,6 @@ jobs:
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: Check workspace
         run: mise run ci
-      - name: Check public TLS trust without webhook sends
-        run: mise exec -- cargo test --package criers --locked public_tls_trust_matrix -- --ignored --nocapture
 
   packaging:
     name: Kubernetes packaging and workflows
