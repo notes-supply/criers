@@ -52,6 +52,7 @@ jobs:
       - name: Build the image once
         run: |
           docker buildx build --load \
+            --build-arg "TRUST_REFRESH=${GITHUB_SHA}" \
             --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
             --label "org.opencontainers.image.version=${VERSION}" \
             --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
