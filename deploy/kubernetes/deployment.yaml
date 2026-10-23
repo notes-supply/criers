@@ -25,7 +25,7 @@ spec:
       containers:
         - name: criers
           # Build and push your own image; this reference is a placeholder.
-          image: registry.example.invalid/criers:0.3.0
+          image: registry.example.invalid/criers:0.3.1
           args: ["serve", "--config", "/etc/criers/criers.toml"]
           ports:
             - name: ingest

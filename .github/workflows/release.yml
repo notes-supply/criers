@@ -16,7 +16,7 @@ concurrency:
 jobs:
   release:
     name: Publish image and chart
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 45
     permissions:
       contents: read # check out the tagged source
@@ -44,9 +44,14 @@ jobs:
           echo "VERSION=${RELEASE_TAG#v}" >> "$GITHUB_ENV"
       - name: Validate and package the chart
         run: mise run chart
+      - name: Set up the persistent Docker builder
+        uses: useblacksmith/setup-docker-builder@19215110ab936351210feebdfa5b440b4493e184 # v2.2.0, Node 24
+        with:
+          cache-key: Dockerfile
+          nofallback: true
       - name: Build the image once
         run: |
-          docker build \
+          docker buildx build --load \
             --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
             --label "org.opencontainers.image.version=${VERSION}" \
             --label "org.opencontainers.image.revision=${GITHUB_SHA}" \

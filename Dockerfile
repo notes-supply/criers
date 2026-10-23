@@ -3,6 +3,9 @@
 
 FROM docker.io/library/rust:1-slim-trixie@sha256:2752b332db73fdbb7dc576f06c82ed1f312005784ef913d7e04a28f5f55dc581 AS build
 WORKDIR /src
+RUN apt-get update --error-on=any \
+    && apt-get install -y --no-install-recommends --only-upgrade ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 COPY mise.toml ./
 RUN toolchain="$(sed -n 's/^rust = { version = "\([^"]*\)".*/\1/p' mise.toml)" \
     && test -n "$toolchain" \
