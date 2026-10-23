@@ -604,8 +604,11 @@ mod tests {
     #[tokio::test]
     #[ignore = "public-network TLS matrix; no webhook sends or credentials"]
     async fn public_tls_trust_matrix() -> anyhow::Result<()> {
-        let harness =
-            crate::tests::Harness::live("https://discord.invalid/api/webhooks/1/dummy", "").await;
+        let harness = crate::tests::Harness::live(
+            "https://discord.invalid/api/webhooks/123456789012345678/dummy",
+            "",
+        )
+        .await;
         let discord = Discord::new(&harness.config.destinations["ops"], Duration::from_secs(15))?;
         let client = &discord.client;
         for (host, accepted) in [
