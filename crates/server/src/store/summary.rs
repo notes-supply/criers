@@ -14,7 +14,8 @@ use crate::{
     config::{Config, Heartbeat},
     render::{Tier, tier_sql},
     summary::{
-        Count, Coverage, Group, MAX_GAP_LINES, MAX_GROUP_LINES, Ongoing, Report, Schedule, Section,
+        Count, Coverage, Group, MAX_GAP_LINES, MAX_GROUP_CONTEXTS, MAX_GROUP_LINES, Ongoing,
+        Report, Schedule, Section,
     },
 };
 
@@ -160,11 +161,12 @@ fn count(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
 /// if it started before the window end and had not closed by then, resolved if
 /// it resolved inside the window. Both branches of the union use an index: the
 /// open one on first_seen_at for unclosed occurrences, the closed one on
-/// closed_at. Parameters: ?1 window start, ?2 window end, ?3 digest rank.
+/// closed_at. A query reading it twice scans it twice rather than copying every
+/// row's labels. Parameters: ?1 window start, ?2 window end, ?3 digest rank.
 macro_rules! candidates {
     () => {
         concat!(
-            "WITH candidates AS (
+            "WITH candidates AS NOT MATERIALIZED (
             SELECT 'open' AS category, source, alertname, severity, highest_action,
                 first_seen_at, summary, labels, ",
             tier_sql!(),
@@ -202,6 +204,10 @@ macro_rules! context {
             ", ",
             label!($labels, "job_name"),
             ", ",
+            label!($labels, "customresource_kind"),
+            " || '/' || ",
+            label!($labels, "name"),
+            ", ",
             label!($labels, "container"),
             ")), ''), ",
             label!($labels, "host"),
@@ -225,7 +231,11 @@ macro_rules! label {
 
 /// One section: true totals per tier from an aggregate, and each tier's most
 /// important groups (highest action, then size) read in display order, at most
-/// [`MAX_GROUP_LINES`] per tier.
+/// [`MAX_GROUP_LINES`] per tier. Only the occurrences of those groups are read
+/// again for resources: each group's distinct resources are counted and the
+/// first [`MAX_GROUP_CONTEXTS`] of them read. `shown` is materialized so the
+/// ranking runs once, and the CROSS JOIN keeps the scan of candidates as the
+/// outer loop, so labels are parsed only for rows of shown groups.
 fn section(
     transaction: &Transaction<'_>,
     category: &str,
@@ -253,34 +263,56 @@ fn section(
     let groups = transaction
         .prepare_cached(concat!(
             candidates!(),
-            "SELECT source, alertname, severity, tier, size, fresh, summary, first, last
-             FROM (SELECT source, alertname, severity, tier, count(*) AS size,
+            ", shown AS MATERIALIZED (
+                SELECT * FROM (SELECT source, alertname, severity, tier, count(*) AS size,
                     coalesce(sum(first_seen_at >= ?1), 0) AS fresh, max(summary) AS summary,
-                    min(",
-            context!("labels"),
-            ") AS first, max(",
-            context!("labels"),
-            ") AS last,
                     row_number() OVER (PARTITION BY tier ORDER BY max(highest_action) DESC,
                         count(*) DESC, alertname, severity, source) AS rank
                 FROM candidates WHERE category = ?4
                 GROUP BY source, alertname, severity, tier)
-             WHERE rank <= ?5
-             ORDER BY tier, rank"
+                WHERE rank <= ?5),
+            contexts AS (
+                SELECT DISTINCT s.tier, s.rank, ",
+            context!("c.labels"),
+            " AS context
+                FROM candidates AS c CROSS JOIN shown AS s
+                    ON c.source = s.source AND c.alertname = s.alertname
+                    AND c.severity IS s.severity AND c.tier = s.tier
+                WHERE c.category = ?4),
+            listed AS (
+                SELECT tier, rank, context,
+                    row_number() OVER (PARTITION BY tier, rank ORDER BY context) AS position,
+                    count(*) OVER (PARTITION BY tier, rank) AS total
+                FROM contexts WHERE context IS NOT NULL)
+             SELECT s.source, s.alertname, s.severity, s.tier, s.size, s.fresh, s.summary,
+                coalesce(max(l.total), 0),
+                json_group_array(l.context ORDER BY l.context)
+                    FILTER (WHERE l.context IS NOT NULL)
+             FROM shown AS s LEFT JOIN listed AS l
+                ON l.tier = s.tier AND l.rank = s.rank AND l.position <= ?6
+             GROUP BY s.tier, s.rank
+             ORDER BY s.tier, s.rank"
         ))?
         .query_map(
-            params![start, end, digest, category, MAX_GROUP_LINES as i64],
+            params![
+                start,
+                end,
+                digest,
+                category,
+                MAX_GROUP_LINES as i64,
+                MAX_GROUP_CONTEXTS as i64
+            ],
             |row| {
                 let size = count(row, 4)?;
                 let summary: Option<String> = row.get(6)?;
-                let mut contexts: Vec<String> = Vec::with_capacity(2);
-                for index in [7, 8] {
-                    if let Some(context) = row.get::<_, Option<String>>(index)?
-                        && !contexts.contains(&context)
-                    {
-                        contexts.push(context);
-                    }
-                }
+                let contexts =
+                    serde_json::from_str(&row.get::<_, String>(8)?).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            8,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?;
                 Ok(Group {
                     source: row.get(0)?,
                     alertname: row.get(1)?,
@@ -289,6 +321,7 @@ fn section(
                     count: size,
                     new: count(row, 5)?,
                     contexts,
+                    context_count: count(row, 7)?,
                     summary: summary.filter(|_| size == 1),
                 })
             },
@@ -486,6 +519,36 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_group_without_a_severity_keeps_its_resources() {
+        let harness = Harness::shadow("").await;
+        let section = harness
+            .store
+            .with_connection(|connection| {
+                connection.execute(
+                    "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < 4)
+                     INSERT INTO occurrences(source, fingerprint, starts_at, status,
+                        highest_action, alertname, severity, labels, summary, first_seen_at,
+                        last_seen_at, observations)
+                     SELECT 'example', printf('%016x', i), '2026-10-12T00:00:00.000000000Z',
+                        'firing', 1, 'Unlabelled', NULL,
+                        CASE WHEN i = 0 THEN '{}' ELSE json_object('host', 'h' || i) END,
+                        '', 1000, 1000, 1
+                     FROM n",
+                    [],
+                )?;
+                let transaction = connection.transaction()?;
+                section(&transaction, "open", 0, 2000)
+            })
+            .await
+            .unwrap();
+        let group = &section.groups[0];
+        assert_eq!(
+            (group.count, group.contexts.as_slice(), group.context_count),
+            (5, &["h1", "h2", "h3"].map(str::to_owned)[..], 4)
+        );
+    }
+
     /// The SQL used for summaries and the Rust used for alert cards must agree.
     #[test]
     fn tier_and_resource_rules_agree_between_sql_and_cards() {
@@ -545,6 +608,35 @@ mod tests {
             &[("instance", "10.0.0.1:9100"), ("job", "node")][..],
             &[("job", "node")][..],
             &[("namespace", ""), ("host", "iris")][..],
+            &[
+                ("namespace", "flux-system"),
+                ("customresource_kind", "Kustomization"),
+                ("name", "apps"),
+            ][..],
+            &[("customresource_kind", "HelmRelease"), ("name", "ingress")][..],
+            &[("namespace", "flux-system"), ("name", "apps")][..],
+            &[
+                ("namespace", "flux-system"),
+                ("customresource_kind", "Kustomization"),
+            ][..],
+            &[
+                ("namespace", "ns"),
+                ("customresource_kind", "Kustomization"),
+                ("name", ""),
+                ("container", "app"),
+            ][..],
+            &[
+                ("namespace", "ns"),
+                ("customresource_kind", "Certificate"),
+                ("name", "web"),
+                ("container", "app"),
+            ][..],
+            &[
+                ("namespace", "ns"),
+                ("job_name", "nightly"),
+                ("customresource_kind", "Certificate"),
+                ("name", "web"),
+            ][..],
             &[][..],
         ];
         for labels in label_sets {

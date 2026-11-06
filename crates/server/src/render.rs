@@ -497,7 +497,8 @@ pub(crate) fn headline(label: &str, escaped: &str) -> String {
 }
 
 /// The resource an alert is about, in the summary's order of preference: a
-/// namespaced workload, else a host, a service, an instance or a job.
+/// namespaced workload or custom resource (`Kind/name`, as kube-state-metrics
+/// labels them), else a host, a service, an instance or a job.
 pub(crate) fn resource(labels: &BTreeMap<String, String>) -> Option<String> {
     let label = |name: &str| {
         labels
@@ -505,17 +506,16 @@ pub(crate) fn resource(labels: &BTreeMap<String, String>) -> Option<String> {
             .map(String::as_str)
             .filter(|value| !value.is_empty())
     };
-    let workload = [
-        "pod",
-        "deployment",
-        "statefulset",
-        "daemonset",
-        "job_name",
-        "container",
-    ]
-    .into_iter()
-    .find_map(label);
-    let namespaced = [label("namespace"), workload]
+    let custom = label("customresource_kind")
+        .zip(label("name"))
+        .map(|(kind, name)| format!("{kind}/{name}"));
+    let workload = ["pod", "deployment", "statefulset", "daemonset", "job_name"]
+        .into_iter()
+        .find_map(label)
+        .map(str::to_owned)
+        .or(custom)
+        .or_else(|| label("container").map(str::to_owned));
+    let namespaced = [label("namespace"), workload.as_deref()]
         .into_iter()
         .flatten()
         .collect::<Vec<_>>()
