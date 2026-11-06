@@ -29,9 +29,9 @@ release exists, install from a checkout with `./charts/criers` instead of the
 OCI reference and set `image.repository` to an image you built.
 
 ```sh
-helm install criers oci://ghcr.io/notes-supply/charts/criers --version 0.3.0 \
+helm install criers oci://ghcr.io/notes-supply/charts/criers --version 0.3.1 \
   --namespace criers -f my-values.yaml
-helm upgrade criers oci://ghcr.io/notes-supply/charts/criers --version 0.3.0 \
+helm upgrade criers oci://ghcr.io/notes-supply/charts/criers --version 0.3.1 \
   --namespace criers -f my-values.yaml
 ```
 

@@ -600,4 +600,69 @@ mod tests {
             "{delay:?}"
         );
     }
+
+    #[tokio::test]
+    #[ignore = "public-network TLS matrix; no webhook sends or credentials"]
+    async fn public_tls_trust_matrix() -> anyhow::Result<()> {
+        let harness = crate::tests::Harness::live(
+            "https://discord.invalid/api/webhooks/123456789012345678/dummy",
+            "",
+        )
+        .await;
+        let discord = Discord::new(&harness.config.destinations["ops"], Duration::from_secs(15))?;
+        let client = &discord.client;
+        for (host, accepted) in [
+            ("example.com", true),
+            ("wrong.host.badssl.com", false),
+            ("self-signed.badssl.com", false),
+            ("dv-g3b-emudhra.we-have-a-problem.com", false),
+            ("dv-g3c-emudhra.we-have-a-problem.com", false),
+            ("ov-g3b-emudhra.we-have-a-problem.com", false),
+            ("ov-g3c-emudhra.we-have-a-problem.com", false),
+            ("ev-g3b-emudhra.we-have-a-problem.com", false),
+            ("ev-g3c-emudhra.we-have-a-problem.com", false),
+            ("dv-g3b-aaa-emudhra.we-have-a-problem.com", false),
+            ("dv-g3c-aaa-emudhra.we-have-a-problem.com", false),
+            ("ov-g3b-aaa-emudhra.we-have-a-problem.com", false),
+            ("ov-g3c-aaa-emudhra.we-have-a-problem.com", false),
+            ("ev-g3b-aaa-emudhra.we-have-a-problem.com", false),
+            ("ev-g3c-aaa-emudhra.we-have-a-problem.com", false),
+            ("dv-g3b-noct-emudhra.we-have-a-problem.com", false),
+            ("dv-g3b-aaa-noct-emudhra.we-have-a-problem.com", false),
+        ] {
+            let result = client
+                .get(format!("https://{host}/"))
+                .timeout(std::time::Duration::from_secs(15))
+                .send()
+                .await;
+            match result {
+                Ok(response) => {
+                    anyhow::ensure!(
+                        accepted,
+                        "{host}: unexpectedly trusted ({})",
+                        response.status()
+                    );
+                    anyhow::ensure!(
+                        response.status().is_success(),
+                        "{host}: invalid control response"
+                    );
+                    let body = response.bytes().await?;
+                    anyhow::ensure!(!body.is_empty(), "{host}: empty control body");
+                    println!("{host}: accepted valid control");
+                }
+                Err(error) => {
+                    let detail = format!("{error:?}");
+                    let certificate_error = detail.to_ascii_lowercase().contains("certificate")
+                        || detail.contains("UnknownIssuer")
+                        || detail.contains("CertNotValidForName");
+                    anyhow::ensure!(
+                        !accepted && certificate_error,
+                        "{host}: inconclusive TLS result: {detail}"
+                    );
+                    println!("{host}: certificate rejected: {detail}");
+                }
+            }
+        }
+        Ok(())
+    }
 }

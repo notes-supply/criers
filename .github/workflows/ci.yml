@@ -16,7 +16,7 @@ concurrency:
 jobs:
   check:
     name: Workspace checks
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
     env:
       CARGO_TERM_COLOR: always
@@ -41,7 +41,7 @@ jobs:
 
   packaging:
     name: Kubernetes packaging and workflows
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     env:
       MISE_TASK_RUN_AUTO_INSTALL: "false"
