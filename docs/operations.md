@@ -233,8 +233,9 @@ Scheduling and delivery:
   with backoff and the window stays pending.
 
 Generation holds the database connection for its duration, which is how long it
-can delay a concurrent webhook commit. Measured with the release build: about
-80 ms for 20,000 notifying occurrences in one window and 270 ms for 100,000.
+can delay a concurrent webhook commit. Measured with the release build on a
+local SSD, for the slowest of the grouping shapes tried: about 80 ms for 20,000
+notifying occurrences in one window and 330 ms for 100,000.
 `criers_summary_cursor_seconds` shows that the schedule advances,
 `criers_summary_window_end_seconds` that summaries are generated, and
 `criers_summary_delivered_window_end_seconds` shows that one actually reached
