@@ -14,7 +14,8 @@ use crate::{
     config::{Config, Heartbeat},
     render::{Tier, tier_sql},
     summary::{
-        Count, Coverage, Group, MAX_GAP_LINES, MAX_GROUP_LINES, Ongoing, Report, Schedule, Section,
+        Count, Coverage, Group, MAX_GAP_LINES, MAX_GROUP_CONTEXTS, MAX_GROUP_LINES, Ongoing,
+        Report, Schedule, Section,
     },
 };
 
@@ -156,24 +157,29 @@ fn count(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
     Ok(u64::try_from(row.get::<_, i64>(index)?).unwrap_or(0))
 }
 
-/// Occurrences that notify (digest or higher) with their section and tier: open
-/// if it started before the window end and had not closed by then, resolved if
-/// it resolved inside the window. Both branches of the union use an index: the
-/// open one on first_seen_at for unclosed occurrences, the closed one on
-/// closed_at. Parameters: ?1 window start, ?2 window end, ?3 digest rank.
+/// Occurrences that notify (digest or higher) with their section, tier and
+/// resource: open if it started before the window end and had not closed by
+/// then, resolved if it resolved inside the window. Both branches of the union
+/// use an index: the open one on first_seen_at for unclosed occurrences, the
+/// closed one on closed_at. Parameters: ?1 window start, ?2 window end, ?3
+/// digest rank.
 macro_rules! candidates {
     () => {
         concat!(
             "WITH candidates AS (
             SELECT 'open' AS category, source, alertname, severity, highest_action,
-                first_seen_at, summary, labels, ",
+                first_seen_at, summary, ",
+            context!("labels"),
+            " AS context, ",
             tier_sql!(),
             " AS tier
             FROM occurrences
             WHERE closed_at IS NULL AND first_seen_at < ?2 AND highest_action >= ?3
             UNION ALL
             SELECT CASE WHEN closed_at >= ?2 THEN 'open' ELSE 'resolved' END, source,
-                alertname, severity, highest_action, first_seen_at, summary, labels, ",
+                alertname, severity, highest_action, first_seen_at, summary, ",
+            context!("labels"),
+            ", ",
             tier_sql!(),
             "
             FROM occurrences
@@ -202,6 +208,10 @@ macro_rules! context {
             ", ",
             label!($labels, "job_name"),
             ", ",
+            label!($labels, "customresource_kind"),
+            " || '/' || ",
+            label!($labels, "name"),
+            ", ",
             label!($labels, "container"),
             ")), ''), ",
             label!($labels, "host"),
@@ -225,7 +235,8 @@ macro_rules! label {
 
 /// One section: true totals per tier from an aggregate, and each tier's most
 /// important groups (highest action, then size) read in display order, at most
-/// [`MAX_GROUP_LINES`] per tier.
+/// [`MAX_GROUP_LINES`] per tier, each with its distinct resources counted and
+/// the first [`MAX_GROUP_CONTEXTS`] of them read.
 fn section(
     transaction: &Transaction<'_>,
     category: &str,
@@ -253,34 +264,51 @@ fn section(
     let groups = transaction
         .prepare_cached(concat!(
             candidates!(),
-            "SELECT source, alertname, severity, tier, size, fresh, summary, first, last
-             FROM (SELECT source, alertname, severity, tier, count(*) AS size,
+            ", grouped AS (
+                SELECT source, alertname, severity, tier, count(*) AS size,
                     coalesce(sum(first_seen_at >= ?1), 0) AS fresh, max(summary) AS summary,
-                    min(",
-            context!("labels"),
-            ") AS first, max(",
-            context!("labels"),
-            ") AS last,
+                    count(DISTINCT context) AS context_count,
                     row_number() OVER (PARTITION BY tier ORDER BY max(highest_action) DESC,
                         count(*) DESC, alertname, severity, source) AS rank
                 FROM candidates WHERE category = ?4
-                GROUP BY source, alertname, severity, tier)
-             WHERE rank <= ?5
-             ORDER BY tier, rank"
+                GROUP BY source, alertname, severity, tier),
+            listed AS (
+                SELECT source, alertname, severity, tier, context,
+                    row_number() OVER (PARTITION BY source, alertname, severity, tier
+                        ORDER BY context) AS position
+                FROM (SELECT DISTINCT source, alertname, severity, tier, context
+                    FROM candidates WHERE category = ?4 AND context IS NOT NULL))
+             SELECT g.source, g.alertname, g.severity, g.tier, g.size, g.fresh, g.summary,
+                g.context_count,
+                json_group_array(l.context ORDER BY l.context)
+                    FILTER (WHERE l.context IS NOT NULL)
+             FROM grouped AS g LEFT JOIN listed AS l
+                ON l.source = g.source AND l.alertname = g.alertname
+                AND l.severity IS g.severity AND l.tier = g.tier AND l.position <= ?6
+             WHERE g.rank <= ?5
+             GROUP BY g.tier, g.rank
+             ORDER BY g.tier, g.rank"
         ))?
         .query_map(
-            params![start, end, digest, category, MAX_GROUP_LINES as i64],
+            params![
+                start,
+                end,
+                digest,
+                category,
+                MAX_GROUP_LINES as i64,
+                MAX_GROUP_CONTEXTS as i64
+            ],
             |row| {
                 let size = count(row, 4)?;
                 let summary: Option<String> = row.get(6)?;
-                let mut contexts: Vec<String> = Vec::with_capacity(2);
-                for index in [7, 8] {
-                    if let Some(context) = row.get::<_, Option<String>>(index)?
-                        && !contexts.contains(&context)
-                    {
-                        contexts.push(context);
-                    }
-                }
+                let contexts =
+                    serde_json::from_str(&row.get::<_, String>(8)?).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            8,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?;
                 Ok(Group {
                     source: row.get(0)?,
                     alertname: row.get(1)?,
@@ -289,6 +317,7 @@ fn section(
                     count: size,
                     new: count(row, 5)?,
                     contexts,
+                    context_count: count(row, 7)?,
                     summary: summary.filter(|_| size == 1),
                 })
             },
@@ -545,6 +574,35 @@ mod tests {
             &[("instance", "10.0.0.1:9100"), ("job", "node")][..],
             &[("job", "node")][..],
             &[("namespace", ""), ("host", "iris")][..],
+            &[
+                ("namespace", "flux-system"),
+                ("customresource_kind", "Kustomization"),
+                ("name", "apps"),
+            ][..],
+            &[("customresource_kind", "HelmRelease"), ("name", "ingress")][..],
+            &[("namespace", "flux-system"), ("name", "apps")][..],
+            &[
+                ("namespace", "flux-system"),
+                ("customresource_kind", "Kustomization"),
+            ][..],
+            &[
+                ("namespace", "ns"),
+                ("customresource_kind", "Kustomization"),
+                ("name", ""),
+                ("container", "app"),
+            ][..],
+            &[
+                ("namespace", "ns"),
+                ("customresource_kind", "Certificate"),
+                ("name", "web"),
+                ("container", "app"),
+            ][..],
+            &[
+                ("namespace", "ns"),
+                ("job_name", "nightly"),
+                ("customresource_kind", "Certificate"),
+                ("name", "web"),
+            ][..],
             &[][..],
         ];
         for labels in label_sets {

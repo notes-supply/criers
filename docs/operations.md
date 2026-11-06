@@ -196,6 +196,9 @@ status line with the open, new and recovered totals, then a field per severity
 with open alerts, one for recoveries and one for coverage problems. Its colour
 is red with critical alerts open, purple with a coverage problem, then amber,
 blue or green. Each field's count equals its lines plus a final "+N more" line.
+A group line names up to three of its distinct resources (a namespaced workload
+or custom resource such as `flux-system/Kustomization/apps`, else a host,
+service, instance or job), followed by "+N more" when it has others.
 The embed stays within Discord's limits (1024 characters per field, 6000 in
 total): group lines are folded into that counted line, and coverage detail into
 one line per source and then into totals, while omitted alerts and failed or

@@ -1503,3 +1503,84 @@ async fn the_generated_window_is_reported_only_after_a_summary_is_generated() {
         )
     );
 }
+
+#[tokio::test]
+async fn group_lines_name_custom_resources_and_count_every_unlisted_resource() {
+    let harness = Harness::shadow(&digest_policy()).await;
+    let end = start(&harness).await;
+    let flux = |name: &str| {
+        json!({
+            "namespace": "flux-system",
+            "customresource_kind": "Kustomization",
+            "name": name,
+        })
+    };
+    let job = |namespace: &str, job: &str| json!({"namespace": namespace, "job_name": job});
+    let daemonset =
+        |namespace: &str, daemonset: &str| json!({"namespace": namespace, "daemonset": daemonset});
+    let alerts = [
+        ("FluxResourceNotReady", flux("apps")),
+        ("FluxResourceNotReady", flux("platform")),
+        ("KubeJobLatestRunFailed", job("backups", "nightly-backup")),
+        (
+            "KubeJobLatestRunFailed",
+            job("kube-system", "mtu-reconciler"),
+        ),
+        ("KubeJobLatestRunFailed", job("media", "nightly-backup")),
+        ("KubeDaemonSetRolloutStuck", daemonset("kube-system", "cni")),
+        (
+            "KubeDaemonSetRolloutStuck",
+            daemonset("kube-system", "kube-proxy"),
+        ),
+        (
+            "KubeDaemonSetRolloutStuck",
+            daemonset("kube-system", "network-policies"),
+        ),
+        (
+            "KubeDaemonSetRolloutStuck",
+            daemonset("telemetry", "node-exporter"),
+        ),
+        (
+            "KubeDaemonSetRolloutStuck",
+            daemonset("telemetry", "vector"),
+        ),
+        (
+            "PodRestarting",
+            json!({"namespace": "media", "pod": "web-0"}),
+        ),
+        (
+            "PodRestarting",
+            json!({"namespace": "media", "pod": "web-0"}),
+        ),
+    ];
+    for (index, (alertname, mut labels)) in alerts.into_iter().enumerate() {
+        labels["alertname"] = json!(alertname);
+        labels["severity"] = json!("warning");
+        let value = with(fixture(), "/alerts/0/labels", labels);
+        harness
+            .ingest(with(
+                value,
+                "/alerts/0/fingerprint",
+                json!(format!("{:016x}", index + 1)),
+            ))
+            .await;
+    }
+    tick(&harness, end + DAY_MS).await;
+    let text = summaries(&harness).await.remove(0).1;
+    let lines: Vec<&str> = text.lines().collect();
+    for expected in [
+        "example · **FluxResourceNotReady** ×2 · new · flux-system/Kustomization/apps, \
+         flux-system/Kustomization/platform",
+        "example · **KubeJobLatestRunFailed** ×3 · new · backups/nightly-backup, \
+         kube-system/mtu-reconciler, media/nightly-backup",
+        "example · **KubeDaemonSetRolloutStuck** ×5 · new · kube-system/cni, \
+         kube-system/kube-proxy, kube-system/network-policies, +2 more",
+        "example · **PodRestarting** ×2 · new · media/web-0",
+    ] {
+        assert!(lines.contains(&expected), "missing {expected:?} in\n{text}");
+    }
+    assert!(
+        text.contains("**12 open** (12 warning) · 12 new") && !text.contains("more ("),
+        "{text}"
+    );
+}
