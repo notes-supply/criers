@@ -16,6 +16,8 @@ pub(crate) const DAY_MS: i64 = 86_400_000;
 
 /// Groups listed per tier; the store reads no more than this many per tier.
 pub(crate) const MAX_GROUP_LINES: usize = 8;
+/// Distinct resources named per group; the store reads no more than this many.
+pub(crate) const MAX_GROUP_CONTEXTS: usize = 3;
 /// Closed heartbeat gaps listed per source before they are summarized.
 pub(crate) const MAX_GAP_LINES: usize = 3;
 /// Coverage lines for sources and truncation shown before the rest is folded.
@@ -64,8 +66,11 @@ pub(crate) struct Group {
     pub count: u64,
     /// Occurrences that started inside the window.
     pub new: u64,
-    /// Up to two distinct example resources.
+    /// The first distinct resources in order, at most [`MAX_GROUP_CONTEXTS`].
     pub contexts: Vec<String>,
+    /// Distinct resources in the whole group; those beyond `contexts` are
+    /// counted on the line.
+    pub context_count: u64,
     /// The summary annotation, shown only for a single occurrence.
     pub summary: Option<String>,
 }
@@ -347,6 +352,10 @@ impl Report {
                 .collect();
             line.push_str(" · ");
             line.push_str(&contexts.join(", "));
+            let unlisted = group.context_count.saturating_sub(contexts.len() as u64);
+            if unlisted > 0 {
+                line.push_str(&format!(", +{unlisted} more"));
+            }
         }
         if let Some(summary) = group
             .summary
@@ -583,6 +592,7 @@ mod tests {
             count,
             new,
             contexts: vec!["media/sonarr".to_owned()],
+            context_count: 1,
             summary: None,
         }
     }
@@ -731,7 +741,10 @@ mod tests {
                 .map(|index| {
                     let mut group = group(&format!("{long}{index}"), tier, count, 1);
                     group.summary = Some(long.clone());
-                    group.contexts = vec![long.clone(), format!("{long}2")];
+                    group.contexts = (0..MAX_GROUP_CONTEXTS)
+                        .map(|context| format!("{long}{context}"))
+                        .collect();
+                    group.context_count = 5000;
                     group
                 })
                 .collect::<Vec<_>>()
@@ -778,6 +791,41 @@ mod tests {
                 && text.contains("Notifications: 3 failed, 0 may not have arrived"),
             "{} units:\n{text}",
             card.embed.units()
+        );
+    }
+
+    #[test]
+    fn listed_resources_fold_whole_groups_to_fit_and_still_account_for_every_alert() {
+        let mut report = report();
+        report.show_source = true;
+        report.open = Section {
+            counts: [Count::default(), count(80, 0, 9), Count::default()],
+            groups: (0..MAX_GROUP_LINES)
+                .map(|index| {
+                    let mut group = group(&format!("WorkloadAlert{index}"), Tier::Warning, 9, 0);
+                    group.contexts = (0..MAX_GROUP_CONTEXTS)
+                        .map(|context| format!("namespace-{index:02}/workload-name-{context:020}"))
+                        .collect();
+                    group.context_count = 9;
+                    group
+                })
+                .collect(),
+        };
+        let card = report.card(&Icons::default());
+        let value = &card.embed.fields[0].value;
+        let listed = value
+            .lines()
+            .filter(|line| line.ends_with(", +6 more"))
+            .count() as u64;
+        assert!(
+            card.embed.within_limits()
+                && listed > 0
+                && value.ends_with(&format!(
+                    "+{} more ({} alerts)",
+                    9 - listed,
+                    80 - 9 * listed
+                )),
+            "{value}"
         );
     }
 

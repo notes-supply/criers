@@ -196,6 +196,9 @@ status line with the open, new and recovered totals, then a field per severity
 with open alerts, one for recoveries and one for coverage problems. Its colour
 is red with critical alerts open, purple with a coverage problem, then amber,
 blue or green. Each field's count equals its lines plus a final "+N more" line.
+A group line names up to three of its distinct resources (a namespaced workload
+or custom resource such as `flux-system/Kustomization/apps`, else a host,
+service, instance or job), followed by "+N more" when it has others.
 The embed stays within Discord's limits (1024 characters per field, 6000 in
 total): group lines are folded into that counted line, and coverage detail into
 one line per source and then into totals, while omitted alerts and failed or
@@ -230,8 +233,9 @@ Scheduling and delivery:
   with backoff and the window stays pending.
 
 Generation holds the database connection for its duration, which is how long it
-can delay a concurrent webhook commit. Measured with the release build: about
-80 ms for 20,000 notifying occurrences in one window and 270 ms for 100,000.
+can delay a concurrent webhook commit. Measured with the release build on a
+local SSD, for the slowest of the grouping shapes tried: about 80 ms for 20,000
+notifying occurrences in one window and 330 ms for 100,000.
 `criers_summary_cursor_seconds` shows that the schedule advances,
 `criers_summary_window_end_seconds` that summaries are generated, and
 `criers_summary_delivered_window_end_seconds` shows that one actually reached
